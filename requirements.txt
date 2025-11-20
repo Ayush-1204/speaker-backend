@@ -1,0 +1,10 @@
+torch
+torchaudio
+speechbrain
+numpy
+librosa
+soundfile
+webrtcvad
+fastapi==0.109.0
+uvicorn==0.22.0
+python-multipart
