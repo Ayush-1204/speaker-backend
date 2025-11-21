@@ -1,4 +1,6 @@
 # app/main.py
+import torchaudio
+torchaudio.set_audio_backend("soundfile")
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 import os
@@ -126,4 +128,5 @@ async def recognize(file: UploadFile = File(...)):
 # ------------------ ROOT ROUTE ------------------
 @app.get("/")
 def home():
+
     return {"message": "Speaker Recognition Backend Running"}
