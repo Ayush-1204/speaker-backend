@@ -17,6 +17,9 @@ from speechbrain.inference import EncoderClassifier
 
 from .vad import apply_vad
 
+import torchaudio
+torchaudio.set_audio_backend("soundfile")
+
 # Device and model dir
 DEVICE = "cpu"
 MODEL_DIR = os.path.join("pretrained_models", "ecapa")
@@ -114,3 +117,4 @@ def get_ecapa_embedding_from_file(path: str):
     print("✅ DEBUG → Final embedding shape:", emb.shape)
 
     return emb
+
