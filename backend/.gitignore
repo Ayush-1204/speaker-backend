@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+*.pyc
+models/*.tflite
+familiar_db.json
+.env

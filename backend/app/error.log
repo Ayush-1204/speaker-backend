@@ -1,0 +1,11 @@
+
+
+--- ENROLL ERROR at Fri Nov 14 19:30:54 2025 ---
+Traceback (most recent call last):
+  File "/mnt/c/Users/AYUSH VERMA/Documents/Speaker_Recognition_System/backend/app/main.py", line 113, in enroll
+    inp = get_embedding_from_file(str(fname), duration=1.0)  # fallback emb length 40
+  File "/mnt/c/Users/AYUSH VERMA/Documents/Speaker_Recognition_System/backend/app/utils/feature_extractor.py", line 31, in get_embedding_from_file
+    y, sr = load_audio_to_mono(path, sr=16000, duration=duration)
+  File "/mnt/c/Users/AYUSH VERMA/Documents/Speaker_Recognition_System/backend/app/utils/feature_extractor.py", line 12, in load_audio_to_mono
+    y = librosa.resample(y.astype(float), orig_sr, sr)
+TypeError: resample() takes 1 positional argument but 3 were given
