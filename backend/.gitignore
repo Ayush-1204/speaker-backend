@@ -4,3 +4,6 @@ __pycache__/
 models/*.tflite
 familiar_db.json
 .env
+app/data/temp_audio/
+app/data/alert_audio/
+app/data/latest_location.json

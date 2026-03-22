@@ -89,4 +89,3 @@ def apply_vad(audio: np.ndarray, sr: int = 16000, use_silero: bool = True):
             return _energy_vad_trim(audio, sr)
     else:
         return _energy_vad_trim(audio, sr)
-
