@@ -1,120 +1,183 @@
-# app/utils/feature_extractor.py
-"""
-ECAPA embedding extractor (SpeechBrain) with VAD.
-- Loads audio with soundfile + librosa resampling
-- Applies VAD (silero fallback already implemented in vad.py)
-- Pads too-short audio so ECAPA never crashes
-- Returns a 1-D L2-normalized numpy.float32 vector of shape (192,)
-"""
+"""ReDimNet2 B6 speaker embeddings via torch.hub. 192-D, L2-normalized."""
 
-import os
+from typing import List, Optional, Tuple
+import logging
+
 import numpy as np
 import soundfile as sf
 import librosa
 import torch
-from huggingface_hub import snapshot_download
-from speechbrain.inference import EncoderClassifier
 
+from . import config
 from .vad import apply_vad
 
-import torchaudio
-torchaudio.set_audio_backend("soundfile")
-
-# Device and model dir
-DEVICE = "cpu"
-MODEL_DIR = os.path.join("pretrained_models", "ecapa")
-
-# Ensure model is present (snapshot download will cache)
-if not os.path.exists(MODEL_DIR) or not os.listdir(MODEL_DIR):
-    os.makedirs(MODEL_DIR, exist_ok=True)
-    snapshot_download(
-        repo_id="speechbrain/spkrec-ecapa-voxceleb",
-        local_dir=MODEL_DIR,
-        ignore_patterns=["*.ckpt"]
-    )
-
-# Load ECAPA encoder (force CPU)
-ECAPA = EncoderClassifier.from_hparams(
-    source=MODEL_DIR,
-    run_opts={"device": DEVICE},
-)
-
-# Minimum length ECAPA needs (1 sec @ 16kHz)
-MIN_SAMPLES = 16000
+_redimnet = None
+logger = logging.getLogger(__name__)
 
 
-def _load_audio(path: str, target_sr: int = 16000):
-    """Load audio file, convert to mono, resample."""
+def _get_redimnet():
+    global _redimnet
+    if _redimnet is None:
+        # Prefer official ReDimNet2 source; fallback to legacy ReDimNet for compatibility.
+        last_exc: Optional[Exception] = None
+
+        v2_train_type = config.REDIMNET_TRAIN_TYPE
+        if v2_train_type == "ft_lm":
+            v2_train_type = "lm"
+
+        v1_train_type = config.REDIMNET_TRAIN_TYPE
+        if v1_train_type == "lm":
+            v1_train_type = "ft_lm"
+
+        load_attempts = [
+            (
+                config.REDIMNET_HUB_REPO,
+                config.REDIMNET_HUB_ENTRY,
+                {
+                    "model_name": config.REDIMNET_MODEL_NAME,
+                    "train_type": v2_train_type,
+                    "dataset": config.REDIMNET_DATASET,
+                    "pretrained": True,
+                },
+            ),
+            (
+                "PalabraAI/redimnet2",
+                "redimnet2",
+                {
+                    "model_name": config.REDIMNET_MODEL_NAME,
+                    "train_type": v2_train_type,
+                    "dataset": config.REDIMNET_DATASET,
+                    "pretrained": True,
+                },
+            ),
+            (
+                "IDRnD/ReDimNet",
+                "ReDimNet",
+                {
+                    "model_name": config.REDIMNET_MODEL_NAME,
+                    "train_type": v1_train_type,
+                    "dataset": config.REDIMNET_DATASET,
+                },
+            ),
+        ]
+
+        seen = set()
+        for hub_repo, hub_entry, load_kwargs in load_attempts:
+            key = (hub_repo, hub_entry)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                _redimnet = torch.hub.load(
+                    hub_repo,
+                    hub_entry,
+                    **load_kwargs,
+                    trust_repo=True,
+                )
+                logger.info(
+                    "REDIMNET_LOADED | hub_repo=%s | hub_entry=%s | model_name=%s | train_type=%s | dataset=%s",
+                    hub_repo,
+                    hub_entry,
+                    load_kwargs.get("model_name"),
+                    load_kwargs.get("train_type"),
+                    load_kwargs.get("dataset"),
+                )
+                break
+            except Exception as exc:
+                last_exc = exc
+                logger.warning(
+                    "REDIMNET_LOAD_FAILED | hub_repo=%s | hub_entry=%s | reason=%s",
+                    hub_repo,
+                    hub_entry,
+                    str(exc),
+                )
+        if _redimnet is None:
+            raise RuntimeError("Failed to load ReDimNet model via torch.hub") from last_exc
+        _redimnet.eval()
+        _redimnet.to(config.DEVICE)
+    return _redimnet
+
+
+def _load_audio(path: str, target_sr: int = 16000) -> Tuple[np.ndarray, int]:
     data, sr = sf.read(path, dtype="float32")
-
     if data.ndim == 2:
         data = data.mean(axis=1)
-
     if sr != target_sr:
         data = librosa.resample(data, orig_sr=sr, target_sr=target_sr)
-
     return data.astype(np.float32), target_sr
 
 
-def get_ecapa_embedding_from_file(path: str):
-    """Full embedding pipeline."""
+def _embed_waveform_array(waveform: np.ndarray, sr: int = 16000) -> np.ndarray:
+    w = np.asarray(waveform, dtype=np.float32).reshape(-1)
+    min_s = max(16000, config.MIN_CHUNK_SAMPLES)
 
-    # 1️⃣ LOAD
-    waveform, sr = _load_audio(path, target_sr=16000)
-    print("\n🔍 DEBUG → Loaded WAV:", path, "Length:", len(waveform), "SR:", sr)
+    if len(w) < 160:
+        w = np.pad(w, (0, max(0, min_s - len(w))), mode="reflect")
+    if len(w) < min_s:
+        w = np.pad(w, (0, min_s - len(w)), mode="reflect")
 
-    # 2️⃣ VAD
-    try:
-        waveform_vad = apply_vad(waveform, sr=sr, use_silero=True)
-    except Exception:
-        waveform_vad = apply_vad(waveform, sr=sr, use_silero=False)
-
-    print("🔍 DEBUG → After VAD length:", len(waveform_vad))
-
-    # If VAD removed too much audio → restore original
-    if len(waveform_vad) < 160:
-        print("⚠️ DEBUG → VAD too small; using original audio")
-        waveform_vad = waveform
-
-    # 3️⃣ **CRITICAL FIX — PAD SHORT AUDIO**
-    if len(waveform_vad) < MIN_SAMPLES:
-        missing = MIN_SAMPLES - len(waveform_vad)
-        waveform_vad = np.pad(waveform_vad, (0, missing), mode="reflect")
-        print(f"🟦 DEBUG → Audio padded to {len(waveform_vad)} samples")
-
-    # 4️⃣ Torch tensor [batch, time]
-    tensor = torch.tensor(waveform_vad, dtype=torch.float32).unsqueeze(0)
-    print("🔍 DEBUG → Tensor shape before ECAPA:", tensor.shape)
-
-    # 5️⃣ ECAPA forward
+    t = torch.tensor(w, dtype=torch.float32, device=config.DEVICE).unsqueeze(0)
+    model = _get_redimnet()
     with torch.no_grad():
-        emb_tensor = ECAPA.encode_batch(tensor)
-
-    # 6️⃣ Convert to numpy
-    emb = emb_tensor.squeeze().cpu().numpy().astype(np.float32)
-    emb = np.asarray(emb).squeeze()
-
-    # 7️⃣ Flatten if needed
-    if emb.ndim != 1:
-        emb = emb.reshape(-1)
-
-    # 8️⃣ Fix wrong shapes
-    if emb.shape[0] != 192:
-        print("⚠️ DEBUG → Unexpected embedding shape:", emb.shape)
-        if emb.ndim > 1:
-            emb = emb.mean(axis=0)
-        emb = emb.flatten()
-
-    # 9️⃣ Normalize
-    norm = np.linalg.norm(emb)
-    if norm > 0:
-        emb = emb / norm
-
-    # 🔟 Final validation
-    if emb.ndim != 1 or emb.shape[0] != 192:
-        raise RuntimeError(f"❌ Invalid embedding shape after processing: {emb.shape}")
-
-    print("✅ DEBUG → Final embedding shape:", emb.shape)
-
+        emb_t = model(t)
+    emb = emb_t.squeeze().detach().cpu().numpy().astype(np.float32).reshape(-1)
+    if emb.shape[0] != config.EMBEDDING_DIM:
+        raise RuntimeError(f"Embedding dim {emb.shape}; expected ({config.EMBEDDING_DIM},)")
+    n = np.linalg.norm(emb)
+    if n > 0:
+        emb = emb / n
     return emb
 
+
+def get_speaker_embedding_from_file(path: str) -> np.ndarray:
+    """Enroll path: load → VAD trim → pad → one ReDimNet embedding."""
+    waveform, sr = _load_audio(path, target_sr=16000)
+    try:
+        w = apply_vad(waveform, sr=sr, use_silero=True)
+    except Exception:
+        w = apply_vad(waveform, sr=sr, use_silero=False)
+    if len(w) < 160:
+        w = waveform
+    return _embed_waveform_array(w, sr)
+
+
+def embed_waveform_chunks(
+    waveform: np.ndarray,
+    sr: int = 16000,
+    segments: Optional[List[Tuple[int, int]]] = None,
+) -> List[np.ndarray]:
+    """Bounded chunks from VAD segments; each chunk → one embedding (verify path)."""
+    w = np.asarray(waveform, dtype=np.float32).reshape(-1)
+    min_s = config.MIN_CHUNK_SAMPLES
+    max_s = config.MAX_CHUNK_SAMPLES
+    chunks: List[np.ndarray] = []
+
+    seg_list = [(0, len(w))] if not segments else [(max(0, a), min(len(w), b)) for a, b in segments if b > a]
+
+    for s, e in seg_list:
+        piece = w[s:e]
+        if len(piece) == 0:
+            continue
+        pos = 0
+        while pos < len(piece):
+            end = min(pos + max_s, len(piece))
+            chunk = piece[pos:end]
+            if len(chunk) < min_s:
+                chunk = np.pad(chunk, (0, min_s - len(chunk)), mode="reflect")
+            chunks.append(chunk.astype(np.float32, copy=False))
+            pos = end
+            if len(chunks) >= config.MAX_VERIFY_CHUNKS:
+                break
+        if len(chunks) >= config.MAX_VERIFY_CHUNKS:
+            break
+
+    if not chunks:
+        chunk = w
+        if len(chunk) < min_s:
+            chunk = np.pad(chunk, (0, min_s - len(chunk)), mode="reflect")
+        chunks = [chunk]
+
+    out: List[np.ndarray] = []
+    for c in chunks[: config.MAX_VERIFY_CHUNKS]:
+        out.append(_embed_waveform_array(c, sr))
+    return out

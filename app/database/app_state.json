@@ -1,0 +1,74 @@
+{
+  "parents": {
+    "test-parent-1": {
+      "id": "test-parent-1",
+      "google_sub": "test-parent-1",
+      "email": "test-parent-1@dev.local",
+      "display_name": "test-parent-1",
+      "created_at": 1774550389179,
+      "updated_at": 1774550389179,
+      "phone_number": null,
+      "fcm_token": null
+    }
+  },
+  "devices": {},
+  "speakers": {},
+  "alerts": {},
+  "refresh_tokens": {
+    "6FIbDChdd28xghXM9Wn74AjSyDPbzjDi79ywXHH1YNE": {
+      "parent_id": "test-parent-1",
+      "created_at": 1774550389191,
+      "expires_at": 1777142389191
+    },
+    "FWMs2hWPBHdxW3U5tov4zi2iupAsKK8f8przASO5XwU": {
+      "parent_id": "c04e139a-8f14-477a-a576-99bea4390808",
+      "created_at": 1774627147473,
+      "expires_at": 1777219147473
+    },
+    "lewqtqGOmfReCt4nQ-AM287bhDDn9KpPxfBXPsrXtOk": {
+      "parent_id": "080cf92e-4b0c-44ac-b1e3-7865857c6e44",
+      "created_at": 1774627264421,
+      "expires_at": 1777219264421
+    },
+    "AF9_dUOxDLm4d75ebIJHWvaFfCH6FmAQxaeNOPETBfM": {
+      "parent_id": "741b5350-fb0d-40fa-94d1-537673fa902c",
+      "created_at": 1774628028867,
+      "expires_at": 1777220028867
+    },
+    "zCOE6pXLCUgs9XdQ7aeBdEnEiyQhDXbWU-qtyj_TmVs": {
+      "parent_id": "09433a73-a706-4e72-92be-de2ff0cfa35b",
+      "created_at": 1774628074097,
+      "expires_at": 1777220074097
+    },
+    "VUx-YiokuBlF4rPasDA8GmczbHgYeflH41MztARuBgU": {
+      "parent_id": "c71d7e59-5ccc-47ac-b37f-44656bf54fb4",
+      "created_at": 1774628307208,
+      "expires_at": 1777220307208
+    },
+    "7eTwraZy16lUHgJfJIpwL65p5STaxKuNZoeXxnBtK2c": {
+      "parent_id": "7171b988-8577-4889-a1c6-71680c0629cc",
+      "created_at": 1774630012459,
+      "expires_at": 1777222012459
+    },
+    "M_3Rx9ygOc2j72_LTSo0r25l-i7XZwwIehR2Lgcn3W4": {
+      "parent_id": "776cee66-a885-40bf-ab4b-6b6a7dbe5433",
+      "created_at": 1774637941724,
+      "expires_at": 1777229941724
+    },
+    "rAi86roS67vI4O7uuGktxw8wKWyx-KZ73Av5yGWeDN0": {
+      "parent_id": "776cee66-a885-40bf-ab4b-6b6a7dbe5433",
+      "created_at": 1774638009373,
+      "expires_at": 1777230009373
+    },
+    "q4aSN2O81m9hh-Lbjrrjhl9JTrI2ugMvzjipY4HPBgc": {
+      "parent_id": "cd77e8e9-c9ab-4cc0-be27-be7c95259ec0",
+      "created_at": 1774681056059,
+      "expires_at": 1777273056059
+    },
+    "LtINZxzFfHc8tlh0zL8w4wujRC7Zzkh0FAkuT-9Tm_M": {
+      "parent_id": "776cee66-a885-40bf-ab4b-6b6a7dbe5433",
+      "created_at": 1774682453793,
+      "expires_at": 1777274453793
+    }
+  }
+}

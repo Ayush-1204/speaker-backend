@@ -1,0 +1,192 @@
+================================================================================
+FIXES FOR GEMINI_ANDROID_APP_IMPLEMENTATION_PROMPT_V2.md
+================================================================================
+
+THREE FIXES NEEDED - Copy each section below and paste into the prompt file
+
+================================================================================
+FIX #1: REPLACE THE MULTIPART RULES SECTION
+================================================================================
+
+FIND THIS TEXT:
+--------------
+## Multipart Rules (Important)
+
+For text-only multipart fields, do NOT use MultipartBody.Part with named @Part annotation mismatch.
+Use either:
+- @Part("field") RequestBody
+or
+- @Part MultipartBody.Part without annotation name
+
+Ensure register device API follows Retrofit multipart correctly.
+
+
+REPLACE WITH THIS TEXT:
+-----------------------
+## Multipart Rules (CRITICAL)
+
+### Rule 1: Text + File Combined
+When uploading a file + text fields together (e.g., display_name + audio file):
+```kotlin
+@Multipart
+@POST("/enroll/speaker")
+suspend fun enrollSpeaker(
+    @Part("display_name") displayName: RequestBody,
+    @Part("speaker_id") speakerId: RequestBody?,  // optional
+    @Part audio: MultipartBody.Part  // NO parameter name here; name embedded in Part
+): EnrollSpeakerResponse
+
+// Caller usage:
+val displayNameBody = RequestBody.create("text/plain".toMediaType(), name)
+val partId = RequestBody.create("text/plain".toMediaType(), speakerId ?: "")
+val audioPart = MultipartBody.Part.createFormData("audio", filename, audioBody)
+enrollSpeaker(displayNameBody, partId, audioPart)
+```
+
+### Rule 2: File-Only (No Text Fields)
+```kotlin
+@Multipart
+@POST("/detect/chunk")
+suspend fun detectChunk(
+    @Part("device_id") deviceId: RequestBody,
+    @Part("latitude") latitude: RequestBody?,
+    @Part("longitude") longitude: RequestBody?,
+    @Part audio: MultipartBody.Part  // NO param name for MultipartBody.Part
+): DetectResponse
+```
+
+### Rule 3: NEVER Do This
+```kotlin
+// WRONG - Causes "must not include a part name" error:
+@Part("audio") audio: MultipartBody.Part  // ❌ WRONG
+
+// CORRECT:
+@Part audio: MultipartBody.Part  // ✓ Correct
+```
+
+Key: MultipartBody.Part parameters must NOT have @Part("name") annotation. The name is embedded when you call `MultipartBody.Part.createFormData("name", filename, body)`.
+
+
+================================================================================
+FIX #2: ADD NEW SECTION AFTER "## Networking Rules"
+================================================================================
+
+FIND THIS TEXT:
+--------------
+## Networking Rules
+
+- Token interceptor for Bearer auth
+- 401 refresh retry with /auth/refresh once
+- Fail to login if refresh fails
+- Exact field names in DTOs (no renaming)
+
+## Multipart Rules (CRITICAL)
+
+
+POSITION: Add the new section BETWEEN these two sections
+
+INSERT THIS TEXT:
+-----------------
+## DataStore & Auth State Management (CRITICAL)
+
+### On Login Success
+```kotlin
+// Save to DataStore
+dataStore.edit { prefs ->
+    prefs[ACCESS_TOKEN_KEY] = response.access_token
+    prefs[REFRESH_TOKEN_KEY] = response.refresh_token
+    prefs[PARENT_ID_KEY] = response.parent.id
+    prefs[DEVICE_ID_KEY] = response.device.id  // if returned
+}
+```
+
+### On Logout (MUST DO ALL STEPS)
+```kotlin
+// Step 1: Call backend logout endpoint FIRST
+val logoutResult = apiService.logout(DeleteLogoutRequest(refreshToken = storedRefreshToken))
+
+// Step 2: Clear ALL DataStore keys (do this even if logout call fails or throws)
+dataStore.edit { prefs ->
+    prefs.remove(ACCESS_TOKEN_KEY)
+    prefs.remove(REFRESH_TOKEN_KEY)
+    prefs.remove(PARENT_ID_KEY)
+    prefs.remove(DEVICE_ID_KEY)
+    prefs.remove(DEVICE_ROLE_KEY)
+    // Clear ANY other auth-related cached data
+}
+
+// Step 3: Clear OkHttp cache (if using cache interceptor)
+okHttpClient.cache?.evictAll()
+
+// Step 4: Navigate to login screen WITHOUT caching/remembering state
+navController.navigate(LOGIN_ROUTE) {
+    popUpTo(0) // Clear entire nav backstack
+}
+```
+
+### On App Startup (Check Auth State)
+```kotlin
+// DO NOT auto-login from cached tokens
+// ONLY proceed if ALL of these are present:
+// - ACCESS_TOKEN non-empty
+// - REFRESH_TOKEN non-empty  
+// - PARENT_ID non-empty
+// - DEVICE_ID non-empty
+
+// If any are missing → show login screen
+```
+
+If logout silently crashes the app, ensure:
+1. You're NOT throwing uncaught exceptions in logout handler
+2. You're clearing DataStore in a try/catch block
+3. You're clearing cache before navigation
+
+
+================================================================================
+FIX #3: ADD NEW SECTION BEFORE "## Acceptance Criteria"
+================================================================================
+
+FIND THIS TEXT:
+--------------
+## Acceptance Criteria
+
+App is accepted only if:
+
+
+POSITION: Add the new section RIGHT BEFORE this heading
+
+INSERT THIS TEXT:
+-----------------
+## Debugging Child Monitoring (If "Nothing Happens")
+
+If child monitoring doesn't produce alerts, verify in this order:
+
+1. **Device Role Check**
+   - After onboarding, verify persisted role = "child_device" in DataStore
+   - If role is "parent_device", monitoring won't work (endpoint rejects non-child roles)
+
+2. **Chunk Submission**
+   - Add logging to see if detectChunk() is being called
+   - Log device_id, audio size, sample rate
+   - Check for 16kHz WAV requirement (if SampleRate != 16000 → error)
+
+3. **Backend Response Status**
+   - Log the DetectResponse.status field (should be "warming_up", "no_hop", or "ok")
+   - "ok" means stranger detected → alert should be created
+   - Still no alert? Check: Is familiar speaker list empty? If empty, all audio = stranger alert
+
+4. **Alerts List**
+   - Call GET /alerts after detection
+   - Should show new Alert with confidence_score > 0.5
+   - Location lat/lon should match submitted coordinates
+
+5. **Common Failures**
+   - 403 Forbidden + "only_child_devices_can_stream_audio" → fix device role
+   - 422 "audio_chunk_must_be_16khz" → resample audio to 16kHz before upload
+   - 200 response but status="no_hop" → normal operation, no stranger detected
+   - 200 response but status="warming_up" → model still warming up, try again
+
+
+================================================================================
+END OF FIXES
+================================================================================
