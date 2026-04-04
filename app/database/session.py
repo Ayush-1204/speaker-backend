@@ -1,7 +1,7 @@
 """Database session and connection management."""
 
 import os
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import sessionmaker, Session
 from app.database.models import Base
 
@@ -27,3 +27,30 @@ def get_db() -> Session:
 def init_db():
     """Create all tables."""
     Base.metadata.create_all(bind=engine)
+    _ensure_device_columns()
+
+
+def _ensure_device_columns() -> None:
+    """Backfill newly added columns for existing deployments without Alembic."""
+    inspector = inspect(engine)
+    if "devices" not in inspector.get_table_names():
+        return
+
+    existing = {col["name"] for col in inspector.get_columns("devices")}
+    statements = []
+
+    if "battery_percent" not in existing:
+        statements.append("ALTER TABLE devices ADD COLUMN battery_percent INTEGER")
+    if "is_online" not in existing:
+        statements.append("ALTER TABLE devices ADD COLUMN is_online BOOLEAN NOT NULL DEFAULT 0")
+    if "monitoring_enabled" not in existing:
+        statements.append("ALTER TABLE devices ADD COLUMN monitoring_enabled BOOLEAN NOT NULL DEFAULT 1")
+    if "last_heartbeat_at" not in existing:
+        statements.append("ALTER TABLE devices ADD COLUMN last_heartbeat_at DATETIME")
+
+    if not statements:
+        return
+
+    with engine.begin() as conn:
+        for stmt in statements:
+            conn.execute(text(stmt))

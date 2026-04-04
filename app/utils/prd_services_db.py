@@ -60,6 +60,7 @@ STRANGER_CONFIRM_COUNT = int(os.environ.get("SAFEEAR_CONFIRM_WINDOWS", _DEFAULT_
 DEBOUNCE_SEC = int(os.environ.get("SAFEEAR_DEBOUNCE_SEC", "60"))
 
 logger = logging.getLogger(__name__)
+DEVICE_ONLINE_TTL_SEC = int(os.environ.get("SAFEEAR_DEVICE_ONLINE_TTL_SEC", "120"))
 
 _LOCK = threading.Lock()
 _SESSIONS: Dict[str, "SessionState"] = {}
@@ -303,6 +304,8 @@ def create_device(
             existing.device_name = normalized_name
             existing.role = role
             existing.device_token = token
+            if existing.monitoring_enabled is None:
+                existing.monitoring_enabled = True
             existing.updated_at = datetime.utcnow()
             db.commit()
             db.refresh(existing)
@@ -319,6 +322,113 @@ def create_device(
     db.commit()
     db.refresh(device)
     return device
+
+
+def list_devices(db: Session, parent_id: str) -> List[Device]:
+    parent_uuid = _as_uuid(parent_id, "parent_id")
+    return (
+        db.query(Device)
+        .filter(Device.parent_id == parent_uuid)
+        .order_by(Device.created_at.desc())
+        .all()
+    )
+
+
+def _send_monitoring_command_to_device(device: Device, monitoring_enabled: bool) -> bool:
+    token = (device.device_token or "").strip()
+    if not token:
+        return False
+
+    try:
+        import firebase_admin
+        from firebase_admin import credentials, messaging
+
+        project_id = os.environ.get("FIREBASE_PROJECT_ID") or os.environ.get("GOOGLE_CLOUD_PROJECT")
+        init_options = {"projectId": project_id} if project_id else None
+
+        if not firebase_admin._apps:
+            creds_path = os.environ.get("FIREBASE_CREDENTIALS_PATH")
+            creds_json = os.environ.get("FIREBASE_CREDENTIALS_JSON")
+            if creds_path:
+                cred = credentials.Certificate(creds_path)
+                firebase_admin.initialize_app(cred, options=init_options)
+            elif creds_json:
+                cred = credentials.Certificate(json.loads(creds_json))
+                firebase_admin.initialize_app(cred, options=init_options)
+            else:
+                firebase_admin.initialize_app(credentials.ApplicationDefault(), options=init_options)
+
+        message = messaging.Message(
+            data={
+                "type": "monitoring_control",
+                "action": "start" if monitoring_enabled else "stop",
+                "monitoring_enabled": "true" if monitoring_enabled else "false",
+                "device_id": str(device.id),
+            },
+            android=messaging.AndroidConfig(priority="high"),
+            token=token,
+        )
+        messaging.send(message, dry_run=False)
+        return True
+    except Exception as exc:
+        logger.warning(
+            "MONITORING_COMMAND_SEND_FAILED | device_id=%s | reason=%s",
+            str(device.id),
+            str(exc),
+        )
+        return False
+
+
+def set_device_monitoring(
+    db: Session,
+    parent_id: str,
+    device_id: str,
+    monitoring_enabled: bool,
+) -> Tuple[Device, bool]:
+    device = get_device(db, parent_id, device_id)
+    device.monitoring_enabled = bool(monitoring_enabled)
+    device.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(device)
+
+    command_sent = False
+    if device.role == DeviceRole.child_device:
+        command_sent = _send_monitoring_command_to_device(device, bool(monitoring_enabled))
+    return device, command_sent
+
+
+def update_device_heartbeat(
+    db: Session,
+    parent_id: str,
+    device_id: str,
+    battery_percent: Optional[int],
+    is_online: Optional[bool],
+    monitoring_enabled: Optional[bool],
+) -> Device:
+    device = get_device(db, parent_id, device_id)
+
+    if battery_percent is not None:
+        battery = int(max(0, min(100, battery_percent)))
+        device.battery_percent = battery
+    if is_online is not None:
+        device.is_online = bool(is_online)
+    if monitoring_enabled is not None:
+        device.monitoring_enabled = bool(monitoring_enabled)
+
+    device.last_heartbeat_at = datetime.utcnow()
+    device.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(device)
+    return device
+
+
+def get_effective_online(device: Device) -> bool:
+    if not bool(device.is_online):
+        return False
+    if not device.last_heartbeat_at:
+        return False
+    age_sec = (datetime.utcnow() - device.last_heartbeat_at).total_seconds()
+    return age_sec <= float(DEVICE_ONLINE_TTL_SEC)
 
 
 def get_device(db: Session, parent_id: str, device_id: str) -> Device:
@@ -413,6 +523,54 @@ def create_speaker(db: Session, parent_id: str, display_name: str) -> EnrolledSp
 def _speaker_dir(parent_id: str, speaker_id: str) -> str:
     dirs = _ensure_parent_dirs(parent_id)
     return os.path.join(dirs["embeddings"], str(speaker_id))
+
+
+def _speaker_avatar_candidates(parent_id: str, speaker_id: str) -> List[str]:
+    sdir = _speaker_dir(parent_id, speaker_id)
+    return [
+        os.path.join(sdir, "profile.jpg"),
+        os.path.join(sdir, "profile.jpeg"),
+        os.path.join(sdir, "profile.png"),
+    ]
+
+
+def get_speaker_avatar_path(parent_id: str, speaker_id: str) -> Optional[str]:
+    for path in _speaker_avatar_candidates(parent_id, speaker_id):
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def save_speaker_avatar(
+    db: Session,
+    parent_id: str,
+    speaker_id: str,
+    image_bytes: bytes,
+    content_type: str,
+) -> str:
+    speaker = get_speaker(db, parent_id, speaker_id)
+    sdir = _speaker_dir(parent_id, speaker.id)
+    os.makedirs(sdir, exist_ok=True)
+
+    normalized_type = (content_type or "").lower().strip()
+    ext = ".png" if normalized_type == "image/png" else ".jpg"
+    target = os.path.join(sdir, f"profile{ext}")
+
+    # Ensure only one avatar file exists for stable storage and no orphaned images.
+    for existing in _speaker_avatar_candidates(parent_id, speaker.id):
+        if os.path.isfile(existing):
+            try:
+                os.remove(existing)
+            except OSError:
+                pass
+
+    with open(target, "wb") as f:
+        f.write(image_bytes)
+
+    speaker.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(speaker)
+    return target
 
 
 def list_speakers(db: Session, parent_id: str) -> List[EnrolledSpeaker]:

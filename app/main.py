@@ -11,7 +11,7 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 import soundfile as sf
 import librosa
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -72,6 +72,26 @@ logging.basicConfig(
 TEMP_DIR = os.path.join("app", "data", "temp_audio")
 os.makedirs(TEMP_DIR, exist_ok=True)
 
+AVATAR_MAX_SIZE_BYTES = int(os.environ.get("SAFEEAR_AVATAR_MAX_SIZE_BYTES", str(5 * 1024 * 1024)))
+ALLOWED_AVATAR_CONTENT_TYPES = {"image/jpeg", "image/png"}
+
+
+def _speaker_avatar_url(request: Request, speaker_id: str) -> str:
+    return str(request.url_for("get_speaker_avatar", speaker_id=str(speaker_id)))
+
+
+def _speaker_payload(row, request: Request, parent_id: str) -> Dict[str, Any]:
+    avatar_exists = svc.get_speaker_avatar_path(parent_id, row.id) is not None
+    return {
+        "id": str(row.id),
+        "parent_id": str(row.parent_id),
+        "display_name": row.display_name,
+        "sample_count": row.sample_count,
+        "profile_image_url": _speaker_avatar_url(request, row.id) if avatar_exists else None,
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+    }
+
 
 @app.on_event("startup")
 def startup_event() -> None:
@@ -113,6 +133,19 @@ class RenameSpeakerRequest(BaseModel):
 class FlagFamiliarRequest(BaseModel):
     display_name: str
     speaker_id: Optional[str] = None
+
+class DeviceMonitoringPatchRequest(BaseModel):
+    monitoring_enabled: bool
+
+class DeviceHeartbeatRequest(BaseModel):
+    battery_percent: Optional[int] = None
+    is_online: Optional[bool] = True
+    monitoring_enabled: Optional[bool] = None
+
+
+class DeviceMonitoringAckRequest(BaseModel):
+    monitoring_enabled: bool
+    is_online: Optional[bool] = True
 
 
 class TestFireAlertRequest(BaseModel):
@@ -296,6 +329,17 @@ def _alert_response_payload(row: Any) -> Dict[str, Any]:
         "updated_at_ms": _dt_to_epoch_ms(row.updated_at),
     }
 
+def _device_payload(row: Device) -> Dict[str, Any]:
+    return {
+        "id": str(row.id),
+        "parent_id": str(row.parent_id),
+        "device_name": row.device_name,
+        "role": row.role.value,
+        "battery_percent": row.battery_percent,
+        "is_online": svc.get_effective_online(row),
+        "monitoring_enabled": bool(row.monitoring_enabled),
+    }
+
 
 @app.post("/auth/google")
 def auth_google(body: GoogleAuthRequest, db: Session = Depends(get_db)):
@@ -420,6 +464,7 @@ def auth_logout(
 
 @app.post("/enroll/speaker")
 async def enroll_speaker(
+    request: Request,
     display_name: str = Form(...),
     speaker_id: Optional[str] = Form(None),
     file: Optional[UploadFile] = File(None),
@@ -435,6 +480,7 @@ async def enroll_speaker(
     # For updates, ensure the target speaker exists before processing audio.
     speaker = svc.get_speaker(db, parent_id, speaker_id) if speaker_id else None
 
+    os.makedirs(TEMP_DIR, exist_ok=True)
     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav", dir=TEMP_DIR) as tmp:
         shutil.copyfileobj(upload.file, tmp)
         temp_path = tmp.name
@@ -458,8 +504,7 @@ async def enroll_speaker(
 
     return {
         "status": "enrolled",
-        "speaker_id": str(speaker.id),
-        "display_name": speaker.display_name,
+        "speaker": _speaker_payload(speaker, request, parent_id),
         "samples_saved": len(embs),
         "embedding_dim": int(embs[0].shape[0]),
         "stages": stage_info,
@@ -467,39 +512,65 @@ async def enroll_speaker(
 
 
 @app.get("/enroll/speakers")
-def get_enrolled_speakers(current=Depends(get_current_parent), db: Session = Depends(get_db)):
+def get_enrolled_speakers(request: Request, current=Depends(get_current_parent), db: Session = Depends(get_db)):
     rows = svc.list_speakers(db, current["parent_id"])
     return {
-        "items": [
-            {
-                "id": str(row.id),
-                "parent_id": str(row.parent_id),
-                "display_name": row.display_name,
-                "sample_count": row.sample_count,
-                "created_at": row.created_at,
-                "updated_at": row.updated_at,
-            }
-            for row in rows
-        ]
+        "items": [_speaker_payload(row, request, current["parent_id"]) for row in rows]
     }
 
 
 @app.patch("/enroll/speakers/{speaker_id}")
 def patch_speaker(
-    speaker_id: str, body: RenameSpeakerRequest, current=Depends(get_current_parent), db: Session = Depends(get_db)
+    request: Request,
+    speaker_id: str,
+    body: RenameSpeakerRequest,
+    current=Depends(get_current_parent),
+    db: Session = Depends(get_db),
 ):
     row = svc.rename_speaker(db, current["parent_id"], speaker_id, body.display_name)
     return {
         "status": "ok",
-        "speaker": {
-            "id": str(row.id),
-            "parent_id": str(row.parent_id),
-            "display_name": row.display_name,
-            "sample_count": row.sample_count,
-            "created_at": row.created_at,
-            "updated_at": row.updated_at,
-        },
+        "speaker": _speaker_payload(row, request, current["parent_id"]),
     }
+
+
+@app.post("/enroll/speakers/{speaker_id}/avatar")
+async def upload_speaker_avatar(
+    request: Request,
+    speaker_id: str,
+    profile_image: UploadFile = File(...),
+    current=Depends(get_current_parent),
+    db: Session = Depends(get_db),
+):
+    content_type = (profile_image.content_type or "").lower().strip()
+    if content_type not in ALLOWED_AVATAR_CONTENT_TYPES:
+        raise HTTPException(status_code=415, detail="unsupported_profile_image_type")
+
+    raw = await profile_image.read()
+    if not raw:
+        raise HTTPException(status_code=422, detail="empty_profile_image")
+    if len(raw) > AVATAR_MAX_SIZE_BYTES:
+        raise HTTPException(status_code=413, detail="profile_image_too_large")
+
+    speaker = svc.get_speaker(db, current["parent_id"], speaker_id)
+    svc.save_speaker_avatar(db, current["parent_id"], speaker_id, raw, content_type)
+    db.refresh(speaker)
+
+    return _speaker_payload(speaker, request, current["parent_id"])
+
+
+@app.get("/enroll/speakers/{speaker_id}/avatar", name="get_speaker_avatar")
+def get_speaker_avatar(
+    speaker_id: str,
+    current=Depends(get_current_parent),
+    db: Session = Depends(get_db),
+):
+    svc.get_speaker(db, current["parent_id"], speaker_id)
+    avatar_path = svc.get_speaker_avatar_path(current["parent_id"], speaker_id)
+    if avatar_path is None:
+        raise HTTPException(status_code=404, detail="profile_image_not_found")
+    media_type = "image/png" if avatar_path.lower().endswith(".png") else "image/jpeg"
+    return FileResponse(avatar_path, media_type=media_type)
 
 
 @app.delete("/enroll/speakers/{speaker_id}")
@@ -998,7 +1069,24 @@ def create_device(
         device_role = DeviceRole(role)
     except ValueError:
         raise HTTPException(status_code=422, detail="invalid_device_role")
+    
+    logger.info(
+        "DEVICE_REGISTRATION_START | parent_id=%s | role=%s | device_name=%s | device_token=%s",
+        parent_id,
+        role,
+        device_name,
+        device_token[:15] + "..." if device_token else None,
+    )
+    
     device = svc.create_device(db, parent_id, device_name, device_role, device_token)
+    
+    logger.info(
+        "DEVICE_REGISTRATION_SUCCESS | device_id=%s | parent_id=%s | role=%s | device_name=%s",
+        str(device.id),
+        str(device.parent_id),
+        device.role.value,
+        device.device_name,
+    )
 
     return {
         "status": "created",
@@ -1010,6 +1098,84 @@ def create_device(
             "device_token": device.device_token
         }
     }
+
+@app.get("/devices")
+def list_devices(current=Depends(get_current_parent), db: Session = Depends(get_db)):
+    parent_id = current["parent_id"]
+    logger.info("DEVICE_LIST_REQUEST | parent_id=%s", parent_id)
+    
+    rows = svc.list_devices(db, parent_id)
+    
+    logger.info(
+        "DEVICE_LIST_RESPONSE | parent_id=%s | count=%d | roles=%s",
+        parent_id,
+        len(rows),
+        ','.join([r.role.value for r in rows]) if rows else "none",
+    )
+    
+    for idx, row in enumerate(rows):
+        logger.debug(
+            "DEVICE_RESULT[%d] | id=%s | parent_id=%s | role=%s | name=%s",
+            idx,
+            str(row.id),
+            str(row.parent_id),
+            row.role.value,
+            row.device_name,
+        )
+    
+    return {"items": [_device_payload(row) for row in rows]}
+
+@app.patch("/devices/{device_id}/monitoring")
+def patch_device_monitoring(
+    device_id: str,
+    body: DeviceMonitoringPatchRequest,
+    current=Depends(get_current_parent),
+    db: Session = Depends(get_db),
+):
+    row, command_sent = svc.set_device_monitoring(
+        db,
+        current["parent_id"],
+        device_id,
+        body.monitoring_enabled,
+    )
+    response = _device_payload(row)
+    response["command_sent"] = command_sent
+    return response
+
+@app.post("/devices/{device_id}/heartbeat")
+def post_device_heartbeat(
+    device_id: str,
+    body: DeviceHeartbeatRequest,
+    current=Depends(get_current_parent),
+    db: Session = Depends(get_db),
+):
+    row = svc.update_device_heartbeat(
+        db,
+        current["parent_id"],
+        device_id,
+        body.battery_percent,
+        body.is_online,
+        body.monitoring_enabled,
+    )
+    return {"status": "ok", "device": _device_payload(row)}
+
+
+@app.post("/devices/{device_id}/monitoring/ack")
+def post_monitoring_ack(
+    device_id: str,
+    body: DeviceMonitoringAckRequest,
+    current=Depends(get_current_parent),
+    db: Session = Depends(get_db),
+):
+    row = svc.update_device_heartbeat(
+        db,
+        current["parent_id"],
+        device_id,
+        battery_percent=None,
+        is_online=body.is_online,
+        monitoring_enabled=body.monitoring_enabled,
+    )
+    return {"status": "acknowledged", "device": _device_payload(row)}
 
 @app.get("/health")
 def health():
