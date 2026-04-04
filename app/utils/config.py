@@ -15,6 +15,17 @@ MAX_CHUNK_SAMPLES = int(os.environ.get("MAX_CHUNK_SAMPLES", "48000"))
 MAX_VERIFY_CHUNKS = int(os.environ.get("MAX_VERIFY_CHUNKS", "6"))
 MIN_VOICED_MS = int(os.environ.get("MIN_VOICED_MS", "250"))
 
+
+def _env_bool(name: str, default: bool) -> bool:
+	return os.environ.get(name, "true" if default else "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
+ENABLE_VOLUME_NORMALIZATION = _env_bool("SAFEEAR_ENABLE_VOLUME_NORMALIZATION", True)
+VOLUME_TARGET_RMS = float(os.environ.get("SAFEEAR_VOLUME_TARGET_RMS", "0.08"))
+VOLUME_MIN_RMS = float(os.environ.get("SAFEEAR_VOLUME_MIN_RMS", "1e-4"))
+VOLUME_MAX_GAIN_DB = float(os.environ.get("SAFEEAR_VOLUME_MAX_GAIN_DB", "9.0"))
+VOLUME_PEAK_LIMIT = float(os.environ.get("SAFEEAR_VOLUME_PEAK_LIMIT", "0.98"))
+
 # Slightly relaxed defaults for real-world phone captures to avoid false rejects.
 SPEECH_GATE_MAX_FLATNESS = float(os.environ.get("SPEECH_GATE_MAX_FLATNESS", "0.60"))
 SPEECH_GATE_MIN_RMS = float(os.environ.get("SPEECH_GATE_MIN_RMS", "1e-6"))

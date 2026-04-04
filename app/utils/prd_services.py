@@ -23,13 +23,15 @@ JWT_EXPIRE_SEC = int(os.environ.get("SAFEEAR_JWT_EXPIRE_SEC", "604800"))
 
 WINDOW_SEC = float(os.environ.get("SAFEEAR_WINDOW_SEC", "1.5"))
 HOP_SEC = float(os.environ.get("SAFEEAR_HOP_SEC", "0.25"))
+ALERT_RING_SEC = float(os.environ.get("SAFEEAR_ALERT_RING_SEC", "6.0"))
+STRANGER_PREROLL_SEC = float(os.environ.get("SAFEEAR_STRANGER_PREROLL_SEC", "2.0"))
 _REDIMNET_HUB_REPO = os.environ.get("REDIMNET_HUB_REPO", "PalabraAI/redimnet2")
 _REDIMNET_HUB_ENTRY = os.environ.get("REDIMNET_HUB_ENTRY", "redimnet2")
 _IS_REDIMNET2 = ("redimnet2" in _REDIMNET_HUB_REPO.lower()) or ("redimnet2" in _REDIMNET_HUB_ENTRY.lower())
 
 _DEFAULT_T_HIGH = "0.68" if _IS_REDIMNET2 else "0.72"
-_DEFAULT_T_LOW = "0.40" if _IS_REDIMNET2 else "0.60"
-_DEFAULT_CONFIRM_WINDOWS = "4" if _IS_REDIMNET2 else "3"
+_DEFAULT_T_LOW = "0.47" if _IS_REDIMNET2 else "0.60"
+_DEFAULT_CONFIRM_WINDOWS = "3"
 
 T_HIGH = float(os.environ.get("SAFEEAR_T_HIGH", _DEFAULT_T_HIGH))
 T_LOW = float(os.environ.get("SAFEEAR_T_LOW", _DEFAULT_T_LOW))
@@ -377,6 +379,9 @@ class SessionState:
     device_id: str
     sr: int = 16000
     ring: Optional[np.ndarray] = None
+    stranger_segment: Optional[np.ndarray] = None
+    stranger_segment_started_ms: int = 0
+    stranger_segment_ended_ms: int = 0
     stranger_streak: int = 0
     last_alert_ms: int = 0
     lat: Optional[float] = None
@@ -401,6 +406,42 @@ def stop_session(parent_id: str, device_id: str) -> None:
     key = _session_key(parent_id, device_id)
     with _LOCK:
         _SESSIONS.pop(key, None)
+
+
+def start_stranger_segment(
+    session: SessionState,
+    waveform: np.ndarray,
+    started_ms: int,
+    pre_roll_waveform: Optional[np.ndarray] = None,
+) -> None:
+    segment = np.asarray(waveform, dtype=np.float32).reshape(-1)
+    if pre_roll_waveform is not None:
+        pre_roll = np.asarray(pre_roll_waveform, dtype=np.float32).reshape(-1)
+        if pre_roll.size > 0:
+            segment = np.concatenate([pre_roll, segment])
+    session.stranger_segment = segment.copy()
+    session.stranger_segment_started_ms = int(started_ms)
+    session.stranger_segment_ended_ms = 0
+
+
+def append_stranger_segment(session: SessionState, waveform: np.ndarray) -> None:
+    segment = np.asarray(waveform, dtype=np.float32).reshape(-1)
+    if session.stranger_segment is None or session.stranger_segment.size == 0:
+        session.stranger_segment = segment.copy()
+        return
+    session.stranger_segment = np.concatenate([session.stranger_segment, segment])
+
+
+def clear_stranger_segment(session: SessionState) -> None:
+    session.stranger_segment = None
+    session.stranger_segment_started_ms = 0
+    session.stranger_segment_ended_ms = 0
+
+
+def get_stranger_segment_waveform(session: SessionState, fallback: np.ndarray) -> np.ndarray:
+    if session.stranger_segment is not None and session.stranger_segment.size > 0:
+        return session.stranger_segment
+    return np.asarray(fallback, dtype=np.float32).reshape(-1)
 
 
 def update_session_location(parent_id: str, device_id: str, lat: Optional[float], lon: Optional[float]) -> None:
@@ -460,7 +501,7 @@ def append_frame(session: SessionState, frame: np.ndarray) -> np.ndarray:
         session.ring = frame
     else:
         session.ring = np.concatenate([session.ring, frame])
-    keep = int(max(6.0, WINDOW_SEC) * session.sr)
+    keep = int(max(ALERT_RING_SEC, WINDOW_SEC) * session.sr)
     if session.ring.shape[0] > keep:
         session.ring = session.ring[-keep:]
     return session.ring
@@ -477,4 +518,13 @@ def save_alert_clip(parent_id: str, session: SessionState, waveform: np.ndarray)
     os.makedirs(adir, exist_ok=True)
     clip_path = os.path.join(adir, "clip.wav")
     sf.write(clip_path, waveform, session.sr)
+    metadata_path = os.path.join(adir, "metadata.json")
+    metadata = {
+        "segment_started_ms": int(session.stranger_segment_started_ms) or None,
+        "segment_ended_ms": int(session.stranger_segment_ended_ms) or None,
+        "sample_rate": int(session.sr),
+        "samples": int(np.asarray(waveform).reshape(-1).shape[0]),
+    }
+    with open(metadata_path, "w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, indent=2)
     return clip_path

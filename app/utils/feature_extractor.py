@@ -9,6 +9,7 @@ import librosa
 import torch
 
 from . import config
+from .audio_preprocess import normalize_waveform
 from .vad import apply_vad
 
 _redimnet = None
@@ -104,11 +105,11 @@ def _load_audio(path: str, target_sr: int = 16000) -> Tuple[np.ndarray, int]:
         data = data.mean(axis=1)
     if sr != target_sr:
         data = librosa.resample(data, orig_sr=sr, target_sr=target_sr)
-    return data.astype(np.float32), target_sr
+    return normalize_waveform(data.astype(np.float32)), target_sr
 
 
 def _embed_waveform_array(waveform: np.ndarray, sr: int = 16000) -> np.ndarray:
-    w = np.asarray(waveform, dtype=np.float32).reshape(-1)
+    w = normalize_waveform(np.asarray(waveform, dtype=np.float32).reshape(-1))
     min_s = max(16000, config.MIN_CHUNK_SAMPLES)
 
     if len(w) < 160:

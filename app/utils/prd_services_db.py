@@ -7,6 +7,11 @@ import shutil
 import threading
 import time
 import uuid
+import json
+import hashlib
+import hmac
+import base64
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass
@@ -17,11 +22,20 @@ from fastapi import HTTPException
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.database.models import Parent, Device, DeviceRole, EnrolledSpeaker, Alert as AlertModel
+from app.database.models import (
+    Parent,
+    Device,
+    DeviceRole,
+    EnrolledSpeaker,
+    Alert as AlertModel,
+    AuthCredential,
+    AuthProvider,
+)
+from app.utils.audio_preprocess import normalize_waveform
 from app.utils.feature_extractor import embed_waveform_chunks
 from app.utils.speech_gate import assess_speech_likeness
 from app.utils.vad import get_speech_segments
-from app.utils.yamnet_classifier import classify_audio_event
+from app.utils.yamnet_classifier import classify_audio_event_windowed
 
 TENANTS_ROOT = os.path.join("app", "data", "tenants")
 
@@ -30,13 +44,15 @@ JWT_EXPIRE_SEC = int(os.environ.get("SAFEEAR_JWT_EXPIRE_SEC", "604800"))
 
 WINDOW_SEC = float(os.environ.get("SAFEEAR_WINDOW_SEC", "1.5"))
 HOP_SEC = float(os.environ.get("SAFEEAR_HOP_SEC", "0.25"))
+ALERT_RING_SEC = float(os.environ.get("SAFEEAR_ALERT_RING_SEC", "6.0"))
+STRANGER_PREROLL_SEC = float(os.environ.get("SAFEEAR_STRANGER_PREROLL_SEC", "2.0"))
 _REDIMNET_HUB_REPO = os.environ.get("REDIMNET_HUB_REPO", "PalabraAI/redimnet2")
 _REDIMNET_HUB_ENTRY = os.environ.get("REDIMNET_HUB_ENTRY", "redimnet2")
 _IS_REDIMNET2 = ("redimnet2" in _REDIMNET_HUB_REPO.lower()) or ("redimnet2" in _REDIMNET_HUB_ENTRY.lower())
 
 _DEFAULT_T_HIGH = "0.68" if _IS_REDIMNET2 else "0.72"
-_DEFAULT_T_LOW = "0.40" if _IS_REDIMNET2 else "0.60"
-_DEFAULT_CONFIRM_WINDOWS = "4" if _IS_REDIMNET2 else "3"
+_DEFAULT_T_LOW = "0.47" if _IS_REDIMNET2 else "0.60"
+_DEFAULT_CONFIRM_WINDOWS = "3"
 
 T_HIGH = float(os.environ.get("SAFEEAR_T_HIGH", _DEFAULT_T_HIGH))
 T_LOW = float(os.environ.get("SAFEEAR_T_LOW", _DEFAULT_T_LOW))
@@ -47,6 +63,7 @@ logger = logging.getLogger(__name__)
 
 _LOCK = threading.Lock()
 _SESSIONS: Dict[str, "SessionState"] = {}
+_INFER_POOL = ThreadPoolExecutor(max_workers=int(os.environ.get("SAFEEAR_INFER_WORKERS", "2")))
 
 
 def _as_uuid(value: Any, field_name: str) -> uuid.UUID:
@@ -69,6 +86,16 @@ def _ensure_parent_dirs(parent_id: str) -> Dict[str, str]:
 
 def now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _perf_metrics(waveform_len: int, sr: int, started_at: float) -> Dict[str, float]:
+    elapsed_sec = max(0.0, time.perf_counter() - started_at)
+    audio_sec = max(1e-6, float(waveform_len) / float(max(1, sr)))
+    return {
+        "processing_ms": round(elapsed_sec * 1000.0, 1),
+        "audio_ms": round(audio_sec * 1000.0, 1),
+        "rtf": round(elapsed_sec / audio_sec, 4),
+    }
 
 
 def _b64(data: bytes) -> str:
@@ -134,6 +161,119 @@ def upsert_parent(db: Session, google_sub: str, email: Optional[str], display_na
     return parent
 
 
+def _normalize_email(email: str) -> str:
+    v = (email or "").strip().lower()
+    if not v or "@" not in v:
+        raise HTTPException(status_code=422, detail="invalid_email")
+    return v
+
+
+def _hash_password(password: str, salt: Optional[bytes] = None) -> str:
+    if password is None or len(password) < 8:
+        raise HTTPException(status_code=422, detail="password_too_short")
+    if salt is None:
+        salt = secrets.token_bytes(16)
+    derived = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 120000)
+    return f"pbkdf2_sha256$120000${base64.b64encode(salt).decode('ascii')}${base64.b64encode(derived).decode('ascii')}"
+
+
+def _verify_password(password: str, encoded_hash: str) -> bool:
+    try:
+        algo, rounds_s, salt_b64, digest_b64 = encoded_hash.split("$", 3)
+        if algo != "pbkdf2_sha256":
+            return False
+        rounds = int(rounds_s)
+        salt = base64.b64decode(salt_b64.encode("ascii"))
+        expected = base64.b64decode(digest_b64.encode("ascii"))
+    except Exception:
+        return False
+
+    actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, rounds)
+    return hmac.compare_digest(actual, expected)
+
+
+def register_parent_with_email(
+    db: Session, email: str, password: str, display_name: Optional[str] = None
+) -> Parent:
+    norm_email = _normalize_email(email)
+    existing_cred = db.query(AuthCredential).filter(AuthCredential.email == norm_email).first()
+    if existing_cred is not None:
+        raise HTTPException(status_code=409, detail="email_already_registered")
+
+    parent = Parent(
+        id=uuid.uuid4(),
+        # Keep existing schema intact by using deterministic non-google subject for email users.
+        google_sub=f"email:{norm_email}",
+        email=norm_email,
+        display_name=display_name,
+    )
+    db.add(parent)
+    db.flush()
+
+    cred = AuthCredential(
+        id=uuid.uuid4(),
+        parent_id=parent.id,
+        provider=AuthProvider.email_password,
+        email=norm_email,
+        password_hash=_hash_password(password),
+    )
+    db.add(cred)
+    db.commit()
+    db.refresh(parent)
+    _ensure_parent_dirs(parent.id)
+    return parent
+
+
+def login_parent_with_email(db: Session, email: str, password: str) -> Parent:
+    norm_email = _normalize_email(email)
+    cred = db.query(AuthCredential).filter(AuthCredential.email == norm_email).first()
+    if cred is None or not _verify_password(password, cred.password_hash):
+        raise HTTPException(status_code=401, detail="invalid_email_or_password")
+
+    parent = db.query(Parent).filter(Parent.id == cred.parent_id).first()
+    if parent is None:
+        raise HTTPException(status_code=401, detail="parent_not_found")
+    return parent
+
+
+def create_password_reset_token(db: Session, email: str, ttl_sec: int = 3600) -> Optional[str]:
+    norm_email = _normalize_email(email)
+    cred = db.query(AuthCredential).filter(AuthCredential.email == norm_email).first()
+    if cred is None:
+        # Do not reveal user existence.
+        return None
+
+    raw = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    cred.reset_token_hash = token_hash
+    cred.reset_token_expires_at = datetime.utcfromtimestamp(time.time() + ttl_sec)
+    cred.updated_at = datetime.utcnow()
+    db.commit()
+    return raw
+
+
+def reset_password_with_token(db: Session, token: str, new_password: str) -> None:
+    token_hash = hashlib.sha256((token or "").encode("utf-8")).hexdigest()
+    now = datetime.utcnow()
+    cred = (
+        db.query(AuthCredential)
+        .filter(
+            AuthCredential.reset_token_hash == token_hash,
+            AuthCredential.reset_token_expires_at.isnot(None),
+            AuthCredential.reset_token_expires_at >= now,
+        )
+        .first()
+    )
+    if cred is None:
+        raise HTTPException(status_code=400, detail="invalid_or_expired_reset_token")
+
+    cred.password_hash = _hash_password(new_password)
+    cred.reset_token_hash = None
+    cred.reset_token_expires_at = None
+    cred.updated_at = datetime.utcnow()
+    db.commit()
+
+
 def get_parent(db: Session, parent_id: str) -> Parent:
     parent_uuid = _as_uuid(parent_id, "parent_id")
     parent = db.query(Parent).filter(Parent.id == parent_uuid).first()
@@ -142,8 +282,17 @@ def get_parent(db: Session, parent_id: str) -> Parent:
     return parent
 
 
-def create_device(db: Session, parent_id: str, device_name: str, role: DeviceRole, device_token: Optional[str] = None) -> Device:
+def create_device(
+    db: Session,
+    parent_id: str,
+    device_name: Optional[str],
+    role: DeviceRole,
+    device_token: Optional[str] = None,
+) -> Device:
     parent_uuid = _as_uuid(parent_id, "parent_id")
+    normalized_name = (device_name or "").strip() or (
+        "Parent Device" if role == DeviceRole.parent_device else "Child Device"
+    )
 
     token = (device_token or "").strip() or None
     if token is not None:
@@ -151,7 +300,7 @@ def create_device(db: Session, parent_id: str, device_name: str, role: DeviceRol
         if existing is not None:
             # Reuse the existing row for this installation token and refresh its binding.
             existing.parent_id = parent_uuid
-            existing.device_name = device_name
+            existing.device_name = normalized_name
             existing.role = role
             existing.device_token = token
             existing.updated_at = datetime.utcnow()
@@ -162,7 +311,7 @@ def create_device(db: Session, parent_id: str, device_name: str, role: DeviceRol
     device = Device(
         id=uuid.uuid4(),
         parent_id=parent_uuid,
-        device_name=device_name,
+        device_name=normalized_name,
         role=role,
         device_token=token
     )
@@ -356,33 +505,43 @@ def _cos(a: np.ndarray, b: np.ndarray) -> float:
 
 def score_against_parent(db: Session, parent_id: str, query_embs: List[np.ndarray]) -> Tuple[float, Optional[str]]:
     candidates = load_parent_embeddings(db, parent_id)
+    return _score_against_candidates(candidates, query_embs, parent_id)
+
+
+def _score_against_candidates(
+    candidates: Dict[str, List[np.ndarray]], query_embs: List[np.ndarray], parent_id: Optional[str] = None
+) -> Tuple[float, Optional[str]]:
     best = -1.0
     best_speaker: Optional[str] = None
     speaker_scores = {}
     
     for sid, embs in candidates.items():
-        sims: List[float] = []
+        per_chunk_best: List[float] = []
         for q in query_embs:
-            for ref in embs:
-                sims.append(_cos(q, ref))
-        if not sims:
+            chunk_best = max((_cos(q, ref) for ref in embs), default=-1.0)
+            if chunk_best >= 0.0:
+                per_chunk_best.append(float(chunk_best))
+        if not per_chunk_best:
             continue
-        # Robust against one-off outliers: use mean of top-k similarities instead of global max.
-        top_k = sorted(sims, reverse=True)[: min(5, len(sims))]
-        speaker_score = float(np.mean(top_k))
+
+        # Robust against accidental one-off matches from strangers.
+        top_chunks = sorted(per_chunk_best, reverse=True)[: min(2, len(per_chunk_best))]
+        speaker_score = float((0.7 * np.median(per_chunk_best)) + (0.3 * np.mean(top_chunks)))
         speaker_scores[sid] = speaker_score
         if speaker_score > best:
             best = speaker_score
             best_speaker = sid
     
     if speaker_scores:
-        logger.debug(f"SPEAKER_SCORING | parent_id={parent_id} | scores={{{', '.join(f'{name}:{score:.4f}' for name, score in speaker_scores.items())}}}")
+        logger.debug(
+            f"SPEAKER_SCORING | parent_id={parent_id or 'unknown'} | scores={{{', '.join(f'{name}:{score:.4f}' for name, score in speaker_scores.items())}}}"
+        )
     
     if best < 0:
-        logger.info(f"NO_SPEAKER_MATCH | parent_id={parent_id} | score=0.0")
+        logger.info(f"NO_SPEAKER_MATCH | parent_id={parent_id or 'unknown'} | score=0.0")
         return 0.0, None
     
-    logger.info(f"BEST_SPEAKER_MATCHED | parent_id={parent_id} | speaker_id={best_speaker} | score={best:.4f}")
+    logger.info(f"BEST_SPEAKER_MATCHED | parent_id={parent_id or 'unknown'} | speaker_id={best_speaker} | score={best:.4f}")
     return float(best), best_speaker
 
 
@@ -450,18 +609,70 @@ def get_alert(db: Session, parent_id: str, alert_id: str) -> AlertModel:
     return alert
 
 
+def _delete_clip_path(path: Optional[str]) -> None:
+    if not path:
+        return
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+        clip_dir = os.path.dirname(path)
+        if clip_dir and os.path.isdir(clip_dir) and not os.listdir(clip_dir):
+            os.rmdir(clip_dir)
+    except OSError:
+        # Clip cleanup should never block DB deletion.
+        pass
+
+
+def delete_alert(db: Session, parent_id: str, alert_id: str) -> None:
+    parent_uuid = _as_uuid(parent_id, "parent_id")
+    alert_uuid = _as_uuid(alert_id, "alert_id")
+    alert = db.query(AlertModel).filter(
+        AlertModel.id == alert_uuid,
+        AlertModel.parent_id == parent_uuid
+    ).first()
+    if not alert:
+        raise HTTPException(status_code=404, detail="alert_not_found")
+
+    clip_path = alert.audio_clip_path
+    db.delete(alert)
+    db.commit()
+    _delete_clip_path(clip_path)
+
+
+def delete_all_alerts(db: Session, parent_id: str) -> int:
+    parent_uuid = _as_uuid(parent_id, "parent_id")
+    rows = db.query(AlertModel).filter(AlertModel.parent_id == parent_uuid).all()
+    if not rows:
+        return 0
+
+    clip_paths = [row.audio_clip_path for row in rows]
+    deleted_count = len(rows)
+    for row in rows:
+        db.delete(row)
+    db.commit()
+
+    for path in clip_paths:
+        _delete_clip_path(path)
+
+    return deleted_count
+
+
 @dataclass
 class SessionState:
     parent_id: str
     device_id: str
     sr: int = 16000
     ring: Optional[np.ndarray] = None
+    stranger_segment: Optional[np.ndarray] = None
+    stranger_segment_started_ms: int = 0
+    stranger_segment_ended_ms: int = 0
     stranger_streak: int = 0
     last_alert_ms: int = 0
     lat: Optional[float] = None
     lon: Optional[float] = None
     last_familiar_ms: int = 0
     last_familiar_speaker_id: Optional[str] = None
+    familiar_recovery_streak: int = 0
 
 
 def _session_key(parent_id: str, device_id: str) -> str:
@@ -484,6 +695,42 @@ def stop_session(parent_id: str, device_id: str) -> None:
         _SESSIONS.pop(key, None)
 
 
+def start_stranger_segment(
+    session: SessionState,
+    waveform: np.ndarray,
+    started_ms: int,
+    pre_roll_waveform: Optional[np.ndarray] = None,
+) -> None:
+    segment = np.asarray(waveform, dtype=np.float32).reshape(-1)
+    if pre_roll_waveform is not None:
+        pre_roll = np.asarray(pre_roll_waveform, dtype=np.float32).reshape(-1)
+        if pre_roll.size > 0:
+            segment = np.concatenate([pre_roll, segment])
+    session.stranger_segment = segment.copy()
+    session.stranger_segment_started_ms = int(started_ms)
+    session.stranger_segment_ended_ms = 0
+
+
+def append_stranger_segment(session: SessionState, waveform: np.ndarray) -> None:
+    segment = np.asarray(waveform, dtype=np.float32).reshape(-1)
+    if session.stranger_segment is None or session.stranger_segment.size == 0:
+        session.stranger_segment = segment.copy()
+        return
+    session.stranger_segment = np.concatenate([session.stranger_segment, segment])
+
+
+def clear_stranger_segment(session: SessionState) -> None:
+    session.stranger_segment = None
+    session.stranger_segment_started_ms = 0
+    session.stranger_segment_ended_ms = 0
+
+
+def get_stranger_segment_waveform(session: SessionState, fallback: np.ndarray) -> np.ndarray:
+    if session.stranger_segment is not None and session.stranger_segment.size > 0:
+        return session.stranger_segment
+    return np.asarray(fallback, dtype=np.float32).reshape(-1)
+
+
 def update_session_location(parent_id: str, device_id: str, lat: Optional[float], lon: Optional[float]) -> None:
     s = get_or_create_session(parent_id, device_id)
     s.lat = lat
@@ -491,15 +738,26 @@ def update_session_location(parent_id: str, device_id: str, lat: Optional[float]
 
 
 def evaluate_window(db: Session, parent_id: str, waveform: np.ndarray, sr: int = 16000) -> Dict[str, Any]:
-    waveform = np.asarray(waveform, dtype=np.float32).reshape(-1)
+    started_at = time.perf_counter()
+    waveform = normalize_waveform(np.asarray(waveform, dtype=np.float32).reshape(-1))
     rms = float(np.sqrt(np.mean(waveform**2) + 1e-12))
     if rms < 0.003:
+        perf = _perf_metrics(len(waveform), sr, started_at)
+        logger.info(
+            "WINDOW_PERF | parent_id=%s | decision=%s | processing_ms=%.1f | audio_ms=%.1f | rtf=%.4f",
+            parent_id,
+            "rejected_silence",
+            perf["processing_ms"],
+            perf["audio_ms"],
+            perf["rtf"],
+        )
         logger.info(f"TIER1_VAD_REJECTED | parent_id={parent_id} | reason=low_rms | rms={rms:.6f}")
         return {
             "tier1_vad": {"passed": False, "voiced_ms": 0.0, "rms": rms},
             "tier2": {"passed": False, "confidence": 0.0, "reason": "low_rms"},
             "tier3": {"passed": False, "score": 0.0, "closest_speaker_id": None},
             "decision": "rejected_silence",
+            "perf": perf,
         }
 
     try:
@@ -510,21 +768,37 @@ def evaluate_window(db: Session, parent_id: str, waveform: np.ndarray, sr: int =
     voiced_samples = sum(max(0, e - s) for s, e in segments)
     voiced_ms = round((voiced_samples * 1000.0) / sr, 1)
     if voiced_samples <= int(0.5 * sr):
+        perf = _perf_metrics(len(waveform), sr, started_at)
+        logger.info(
+            "WINDOW_PERF | parent_id=%s | decision=%s | processing_ms=%.1f | audio_ms=%.1f | rtf=%.4f",
+            parent_id,
+            "rejected",
+            perf["processing_ms"],
+            perf["audio_ms"],
+            perf["rtf"],
+        )
         logger.info(f"TIER1_VAD_REJECTED | parent_id={parent_id} | reason=insufficient_voice | voiced_ms={voiced_ms} | threshold_ms=500")
         return {
             "tier1_vad": {"passed": False, "voiced_ms": voiced_ms},
             "tier2": {"passed": False, "confidence": 0.0},
             "tier3": {"passed": False, "score": 0.0, "closest_speaker_id": None},
             "decision": "rejected",
+            "perf": perf,
         }
 
     logger.info(f"TIER1_VAD_PASSED | parent_id={parent_id} | voiced_ms={voiced_ms} | rms={rms:.6f}")
 
     longest = max(segments, key=lambda ab: ab[1] - ab[0])
     gate_audio = waveform[longest[0] : longest[1]]
+    parent_candidates = load_parent_embeddings(db, parent_id)
+
+    # Run YAMNet and ReDimNet path in parallel after VAD to reduce tail latency.
+    future_yamnet = _INFER_POOL.submit(classify_audio_event_windowed, gate_audio, sr)
+    future_embs = _INFER_POOL.submit(embed_waveform_chunks, waveform, sr, segments)
+
     speech_ok, speech_metrics = assess_speech_likeness(gate_audio, sr)
-    
-    yamnet_result = classify_audio_event(gate_audio, sr)
+
+    yamnet_result = future_yamnet.result()
     category = yamnet_result.get("category", "uncertain")
     confidence = float(yamnet_result.get("confidence", 0.0))
 
@@ -546,20 +820,39 @@ def evaluate_window(db: Session, parent_id: str, waveform: np.ndarray, sr: int =
     )
 
     if hard_reject:
+        perf = _perf_metrics(len(waveform), sr, started_at)
+        logger.info(
+            "WINDOW_PERF | parent_id=%s | decision=%s | processing_ms=%.1f | audio_ms=%.1f | rtf=%.4f",
+            parent_id,
+            "discard_non_human_or_low_confidence",
+            perf["processing_ms"],
+            perf["audio_ms"],
+            perf["rtf"],
+        )
         logger.info(f"TIER2_REJECTED | parent_id={parent_id} | speech_ok={speech_ok} | yamnet_category={category} | yamnet_confidence={confidence:.4f}")
         return {
             "tier1_vad": {"passed": True, "voiced_ms": voiced_ms},
             "tier2": {"passed": False, "confidence": confidence, **yamnet_result, **speech_metrics},
             "tier3": {"passed": False, "score": 0.0, "closest_speaker_id": None},
             "decision": "discard_non_human_or_low_confidence",
+            "perf": perf,
         }
 
     logger.info(f"TIER2_PASSED | parent_id={parent_id} | proceeding_to_tier3_speaker_match")
 
-    query_embs = embed_waveform_chunks(waveform, sr=sr, segments=segments)
-    score, closest_speaker_id = score_against_parent(db, parent_id, query_embs)
+    query_embs = future_embs.result()
+    score, closest_speaker_id = _score_against_candidates(parent_candidates, query_embs, parent_id)
     
     logger.info(f"TIER3_SCORED | parent_id={parent_id} | score={score:.4f} | closest_speaker_id={closest_speaker_id} | t_high={T_HIGH} | t_low={T_LOW}")
+    perf = _perf_metrics(len(waveform), sr, started_at)
+    logger.info(
+        "WINDOW_PERF | parent_id=%s | decision=%s | processing_ms=%.1f | audio_ms=%.1f | rtf=%.4f",
+        parent_id,
+        "tier3_scored",
+        perf["processing_ms"],
+        perf["audio_ms"],
+        perf["rtf"],
+    )
     
     return {
         "tier1_vad": {"passed": True, "voiced_ms": voiced_ms},
@@ -572,6 +865,7 @@ def evaluate_window(db: Session, parent_id: str, waveform: np.ndarray, sr: int =
             "t_low": T_LOW,
         },
         "decision": "tier3_scored",
+        "perf": perf,
     }
 
 
@@ -581,7 +875,7 @@ def append_frame(session: SessionState, frame: np.ndarray) -> np.ndarray:
         session.ring = frame
     else:
         session.ring = np.concatenate([session.ring, frame])
-    keep = int(max(6.0, WINDOW_SEC) * session.sr)
+    keep = int(max(ALERT_RING_SEC, WINDOW_SEC) * session.sr)
     if session.ring.shape[0] > keep:
         session.ring = session.ring[-keep:]
     return session.ring
@@ -598,4 +892,13 @@ def save_alert_clip(parent_id: str, session: SessionState, waveform: np.ndarray)
     os.makedirs(adir, exist_ok=True)
     clip_path = os.path.join(adir, "clip.wav")
     sf.write(clip_path, waveform, session.sr)
+    metadata_path = os.path.join(adir, "metadata.json")
+    metadata = {
+        "segment_started_ms": int(session.stranger_segment_started_ms) or None,
+        "segment_ended_ms": int(session.stranger_segment_ended_ms) or None,
+        "sample_rate": int(session.sr),
+        "samples": int(np.asarray(waveform).reshape(-1).shape[0]),
+    }
+    with open(metadata_path, "w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, indent=2)
     return clip_path

@@ -105,6 +105,77 @@ def classify_audio_event(waveform: np.ndarray, sr: int = 16000) -> Dict[str, Any
         return _fallback_classify(waveform)
 
 
+def classify_audio_event_windowed(
+    waveform: np.ndarray,
+    sr: int = 16000,
+    frame_sec: float = 0.96,
+    hop_sec: float = 0.48,
+) -> Dict[str, Any]:
+    """Aggregate YAMNet decisions over overlapping near-native frames."""
+    w = np.asarray(waveform, dtype=np.float32).reshape(-1)
+    if w.size == 0:
+        return {
+            "category": "reject",
+            "confidence": 0.0,
+            "top_class": "unknown",
+            "all_scores": {"unknown": 0.0},
+            "method": "yamnet_windowed",
+            "num_frames": 0,
+        }
+
+    frame_len = max(1, int(frame_sec * sr))
+    hop_len = max(1, int(hop_sec * sr))
+
+    frames = []
+    if w.shape[0] <= frame_len:
+        frames = [w]
+    else:
+        for start in range(0, max(1, w.shape[0] - frame_len + 1), hop_len):
+            end = start + frame_len
+            if end > w.shape[0]:
+                break
+            frames.append(w[start:end])
+        if not frames:
+            frames = [w[-frame_len:]]
+
+    decisions = [classify_audio_event(f, sr=sr) for f in frames]
+
+    category_votes: Dict[str, int] = {}
+    category_conf: Dict[str, list] = {}
+    for d in decisions:
+        c = str(d.get("category", "uncertain"))
+        conf = float(d.get("confidence", 0.0))
+        category_votes[c] = category_votes.get(c, 0) + 1
+        category_conf.setdefault(c, []).append(conf)
+
+    def _cat_key(cat: str):
+        confs = category_conf.get(cat, [0.0])
+        return (category_votes.get(cat, 0), float(np.mean(confs)))
+
+    best_category = max(category_votes.keys(), key=_cat_key)
+    best_conf = float(np.median(category_conf.get(best_category, [0.0])))
+
+    top_class_votes: Dict[str, int] = {}
+    for d in decisions:
+        c = str(d.get("top_class", "unknown"))
+        top_class_votes[c] = top_class_votes.get(c, 0) + 1
+    best_top_class = max(top_class_votes.keys(), key=lambda k: top_class_votes[k])
+
+    return {
+        "category": best_category,
+        "confidence": best_conf,
+        "top_class": best_top_class,
+        "all_scores": {
+            f"cat_{cat}": float(np.mean(confs))
+            for cat, confs in category_conf.items()
+        },
+        "method": "yamnet_windowed",
+        "num_frames": len(frames),
+        "frame_sec": frame_sec,
+        "hop_sec": hop_sec,
+    }
+
+
 def _fallback_classify(waveform: np.ndarray) -> Dict[str, Any]:
     """Fallback when YAMNet is unavailable. Use speech gate + energy."""
     from app.utils.speech_gate import assess_speech_likeness

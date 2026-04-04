@@ -2,6 +2,7 @@
 
 import os
 import time
+import json
 from typing import Optional
 from datetime import datetime, timedelta
 import logging
@@ -13,6 +14,9 @@ SMS_TIMEOUT_SEC = int(os.environ.get("SAFEEAR_SMS_TIMEOUT_SEC", "60"))
 EMAIL_TIMEOUT_SEC = int(os.environ.get("SAFEEAR_EMAIL_TIMEOUT_SEC", "30"))
 
 FIREBASE_CREDENTIALS = os.environ.get("FIREBASE_CREDENTIALS_PATH")
+FIREBASE_CREDENTIALS_JSON = os.environ.get("FIREBASE_CREDENTIALS_JSON")
+FIREBASE_PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID") or os.environ.get("GOOGLE_CLOUD_PROJECT")
+ANDROID_NOTIFICATION_CHANNEL_ID = os.environ.get("SAFEEAR_ANDROID_NOTIFICATION_CHANNEL_ID", "safeear_alerts")
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
 TWILIO_FROM_NUMBER = os.environ.get("TWILIO_FROM_NUMBER")
@@ -25,14 +29,19 @@ def _init_firebase():
     try:
         import firebase_admin
         from firebase_admin import credentials, messaging
+
+        init_options = {"projectId": FIREBASE_PROJECT_ID} if FIREBASE_PROJECT_ID else None
         
         if not firebase_admin._apps:
             if FIREBASE_CREDENTIALS:
                 cred = credentials.Certificate(FIREBASE_CREDENTIALS)
-                firebase_admin.initialize_app(cred)
+                firebase_admin.initialize_app(cred, options=init_options)
+            elif FIREBASE_CREDENTIALS_JSON:
+                cred = credentials.Certificate(json.loads(FIREBASE_CREDENTIALS_JSON))
+                firebase_admin.initialize_app(cred, options=init_options)
             else:
-                logger.warning("[firebase] No credentials provided; FCM disabled")
-                return None
+                # Works on Render if GOOGLE_APPLICATION_CREDENTIALS is set.
+                firebase_admin.initialize_app(credentials.ApplicationDefault(), options=init_options)
         return messaging
     except Exception as e:
         logger.error(f"[firebase] Init failed: {e}")
@@ -52,7 +61,11 @@ def send_fcm_push(
         return False
 
     try:
-        maps_url = f"https://www.google.com/maps?q={lat},{lon}" if lat and lon else "https://www.google.com/maps"
+        maps_url = (
+            f"https://www.google.com/maps?q={lat},{lon}"
+            if lat is not None and lon is not None
+            else "https://www.google.com/maps"
+        )
         message = messaging.Message(
             notification=messaging.Notification(
                 title="SafeEar Alert",
@@ -64,13 +77,22 @@ def send_fcm_push(
                 "maps_url": maps_url,
                 "confidence": str(confidence)
             },
+            android=messaging.AndroidConfig(
+                priority="high",
+                ttl=timedelta(minutes=15),
+                notification=messaging.AndroidNotification(
+                    channel_id=ANDROID_NOTIFICATION_CHANNEL_ID,
+                    sound="default",
+                    click_action="SAFEEAR_ALERT",
+                ),
+            ),
             token=fcm_token,
         )
         response = messaging.send(message, dry_run=False)
-        logger.info(f"[fcm] Sent to {fcm_token}: {response}")
+        logger.info("[fcm] Sent | token_suffix=%s | response=%s", fcm_token[-8:], response)
         return True
     except Exception as e:
-        logger.error(f"[fcm] Send failed: {e}")
+        logger.error("[fcm] Send failed | token_suffix=%s | error=%s", (fcm_token[-8:] if fcm_token else "none"), str(e))
         return False
 
 

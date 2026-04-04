@@ -5,6 +5,7 @@ import shutil
 import tempfile
 import threading
 import warnings
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -18,6 +19,7 @@ from sqlalchemy.orm import Session
 from app.database.models import Device, DeviceRole
 from app.database.session import get_db, init_db
 from app.utils import prd_services_db as svc
+from app.utils.audio_preprocess import normalize_waveform
 from app.utils.notification_worker import escalate_alert
 from app.utils.prd_services import (
     DEBOUNCE_SEC,
@@ -37,6 +39,12 @@ FORCE_ALERT_SCORE = float(os.environ.get("SAFEEAR_FORCE_ALERT_SCORE", "0.15"))
 FORCE_ALERT_MIN_STREAK = int(os.environ.get("SAFEEAR_FORCE_ALERT_MIN_STREAK", "2"))
 FAMILIAR_GRACE_SEC = int(os.environ.get("SAFEEAR_FAMILIAR_GRACE_SEC", "20"))
 FAMILIAR_HOLD_FLOOR = float(os.environ.get("SAFEEAR_FAMILIAR_HOLD_FLOOR", "0.30"))
+FAMILIAR_GRACE_MARGIN = float(os.environ.get("SAFEEAR_FAMILIAR_GRACE_MARGIN", "0.05"))
+FAMILIAR_GRACE_MIN_CONF = float(os.environ.get("SAFEEAR_FAMILIAR_GRACE_MIN_CONF", "0.65"))
+FAMILIAR_RESET_MIN_STREAK = int(os.environ.get("SAFEEAR_FAMILIAR_RESET_MIN_STREAK", "2"))
+SOFT_STRANGER_MARGIN = float(os.environ.get("SAFEEAR_SOFT_STRANGER_MARGIN", "0.08"))
+SOFT_STRANGER_MIN_CONF = float(os.environ.get("SAFEEAR_SOFT_STRANGER_MIN_CONF", "0.30"))
+STRANGER_PREROLL_SEC = float(os.environ.get("SAFEEAR_STRANGER_PREROLL_SEC", "2.0"))
 
 # Keep TF/Google runtime logs readable in local dev.
 os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
@@ -76,6 +84,26 @@ class GoogleAuthRequest(BaseModel):
 
 class RefreshRequest(BaseModel):
     refresh_token: str
+
+
+class EmailRegisterRequest(BaseModel):
+    email: str
+    password: str
+    display_name: Optional[str] = None
+
+
+class EmailLoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: str
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str
 
 
 class RenameSpeakerRequest(BaseModel):
@@ -152,9 +180,9 @@ def get_current_parent(
 
 
 def _verify_google_like_token(id_token: str) -> Dict[str, Any]:
-    client_id = os.environ.get("GOOGLE_CLIENT_ID")
     allow_dev = os.environ.get("SAFEEAR_ALLOW_DEV_GOOGLE_TOKEN", "true").lower() == "true"
 
+    # Dev token bypass (for testing/development).
     if id_token.startswith("dev:"):
         if not allow_dev:
             raise HTTPException(status_code=401, detail="dev_token_disabled")
@@ -163,7 +191,21 @@ def _verify_google_like_token(id_token: str) -> Dict[str, Any]:
             raise HTTPException(status_code=401, detail="invalid_dev_token")
         return {"sub": dev_sub, "email": f"{dev_sub}@dev.local", "name": dev_sub}
 
-    if not client_id:
+    # Collect configured Google client IDs.
+    raw_client_ids = []
+    for key in ("GOOGLE_CLIENT_ID", "GOOGLE_WEB_CLIENT_ID", "GOOGLE_ANDROID_CLIENT_ID", "GOOGLE_CLIENT_IDS"):
+        value = os.environ.get(key)
+        if value:
+            raw_client_ids.append(value)
+
+    allowed_client_ids = []
+    for raw in raw_client_ids:
+        allowed_client_ids.extend([part.strip() for part in raw.split(",") if part.strip()])
+
+    allowed_client_ids = list(dict.fromkeys(allowed_client_ids))
+
+    if not allowed_client_ids:
+        logger.warning("GOOGLE_AUTH_SKIPPED | reason=no_google_client_id_configured")
         raise HTTPException(status_code=500, detail="missing_google_client_id")
 
     try:
@@ -171,10 +213,88 @@ def _verify_google_like_token(id_token: str) -> Dict[str, Any]:
 
         grequests = importlib.import_module("google.auth.transport.requests")
         gid = importlib.import_module("google.oauth2.id_token")
-        info = gid.verify_oauth2_token(id_token, grequests.Request(), client_id)
+        last_error = None
+        info = None
+        for client_id in allowed_client_ids:
+            try:
+                info = gid.verify_oauth2_token(id_token, grequests.Request(), audience=client_id)
+                break
+            except Exception as exc:
+                last_error = exc
+                continue
+
+        if info is None:
+            raise HTTPException(status_code=401, detail="invalid_google_id_token") from last_error
+
+        aud = str(info.get("aud", "")).strip()
+        if aud not in allowed_client_ids:
+            logger.warning(
+                "GOOGLE_AUTH_AUDIENCE_MISMATCH | aud=%s | allowed=%s",
+                aud,
+                ",".join(allowed_client_ids),
+            )
+            raise HTTPException(status_code=401, detail="invalid_google_audience")
         return {"sub": info.get("sub"), "email": info.get("email"), "name": info.get("name")}
+    except HTTPException:
+        raise
     except Exception as exc:
+        logger.warning("GOOGLE_AUTH_VERIFY_FAILED | reason=%s", str(exc))
         raise HTTPException(status_code=401, detail="invalid_google_id_token") from exc
+
+
+def _send_password_reset_email(to_email: str, reset_link: str) -> None:
+    sendgrid_api_key = os.environ.get("SENDGRID_API_KEY")
+    from_email = os.environ.get("SENDGRID_FROM_EMAIL", "alerts@safeear.app")
+    if not sendgrid_api_key:
+        logger.info("PASSWORD_RESET_EMAIL_SKIPPED | email=%s | reason=sendgrid_not_configured", to_email)
+        return
+    try:
+        from sendgrid import SendGridAPIClient
+        from sendgrid.helpers.mail import Mail
+
+        message = Mail(
+            from_email=from_email,
+            to_emails=to_email,
+            subject="SafeEar password reset",
+            html_content=(
+                "<p>You requested a SafeEar password reset.</p>"
+                f"<p><a href=\"{reset_link}\">Reset password</a></p>"
+                "<p>If you didn't request this, you can ignore this email.</p>"
+            ),
+        )
+        SendGridAPIClient(sendgrid_api_key).send(message)
+    except Exception as exc:
+        logger.warning("PASSWORD_RESET_EMAIL_FAILED | email=%s | reason=%s", to_email, str(exc))
+
+
+def _dt_to_epoch_ms(value: Optional[datetime]) -> Optional[int]:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return int(value.timestamp() * 1000)
+
+
+def _alert_response_payload(row: Any) -> Dict[str, Any]:
+    return {
+        "id": str(row.id),
+        "parent_id": str(row.parent_id),
+        "device_id": str(row.device_id),
+        "timestamp": row.timestamp,
+        "timestamp_ms": _dt_to_epoch_ms(row.timestamp),
+        "confidence_score": row.confidence_score,
+        "audio_clip_path": row.audio_clip_path,
+        "latitude": row.latitude,
+        "longitude": row.longitude,
+        "lat": row.latitude,
+        "lng": row.longitude,
+        "acknowledged_at": row.acknowledged_at,
+        "acknowledged_at_ms": _dt_to_epoch_ms(row.acknowledged_at),
+        "created_at": row.created_at,
+        "created_at_ms": _dt_to_epoch_ms(row.created_at),
+        "updated_at": row.updated_at,
+        "updated_at_ms": _dt_to_epoch_ms(row.updated_at),
+    }
 
 
 @app.post("/auth/google")
@@ -201,6 +321,72 @@ def auth_google(body: GoogleAuthRequest, db: Session = Depends(get_db)):
     }
 
 
+@app.post("/auth/register-email")
+def auth_register_email(body: EmailRegisterRequest, db: Session = Depends(get_db)):
+    from app.utils.prd_services import make_jwt, save_refresh_token
+
+    parent = svc.register_parent_with_email(db, body.email, body.password, body.display_name)
+    access_token = make_jwt(str(parent.id))
+    refresh_token = save_refresh_token(str(parent.id))
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "expires_in": 604800,
+        "parent": {
+            "id": str(parent.id),
+            "email": parent.email,
+            "display_name": parent.display_name,
+        },
+    }
+
+
+@app.post("/auth/login-email")
+def auth_login_email(body: EmailLoginRequest, db: Session = Depends(get_db)):
+    from app.utils.prd_services import make_jwt, save_refresh_token
+
+    parent = svc.login_parent_with_email(db, body.email, body.password)
+    access_token = make_jwt(str(parent.id))
+    refresh_token = save_refresh_token(str(parent.id))
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "expires_in": 604800,
+        "parent": {
+            "id": str(parent.id),
+            "email": parent.email,
+            "display_name": parent.display_name,
+        },
+    }
+
+
+@app.post("/auth/forgot-password")
+def auth_forgot_password(body: ForgotPasswordRequest, db: Session = Depends(get_db)):
+    reset_token = svc.create_password_reset_token(db, body.email, ttl_sec=3600)
+
+    reset_base_url = os.environ.get("SAFEEAR_PASSWORD_RESET_URL")
+    if reset_token and reset_base_url:
+        reset_link = f"{reset_base_url}?token={reset_token}"
+        _send_password_reset_email(body.email, reset_link)
+
+    response: Dict[str, Any] = {
+        "status": "ok",
+        "message": "If this email is registered, a reset link has been issued.",
+    }
+    if reset_token and os.environ.get("SAFEEAR_DEBUG_RETURN_RESET_TOKEN", "false").lower() == "true":
+        response["reset_token"] = reset_token
+    if reset_token and not reset_base_url:
+        response["note"] = "Set SAFEEAR_PASSWORD_RESET_URL to enable email reset links."
+    return response
+
+
+@app.post("/auth/reset-password")
+def auth_reset_password(body: ResetPasswordRequest, db: Session = Depends(get_db)):
+    svc.reset_password_with_token(db, body.token, body.new_password)
+    return {"status": "ok", "message": "password_updated"}
+
+
 @app.post("/auth/refresh")
 def auth_refresh(body: RefreshRequest, db: Session = Depends(get_db)):
     from app.utils.prd_services import consume_refresh_token, make_jwt, save_refresh_token
@@ -215,10 +401,20 @@ def auth_refresh(body: RefreshRequest, db: Session = Depends(get_db)):
     }
 
 
-@app.delete("/auth/logout")
-def auth_logout(body: RefreshRequest, db: Session = Depends(get_db)):
+@app.api_route("/auth/logout", methods=["POST", "DELETE"])
+def auth_logout(
+    body: Optional[RefreshRequest] = None,
+    refresh_token: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
     from app.utils.prd_services import revoke_refresh_token
-    revoke_refresh_token(body.refresh_token)
+
+    # Some mobile clients cannot reliably send a JSON body with DELETE.
+    token = (body.refresh_token if body else None) or refresh_token
+    if not token:
+        raise HTTPException(status_code=422, detail="refresh_token_required")
+
+    revoke_refresh_token(token)
     return {"status": "ok"}
 
 
@@ -385,6 +581,8 @@ async def detect_chunk(
             )
             raise HTTPException(status_code=400, detail="audio_chunk_must_be_16khz") from exc
 
+    arr = normalize_waveform(arr)
+
     parent_id = current["parent_id"]
     # Validate device role: only child_device can stream detection chunks
     device = svc.get_device(db, parent_id, device_id)
@@ -441,15 +639,31 @@ async def detect_chunk(
     tier1_pass = stage.get("tier1_vad", {}).get("passed", False)
     tier2_pass = stage.get("tier2", {}).get("passed", False)
     tier3_pass = stage.get("tier3", {}).get("passed", False)
+    tier2_category = str(stage.get("tier2", {}).get("category", "uncertain"))
+    tier2_confidence = float(stage.get("tier2", {}).get("confidence", 0.0))
     logger.info(f"STAGE_RESULT | score={score:.4f} | tier1_vad={tier1_pass} | tier2={tier2_pass} | tier3={tier3_pass} | stage_decision={stage.get('decision', 'unknown')}")
 
     if score >= T_HIGH:
-        session.stranger_streak = 0
-        session.last_familiar_ms = now
-        session.last_familiar_speaker_id = str(closest_speaker_id) if closest_speaker_id else None
-        decision = "familiar"
-        logger.info(f"SCORE_DECISION | score={score:.4f} >= t_high={T_HIGH} | decision=familiar | streak_reset")
+        session.familiar_recovery_streak += 1
+        if session.stranger_streak > 0 and session.familiar_recovery_streak < FAMILIAR_RESET_MIN_STREAK:
+            decision = "uncertain_recovery"
+            logger.info(
+                "SCORE_DECISION | score=%.4f >= t_high=%.2f but pending_familiar_recovery "
+                "| decision=uncertain_recovery | recovery_streak=%s/%s | stranger_streak=%s",
+                score,
+                T_HIGH,
+                session.familiar_recovery_streak,
+                FAMILIAR_RESET_MIN_STREAK,
+                session.stranger_streak,
+            )
+        else:
+            session.stranger_streak = 0
+            session.last_familiar_ms = now
+            session.last_familiar_speaker_id = str(closest_speaker_id) if closest_speaker_id else None
+            decision = "familiar"
+            logger.info(f"SCORE_DECISION | score={score:.4f} >= t_high={T_HIGH} | decision=familiar | streak_reset")
     elif score <= T_LOW:
+        session.familiar_recovery_streak = 0
         within_familiar_grace = (
             session.last_familiar_ms > 0
             and (now - session.last_familiar_ms) <= FAMILIAR_GRACE_SEC * 1000
@@ -459,8 +673,10 @@ async def detect_chunk(
             and bool(session.last_familiar_speaker_id)
             and str(closest_speaker_id) == str(session.last_familiar_speaker_id)
         )
+        mild_post_familiar_dip = score >= max(FAMILIAR_HOLD_FLOOR, T_LOW - FAMILIAR_GRACE_MARGIN)
+        strong_human_signal = tier2_category == "human_speech" and tier2_confidence >= FAMILIAR_GRACE_MIN_CONF
 
-        if within_familiar_grace and same_recent_speaker and score >= FAMILIAR_HOLD_FLOOR:
+        if within_familiar_grace and same_recent_speaker and session.stranger_streak == 0 and mild_post_familiar_dip and strong_human_signal:
             session.stranger_streak = 0
             decision = "uncertain_post_familiar"
             logger.info(
@@ -472,8 +688,25 @@ async def detect_chunk(
             decision = "stranger_candidate"
             logger.info(f"SCORE_DECISION | score={score:.4f} <= t_low={T_LOW} | decision=stranger_candidate | streak_incremented={session.stranger_streak}")
     else:
-        decision = "uncertain"
-        logger.info(f"SCORE_DECISION | t_low < score={score:.4f} < t_high | decision=uncertain")
+        session.familiar_recovery_streak = 0
+        soft_limit = T_LOW + SOFT_STRANGER_MARGIN
+        likely_human_speech = tier2_category in {"human_speech", "uncertain"} and tier2_confidence >= SOFT_STRANGER_MIN_CONF
+
+        if score <= soft_limit and likely_human_speech:
+            session.stranger_streak += 1
+            decision = "stranger_candidate_soft"
+            logger.info(
+                "SCORE_DECISION | soft_stranger_window | score=%.4f | soft_limit=%.4f | "
+                "tier2_category=%s | tier2_confidence=%.4f | streak_incremented=%s",
+                score,
+                soft_limit,
+                tier2_category,
+                tier2_confidence,
+                session.stranger_streak,
+            )
+        else:
+            decision = "uncertain"
+            logger.info(f"SCORE_DECISION | t_low < score={score:.4f} < t_high | decision=uncertain")
 
     # For clearly low scores, fast-track only after at least N consecutive stranger windows.
     if score <= FORCE_ALERT_SCORE and session.stranger_streak >= FORCE_ALERT_MIN_STREAK:
@@ -484,9 +717,34 @@ async def detect_chunk(
             f"min_streak={FORCE_ALERT_MIN_STREAK} | streak_updated={old_streak}->{session.stranger_streak}"
         )
 
+    # Capture the full stranger episode instead of only the last rolling window.
+    if session.stranger_streak > 0:
+        if session.stranger_segment is None:
+            pre_roll_samples = int(STRANGER_PREROLL_SEC * session.sr)
+            pre_roll_waveform = None
+            if ring is not None and ring.shape[0] > len(arr):
+                pre_roll_source = ring[:-len(arr)]
+                if pre_roll_source.shape[0] > 0:
+                    pre_roll_waveform = pre_roll_source[-pre_roll_samples:]
+            svc.start_stranger_segment(session, arr, now, pre_roll_waveform=pre_roll_waveform)
+            logger.info(
+                "STRANGER_SEGMENT_START | parent_id=%s | device_id=%s | started_ms=%s | first_chunk_samples=%s | pre_roll_samples=%s",
+                parent_id,
+                device_id,
+                now,
+                int(len(arr)),
+                int(pre_roll_waveform.shape[0]) if pre_roll_waveform is not None else 0,
+            )
+        else:
+            svc.append_stranger_segment(session, arr)
+    else:
+        svc.clear_stranger_segment(session)
+
     if session.stranger_streak >= ALERT_TRIGGER_STREAK:
         if now - session.last_alert_ms >= DEBOUNCE_SEC * 1000:
-            clip_path = save_alert_clip(parent_id, session, ring)
+            session.stranger_segment_ended_ms = now
+            clip_waveform = svc.get_stranger_segment_waveform(session, ring)
+            clip_path = save_alert_clip(parent_id, session, clip_waveform)
             row = svc.create_alert(
                 db=db,
                 parent_id=parent_id,
@@ -500,7 +758,16 @@ async def detect_chunk(
             alert_id = str(row.id)
             session.last_alert_ms = now
             session.stranger_streak = 0
-            logger.info(f"ALERT_FIRED | alert_id={alert_id} | score={score:.4f} | streak_satisfied={ALERT_TRIGGER_STREAK} | clip_path={clip_path}")
+            logger.info(
+                "ALERT_FIRED | alert_id=%s | score=%.4f | streak_satisfied=%s | clip_path=%s | segment_started_ms=%s | segment_ended_ms=%s | segment_samples=%s",
+                alert_id,
+                score,
+                ALERT_TRIGGER_STREAK,
+                clip_path,
+                session.stranger_segment_started_ms or None,
+                session.stranger_segment_ended_ms or None,
+                int(np.asarray(clip_waveform).reshape(-1).shape[0]),
+            )
             parent = svc.get_parent(db, parent_id)
             # Prefer parent-device FCM token (fallback to stored parent token).
             parent_device = (
@@ -513,8 +780,32 @@ async def detect_chunk(
                 .order_by(Device.updated_at.desc())
                 .first()
             )
-            parent_fcm_token = parent_device.device_token if parent_device else parent.fcm_token
-            logger.info(f"ALERT_ESCALATION_START | alert_id={alert_id} | parent_email={parent.email} | fcm_token_available={bool(parent_fcm_token)}")
+            any_recent_device = (
+                db.query(Device)
+                .filter(
+                    Device.parent_id == parent.id,
+                    Device.device_token.isnot(None),
+                )
+                .order_by(Device.updated_at.desc())
+                .first()
+            )
+            parent_fcm_token = (
+                (parent_device.device_token if parent_device else None)
+                or (any_recent_device.device_token if any_recent_device else None)
+                or parent.fcm_token
+            )
+            token_source = (
+                "parent_device"
+                if parent_device and parent_device.device_token
+                else ("recent_device" if any_recent_device and any_recent_device.device_token else ("parent_profile" if parent.fcm_token else "none"))
+            )
+            logger.info(
+                "ALERT_ESCALATION_START | alert_id=%s | parent_email=%s | fcm_token_available=%s | token_source=%s",
+                alert_id,
+                parent.email,
+                bool(parent_fcm_token),
+                token_source,
+            )
             # Wire background thread for notification escalation
             thread = threading.Thread(
                 target=escalate_alert,
@@ -531,6 +822,7 @@ async def detect_chunk(
                 daemon=True,
             )
             thread.start()
+            svc.clear_stranger_segment(session)
         else:
             alert_block_reason = "debounced"
             logger.info(f"ALERT_BLOCKED | alert_id=None | reason=debounced | last_alert_ms={session.last_alert_ms} | now={now} | debounce_sec={DEBOUNCE_SEC}")
@@ -550,6 +842,11 @@ async def detect_chunk(
             "force_alert_min_streak": FORCE_ALERT_MIN_STREAK,
             "familiar_grace_sec": FAMILIAR_GRACE_SEC,
             "familiar_hold_floor": FAMILIAR_HOLD_FLOOR,
+            "familiar_grace_margin": FAMILIAR_GRACE_MARGIN,
+            "familiar_grace_min_conf": FAMILIAR_GRACE_MIN_CONF,
+            "familiar_reset_min_streak": FAMILIAR_RESET_MIN_STREAK,
+            "soft_stranger_margin": SOFT_STRANGER_MARGIN,
+            "soft_stranger_min_conf": SOFT_STRANGER_MIN_CONF,
             "debounce_sec": DEBOUNCE_SEC,
             "block_reason": alert_block_reason,
         },
@@ -570,44 +867,28 @@ def get_alert_history(limit: int = 50, offset: int = 0, current=Depends(get_curr
     rows = svc.list_alerts(db, current["parent_id"], limit=limit, offset=offset)
     return {
         "items": [
-            {
-                "id": str(row.id),
-                "parent_id": str(row.parent_id),
-                "device_id": str(row.device_id),
-                "timestamp": row.timestamp,
-                "confidence_score": row.confidence_score,
-                "audio_clip_path": row.audio_clip_path,
-                "latitude": row.latitude,
-                "longitude": row.longitude,
-                "lat": row.latitude,
-                "lng": row.longitude,
-                "acknowledged_at": row.acknowledged_at,
-                "created_at": row.created_at,
-                "updated_at": row.updated_at,
-            }
+            _alert_response_payload(row)
             for row in rows
         ]
     }
 
 
+@app.delete("/alerts/{alert_id}")
+def delete_alert(alert_id: str, current=Depends(get_current_parent), db: Session = Depends(get_db)):
+    svc.delete_alert(db, current["parent_id"], alert_id)
+    return {"status": "deleted", "alert_id": alert_id}
+
+
+@app.delete("/alerts")
+def delete_all_alerts(current=Depends(get_current_parent), db: Session = Depends(get_db)):
+    deleted_count = svc.delete_all_alerts(db, current["parent_id"])
+    return {"status": "cleared", "deleted_count": deleted_count}
+
+
 @app.post("/alerts/{alert_id}/ack")
 def acknowledge_alert(alert_id: str, current=Depends(get_current_parent), db: Session = Depends(get_db)):
     row = svc.ack_alert(db, current["parent_id"], alert_id)
-    alert_payload = {
-        "id": str(row.id),
-        "parent_id": str(row.parent_id),
-        "device_id": str(row.device_id),
-        "timestamp": row.timestamp,
-        "confidence_score": row.confidence_score,
-        "audio_clip_path": row.audio_clip_path,
-        "latitude": row.latitude,
-        "longitude": row.longitude,
-        "lat": row.latitude,
-        "lng": row.longitude,
-        "acknowledged_at": row.acknowledged_at,
-        "created_at": row.created_at,
-        "updated_at": row.updated_at,
-    }
+    alert_payload = _alert_response_payload(row)
     return {
         "status": "acknowledged",
         # Flat fields for clients that deserialize AckAlertResponse at root.
@@ -653,6 +934,7 @@ def fire_test_alert(body: TestFireAlertRequest, current=Depends(get_current_pare
         "alert_id": str(row.id),
         "device_id": str(row.device_id),
         "confidence_score": row.confidence_score,
+        "timestamp_ms": _dt_to_epoch_ms(row.timestamp),
         "clip_url": f"/alerts/{row.id}/clip",
     }
 
@@ -705,7 +987,7 @@ def get_alert_clip(alert_id: str, current=Depends(get_current_parent), db: Sessi
 
 @app.post("/devices")
 def create_device(
-    device_name: str = Form(...),
+    device_name: Optional[str] = Form(None),
     role: str = Form(...),
     device_token: Optional[str] = Form(None),
     current=Depends(get_current_parent),

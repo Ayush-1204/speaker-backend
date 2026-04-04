@@ -7,6 +7,7 @@ import soundfile as sf
 import librosa
 
 from . import config
+from .audio_preprocess import normalize_waveform
 from .compare import THRESHOLD, match_embedding
 from .feature_extractor import embed_waveform_chunks
 from .speech_gate import assess_speech_likeness
@@ -20,7 +21,7 @@ def _load_mono_16k(path: str) -> np.ndarray:
         data = data.mean(axis=1)
     if sr != 16000:
         data = librosa.resample(data, orig_sr=sr, target_sr=16000)
-    return data.astype(np.float32)
+    return normalize_waveform(data.astype(np.float32))
 
 
 def _voiced_duration_ms(segments: List[Tuple[int, int]], sr: int) -> float:

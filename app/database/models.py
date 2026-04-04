@@ -27,6 +27,27 @@ class Parent(Base):
     devices = relationship("Device", back_populates="parent", cascade="all, delete-orphan")
     speakers = relationship("EnrolledSpeaker", back_populates="parent", cascade="all, delete-orphan")
     alerts = relationship("Alert", back_populates="parent", cascade="all, delete-orphan")
+    credentials = relationship("AuthCredential", back_populates="parent", cascade="all, delete-orphan")
+
+
+class AuthProvider(str, enum.Enum):
+    email_password = "email_password"
+
+
+class AuthCredential(Base):
+    __tablename__ = "auth_credentials"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    parent_id = Column(UUID(as_uuid=True), ForeignKey("parents.id"), nullable=False, index=True)
+    provider = Column(Enum(AuthProvider), nullable=False, index=True)
+    email = Column(String, nullable=False, unique=True, index=True)
+    password_hash = Column(String, nullable=False)
+    reset_token_hash = Column(String)
+    reset_token_expires_at = Column(DateTime)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    parent = relationship("Parent", back_populates="credentials")
 
 
 class DeviceRole(str, enum.Enum):

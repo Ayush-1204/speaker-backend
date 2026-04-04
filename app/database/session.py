@@ -5,9 +5,10 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
 from app.database.models import Base
 
+# Default to SQLite for local development; set DATABASE_URL env var to override (e.g., PostgreSQL for production).
 DATABASE_URL = os.environ.get(
     "DATABASE_URL",
-    "postgresql://safeear:safeear@localhost:5432/safeear"
+    "sqlite:///./safeear.db"
 )
 
 engine = create_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
