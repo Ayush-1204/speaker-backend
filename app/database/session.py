@@ -47,6 +47,8 @@ def _ensure_device_columns() -> None:
         statements.append("ALTER TABLE devices ADD COLUMN monitoring_enabled BOOLEAN NOT NULL DEFAULT 1")
     if "last_heartbeat_at" not in existing:
         statements.append("ALTER TABLE devices ADD COLUMN last_heartbeat_at DATETIME")
+    if "last_activity_at" not in existing:
+        statements.append("ALTER TABLE devices ADD COLUMN last_activity_at DATETIME")
 
     if not statements:
         return

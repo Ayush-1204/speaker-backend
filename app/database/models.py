@@ -67,6 +67,7 @@ class Device(Base):
     is_online = Column(Boolean, default=False, nullable=False)
     monitoring_enabled = Column(Boolean, default=True, nullable=False)
     last_heartbeat_at = Column(DateTime)
+    last_activity_at = Column(DateTime)
     last_location_lat = Column(Float)
     last_location_lon = Column(Float)
     last_location_ts = Column(DateTime)

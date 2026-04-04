@@ -330,14 +330,31 @@ def _alert_response_payload(row: Any) -> Dict[str, Any]:
     }
 
 def _device_payload(row: Device) -> Dict[str, Any]:
+    """Build device response with real telemetry and location data.
+    
+    Returns null for unknown battery (not 0).
+    Includes location coordinates and activity timestamp for live location feature.
+    """
+    last_seen = None
+    if row.last_activity_at:
+        last_seen = row.last_activity_at.isoformat() if hasattr(row.last_activity_at, 'isoformat') else str(row.last_activity_at)
+    
+    location_updated_at = None
+    if row.last_location_ts:
+        location_updated_at = row.last_location_ts.isoformat() if hasattr(row.last_location_ts, 'isoformat') else str(row.last_location_ts)
+    
     return {
         "id": str(row.id),
         "parent_id": str(row.parent_id),
         "device_name": row.device_name,
         "role": row.role.value,
-        "battery_percent": row.battery_percent,
+        "battery_percent": row.battery_percent,  # null if unknown, not 0
         "is_online": svc.get_effective_online(row),
         "monitoring_enabled": bool(row.monitoring_enabled),
+        "last_seen_at": last_seen,
+        "latitude": row.last_location_lat,
+        "longitude": row.last_location_lon,
+        "location_updated_at": location_updated_at,
     }
 
 
@@ -659,6 +676,9 @@ async def detect_chunk(
     device = svc.get_device(db, parent_id, device_id)
     if device.role != DeviceRole.child_device:
         raise HTTPException(status_code=403, detail="only_child_devices_can_stream_audio")
+
+    # Mark device as active (for telemetry: is_online, last_seen_at)
+    svc.update_device_activity(db, parent_id, device_id)
 
     logger.info(
         "DETECT_CHUNK_RECEIVED | parent_id=%s | device_id=%s | audio_len=%s | sr=%s | decode_method=%s",

@@ -416,6 +416,7 @@ def update_device_heartbeat(
         device.monitoring_enabled = bool(monitoring_enabled)
 
     device.last_heartbeat_at = datetime.utcnow()
+    device.last_activity_at = datetime.utcnow()  # Mark activity on heartbeat
     device.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(device)
@@ -423,11 +424,30 @@ def update_device_heartbeat(
 
 
 def get_effective_online(device: Device) -> bool:
+    """Compute if device is online based on recent heartbeat or activity.
+    
+    Device is considered online if:
+    1. is_online flag is true, AND
+    2. Recent activity (last_activity_at OR last_heartbeat_at) within TTL
+    
+    last_activity_at includes: chunk uploads, location updates, explicit heartbeats.
+    This ensures parent sees child as online while actively streaming.
+    """
     if not bool(device.is_online):
         return False
-    if not device.last_heartbeat_at:
+    
+    # Check most recent activity timestamp (could be from chunk, location, or heartbeat)
+    latest_activity = None
+    if device.last_activity_at:
+        latest_activity = device.last_activity_at
+    if device.last_heartbeat_at:
+        if latest_activity is None or device.last_heartbeat_at > latest_activity:
+            latest_activity = device.last_heartbeat_at
+    
+    if not latest_activity:
         return False
-    age_sec = (datetime.utcnow() - device.last_heartbeat_at).total_seconds()
+    
+    age_sec = (datetime.utcnow() - latest_activity).total_seconds()
     return age_sec <= float(DEVICE_ONLINE_TTL_SEC)
 
 
@@ -440,6 +460,29 @@ def get_device(db: Session, parent_id: str, device_id: str) -> Device:
     return device
 
 
+def update_device_activity(db: Session, parent_id: str, device_id: str) -> Device:
+    """Mark device as active by updating last_activity_at.
+    
+    Called when:
+    - Audio chunk uploaded (detect_chunk)
+    - Location update received (detect_location)
+    - Explicit heartbeat sent
+    
+    This keeps get_effective_online() returning True during active streaming.
+    """
+    device = get_device(db, parent_id, device_id)
+    now = datetime.utcnow()
+    
+    # Only update if activity timestamp is outdated (avoid excessive DB updates)
+    if device.last_activity_at is None or \
+       (now - device.last_activity_at).total_seconds() > 1:
+        device.last_activity_at = now
+        db.commit()
+        db.refresh(device)
+    
+    return device
+
+
 def update_device_location(db: Session, parent_id: str, device_id: str, lat: Optional[float], lon: Optional[float]) -> Device:
     device = get_device(db, parent_id, device_id)
     if lat is not None:
@@ -447,6 +490,7 @@ def update_device_location(db: Session, parent_id: str, device_id: str, lat: Opt
     if lon is not None:
         device.last_location_lon = lon
     device.last_location_ts = datetime.utcnow()
+    device.last_activity_at = datetime.utcnow()  # Mark activity on location update
     db.commit()
     db.refresh(device)
     return device
