@@ -51,6 +51,8 @@ def _init_firebase():
 def send_fcm_push(
     fcm_token: str,
     alert_id: str,
+    device_id: str,
+    timestamp_ms: int,
     lat: Optional[float],
     lon: Optional[float],
     confidence: float
@@ -73,6 +75,8 @@ def send_fcm_push(
             ),
             data={
                 "alert_id": alert_id,
+                "device_id": device_id,
+                "timestamp_ms": str(timestamp_ms),
                 "type": "stranger_detected",
                 "maps_url": maps_url,
                 "confidence": str(confidence)
@@ -160,6 +164,8 @@ def escalate_alert(
     parent_phone: Optional[str],
     fcm_token: Optional[str],
     alert_id: str,
+    device_id: str,
+    timestamp_ms: int,
     lat: Optional[float],
     lon: Optional[float],
     audio_url: str,
@@ -179,7 +185,7 @@ def escalate_alert(
 
     # T+0: Try FCM
     if fcm_token:
-        result["fcm"]["sent"] = send_fcm_push(fcm_token, alert_id, lat, lon, confidence)
+        result["fcm"]["sent"] = send_fcm_push(fcm_token, alert_id, device_id, timestamp_ms, lat, lon, confidence)
         if result["fcm"]["sent"]:
             result["fcm"]["at_ms"] = int(time.time() * 1000 - start_ms)
             logger.info(f"[escalate] FCM sent at {result['fcm']['at_ms']}ms")

@@ -1,23 +1,25 @@
 import io
+import asyncio
 import logging
 import os
 import shutil
 import tempfile
 import threading
 import warnings
+import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 import numpy as np
 import soundfile as sf
 import librosa
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.database.models import Device, DeviceRole
-from app.database.session import get_db, init_db
+from app.database.session import SessionLocal, get_db, init_db
 from app.utils import prd_services_db as svc
 from app.utils.audio_preprocess import normalize_waveform
 from app.utils.notification_worker import escalate_alert
@@ -68,6 +70,114 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - [%(funcName)s] %(message)s"
 )
+
+WS_PING_INTERVAL_SEC = int(os.environ.get("SAFEEAR_WS_PING_INTERVAL_SEC", "20"))
+WS_CLIENT_QUEUE_MAX = int(os.environ.get("SAFEEAR_WS_CLIENT_QUEUE_MAX", "256"))
+
+_WS_LOOP: Optional[asyncio.AbstractEventLoop] = None
+_WS_STATE_LOCK = threading.Lock()
+_WS_CLIENTS_BY_PARENT: Dict[str, Dict[str, asyncio.Queue]] = {}
+_WS_SEQ_BY_PARENT: Dict[str, int] = {}
+_WS_PUBLISHED_COUNTS: Dict[str, int] = {
+    "alert_created": 0,
+    "device_status_changed": 0,
+    "monitoring_changed": 0,
+}
+_WS_LAST_QUEUE_LAG_MS: int = 0
+_DEVICE_STATUS_EVENT_LAST_SENT: Dict[str, int] = {}
+DEVICE_STATUS_EVENT_MIN_INTERVAL_MS = int(os.environ.get("SAFEEAR_DEVICE_STATUS_EVENT_MIN_INTERVAL_MS", "800"))
+
+
+def _ws_set_loop(loop: asyncio.AbstractEventLoop) -> None:
+    global _WS_LOOP
+    with _WS_STATE_LOCK:
+        _WS_LOOP = loop
+
+
+def _ws_next_seq(parent_id: str) -> int:
+    with _WS_STATE_LOCK:
+        next_seq = _WS_SEQ_BY_PARENT.get(parent_id, 0) + 1
+        _WS_SEQ_BY_PARENT[parent_id] = next_seq
+        return next_seq
+
+
+async def _ws_register_client(parent_id: str, client_id: str, queue: asyncio.Queue) -> None:
+    with _WS_STATE_LOCK:
+        parent_clients = _WS_CLIENTS_BY_PARENT.setdefault(parent_id, {})
+        parent_clients[client_id] = queue
+        active_count = sum(len(v) for v in _WS_CLIENTS_BY_PARENT.values())
+    logger.info("WS_CONNECT | parent_id=%s | client_id=%s | active_clients=%s", parent_id, client_id, active_count)
+
+
+async def _ws_unregister_client(parent_id: str, client_id: str) -> None:
+    with _WS_STATE_LOCK:
+        parent_clients = _WS_CLIENTS_BY_PARENT.get(parent_id)
+        if parent_clients and client_id in parent_clients:
+            del parent_clients[client_id]
+            if not parent_clients:
+                _WS_CLIENTS_BY_PARENT.pop(parent_id, None)
+        active_count = sum(len(v) for v in _WS_CLIENTS_BY_PARENT.values())
+    logger.info("WS_DISCONNECT | parent_id=%s | client_id=%s | active_clients=%s", parent_id, client_id, active_count)
+
+
+async def _ws_publish_async(parent_id: str, event_type: str, payload: Dict[str, Any]) -> None:
+    global _WS_LAST_QUEUE_LAG_MS
+    seq = _ws_next_seq(parent_id)
+    event = {
+        "type": event_type,
+        "payload": payload,
+        "timestamp_ms": now_ms(),
+        "seq": seq,
+    }
+    queued_at_ms = now_ms()
+
+    with _WS_STATE_LOCK:
+        parent_clients = dict(_WS_CLIENTS_BY_PARENT.get(parent_id, {}))
+        if event_type in _WS_PUBLISHED_COUNTS:
+            _WS_PUBLISHED_COUNTS[event_type] += 1
+
+    delivered = 0
+    for _client_id, queue in parent_clients.items():
+        try:
+            if queue.full():
+                try:
+                    queue.get_nowait()
+                except Exception:
+                    pass
+            queue.put_nowait({"event": event, "queued_at_ms": queued_at_ms})
+            delivered += 1
+        except Exception:
+            continue
+
+    _WS_LAST_QUEUE_LAG_MS = 0
+    logger.info(
+        "WS_EVENT_PUBLISHED | parent_id=%s | type=%s | seq=%s | delivered=%s",
+        parent_id,
+        event_type,
+        seq,
+        delivered,
+    )
+
+
+def publish_parent_event(parent_id: str, event_type: str, payload: Dict[str, Any]) -> None:
+    loop = _WS_LOOP
+    if loop is None:
+        return
+    try:
+        asyncio.run_coroutine_threadsafe(_ws_publish_async(parent_id, event_type, payload), loop)
+    except Exception as exc:
+        logger.warning("WS_EVENT_PUBLISH_FAILED | parent_id=%s | type=%s | reason=%s", parent_id, event_type, str(exc))
+
+
+def _should_publish_device_status(parent_id: str, device_id: str) -> bool:
+    key = f"{parent_id}:{device_id}"
+    now = now_ms()
+    with _WS_STATE_LOCK:
+        last = _DEVICE_STATUS_EVENT_LAST_SENT.get(key)
+        if last is not None and (now - last) < DEVICE_STATUS_EVENT_MIN_INTERVAL_MS:
+            return False
+        _DEVICE_STATUS_EVENT_LAST_SENT[key] = now
+        return True
 
 TEMP_DIR = os.path.join("app", "data", "temp_audio")
 os.makedirs(TEMP_DIR, exist_ok=True)
@@ -139,13 +249,14 @@ class DeviceMonitoringPatchRequest(BaseModel):
 
 class DeviceHeartbeatRequest(BaseModel):
     battery_percent: Optional[int] = None
-    is_online: Optional[bool] = True
+    is_online: Optional[bool] = None
     monitoring_enabled: Optional[bool] = None
 
 
 class DeviceMonitoringAckRequest(BaseModel):
     monitoring_enabled: bool
-    is_online: Optional[bool] = True
+    is_online: Optional[bool] = None
+    battery_percent: Optional[int] = None
 
 
 class TestFireAlertRequest(BaseModel):
@@ -161,6 +272,8 @@ class DetectLocationRequest(BaseModel):
     longitude: Optional[float] = None
     lat: Optional[float] = None
     lng: Optional[float] = None
+    battery_percent: Optional[int] = None
+    battery: Optional[int] = None
 
 
 def _extract_bearer(auth_header: Optional[str]) -> str:
@@ -210,6 +323,16 @@ def get_current_parent(
     except HTTPException as exc:
         raise HTTPException(status_code=401, detail="parent_not_found") from exc
     return {"parent_id": parent_id}
+
+
+def _parent_id_from_access_token(token: str) -> str:
+    from app.utils.prd_services import parse_jwt
+
+    payload = parse_jwt(token)
+    parent_id = payload.get("sub")
+    if not parent_id:
+        raise HTTPException(status_code=401, detail="invalid_token_subject")
+    return str(parent_id)
 
 
 def _verify_google_like_token(id_token: str) -> Dict[str, Any]:
@@ -313,7 +436,7 @@ def _alert_response_payload(row: Any) -> Dict[str, Any]:
         "id": str(row.id),
         "parent_id": str(row.parent_id),
         "device_id": str(row.device_id),
-        "timestamp": row.timestamp,
+        "timestamp": row.timestamp.isoformat() if row.timestamp else None,
         "timestamp_ms": _dt_to_epoch_ms(row.timestamp),
         "confidence_score": row.confidence_score,
         "audio_clip_path": row.audio_clip_path,
@@ -321,11 +444,11 @@ def _alert_response_payload(row: Any) -> Dict[str, Any]:
         "longitude": row.longitude,
         "lat": row.latitude,
         "lng": row.longitude,
-        "acknowledged_at": row.acknowledged_at,
+        "acknowledged_at": row.acknowledged_at.isoformat() if row.acknowledged_at else None,
         "acknowledged_at_ms": _dt_to_epoch_ms(row.acknowledged_at),
-        "created_at": row.created_at,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
         "created_at_ms": _dt_to_epoch_ms(row.created_at),
-        "updated_at": row.updated_at,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
         "updated_at_ms": _dt_to_epoch_ms(row.updated_at),
     }
 
@@ -600,8 +723,19 @@ def remove_speaker(speaker_id: str, current=Depends(get_current_parent), db: Ses
 def detect_location(body: DetectLocationRequest, current=Depends(get_current_parent), db: Session = Depends(get_db)):
     lat = body.latitude if body.latitude is not None else body.lat
     lon = body.longitude if body.longitude is not None else body.lng
-    svc.update_device_location(db, current["parent_id"], body.device_id, lat, lon)
+    battery_percent = body.battery_percent if body.battery_percent is not None else body.battery
+    row = svc.update_device_location(db, current["parent_id"], body.device_id, lat, lon)
+    if battery_percent is not None:
+        row = svc.update_device_battery(db, current["parent_id"], body.device_id, battery_percent)
+    else:
+        logger.warning(
+            "DEVICE_BATTERY_MISSING | endpoint=/detect/location | parent_id=%s | device_id=%s",
+            current["parent_id"],
+            body.device_id,
+        )
     svc.update_session_location(current["parent_id"], body.device_id, lat, lon)
+    if _should_publish_device_status(current["parent_id"], body.device_id):
+        publish_parent_event(current["parent_id"], "device_status_changed", _device_payload(row))
     return {"status": "ok", "device_id": body.device_id, "latitude": lat, "longitude": lon}
 
 
@@ -612,6 +746,8 @@ async def detect_chunk(
     audio: Optional[UploadFile] = File(None),
     latitude: Optional[float] = Form(None),
     longitude: Optional[float] = Form(None),
+    battery_percent: Optional[int] = Form(None),
+    battery: Optional[int] = Form(None),
     current=Depends(get_current_parent),
     db: Session = Depends(get_db),
 ):
@@ -623,6 +759,10 @@ async def detect_chunk(
     raw = await upload.read()
     if not raw:
         parent_id = current["parent_id"]
+        try:
+            svc.update_device_activity(db, parent_id, device_id)
+        except Exception:
+            pass
         logger.warning(
             "DETECT_CHUNK_EMPTY | parent_id=%s | device_id=%s | filename=%s | content_type=%s | bytes=0 "
             "| DIAGNOSTIC: Possible audio capture failure on child - check audio permissions and initialization",
@@ -641,6 +781,12 @@ async def detect_chunk(
                 empty_count,
                 svc._EMPTY_CHUNK_THRESHOLD,
             )
+        if _should_publish_device_status(parent_id, device_id):
+            try:
+                row = svc.get_device(db, parent_id, device_id)
+                publish_parent_event(parent_id, "device_status_changed", _device_payload(row))
+            except Exception:
+                pass
         return {"status": "no_hop", "reason": "empty_chunk", "chunk_samples": 0, "consecutive_empty_chunks": empty_count}
 
     try:
@@ -692,7 +838,20 @@ async def detect_chunk(
         raise HTTPException(status_code=403, detail="only_child_devices_can_stream_audio")
 
     # Mark device as active (for telemetry: is_online, last_seen_at)
-    svc.update_device_activity(db, parent_id, device_id)
+    device = svc.update_device_activity(db, parent_id, device_id)
+
+    reported_battery = battery_percent if battery_percent is not None else battery
+    if reported_battery is not None:
+        device = svc.update_device_battery(db, parent_id, device_id, reported_battery)
+    else:
+        logger.warning(
+            "DEVICE_BATTERY_MISSING | endpoint=/detect/chunk | parent_id=%s | device_id=%s",
+            parent_id,
+            device_id,
+        )
+
+    if _should_publish_device_status(parent_id, device_id):
+        publish_parent_event(parent_id, "device_status_changed", _device_payload(device))
 
     logger.info(
         "DETECT_CHUNK_RECEIVED | parent_id=%s | device_id=%s | audio_len=%s | sr=%s | decode_method=%s",
@@ -859,6 +1018,7 @@ async def detect_chunk(
                 latitude=session.lat,
                 longitude=session.lon,
             )
+            publish_parent_event(parent_id, "alert_created", _alert_response_payload(row))
             alert_fired = True
             alert_id = str(row.id)
             session.last_alert_ms = now
@@ -919,6 +1079,8 @@ async def detect_chunk(
                     parent.phone_number,
                     parent_fcm_token,
                     alert_id,
+                    device_id,
+                    _dt_to_epoch_ms(row.timestamp) or now_ms(),
                     session.lat,
                     session.lon,
                     f"/alerts/{alert_id}/clip",
@@ -968,8 +1130,14 @@ def stop_detect_session(device_id: str, current=Depends(get_current_parent), db:
 
 
 @app.get("/alerts")
-def get_alert_history(limit: int = 50, offset: int = 0, current=Depends(get_current_parent), db: Session = Depends(get_db)):
-    rows = svc.list_alerts(db, current["parent_id"], limit=limit, offset=offset)
+def get_alert_history(
+    limit: int = 50,
+    offset: int = 0,
+    since_ms: Optional[int] = None,
+    current=Depends(get_current_parent),
+    db: Session = Depends(get_db),
+):
+    rows = svc.list_alerts(db, current["parent_id"], limit=limit, offset=offset, since_ms=since_ms)
     return {
         "items": [
             _alert_response_payload(row)
@@ -1033,6 +1201,7 @@ def fire_test_alert(body: TestFireAlertRequest, current=Depends(get_current_pare
         latitude=session.lat,
         longitude=session.lon,
     )
+    publish_parent_event(parent_id, "alert_created", _alert_response_payload(row))
 
     return {
         "status": "test_alert_fired",
@@ -1134,11 +1303,15 @@ def create_device(
     }
 
 @app.get("/devices")
-def list_devices(current=Depends(get_current_parent), db: Session = Depends(get_db)):
+def list_devices(
+    since_ms: Optional[int] = None,
+    current=Depends(get_current_parent),
+    db: Session = Depends(get_db),
+):
     parent_id = current["parent_id"]
     logger.info("DEVICE_LIST_REQUEST | parent_id=%s", parent_id)
     
-    rows = svc.list_devices(db, parent_id)
+    rows = svc.list_devices(db, parent_id, since_ms=since_ms)
     
     logger.info(
         "DEVICE_LIST_RESPONSE | parent_id=%s | count=%d | roles=%s",
@@ -1166,11 +1339,19 @@ def patch_device_monitoring(
     current=Depends(get_current_parent),
     db: Session = Depends(get_db),
 ):
+    started_at = time.perf_counter()
     row, command_sent = svc.set_device_monitoring(
         db,
         current["parent_id"],
         device_id,
         body.monitoring_enabled,
+    )
+    publish_parent_event(current["parent_id"], "monitoring_changed", _device_payload(row))
+    logger.info(
+        "MONITORING_TOGGLE_LATENCY | parent_id=%s | device_id=%s | latency_ms=%.2f",
+        current["parent_id"],
+        device_id,
+        (time.perf_counter() - started_at) * 1000.0,
     )
     response = _device_payload(row)
     response["command_sent"] = command_sent
@@ -1183,6 +1364,12 @@ def post_device_heartbeat(
     current=Depends(get_current_parent),
     db: Session = Depends(get_db),
 ):
+    if body.battery_percent is None:
+        logger.warning(
+            "DEVICE_BATTERY_MISSING | endpoint=/devices/{id}/heartbeat | parent_id=%s | device_id=%s",
+            current["parent_id"],
+            device_id,
+        )
     row = svc.update_device_heartbeat(
         db,
         current["parent_id"],
@@ -1191,6 +1378,8 @@ def post_device_heartbeat(
         body.is_online,
         body.monitoring_enabled,
     )
+    if _should_publish_device_status(current["parent_id"], device_id):
+        publish_parent_event(current["parent_id"], "device_status_changed", _device_payload(row))
     return {"status": "ok", "device": _device_payload(row)}
 
 
@@ -1201,19 +1390,102 @@ def post_monitoring_ack(
     current=Depends(get_current_parent),
     db: Session = Depends(get_db),
 ):
+    if body.battery_percent is None:
+        logger.warning(
+            "DEVICE_BATTERY_MISSING | endpoint=/devices/{id}/monitoring/ack | parent_id=%s | device_id=%s",
+            current["parent_id"],
+            device_id,
+        )
     row = svc.update_device_heartbeat(
         db,
         current["parent_id"],
         device_id,
-        battery_percent=None,
+        battery_percent=body.battery_percent,
         is_online=body.is_online,
         monitoring_enabled=body.monitoring_enabled,
     )
+    if _should_publish_device_status(current["parent_id"], device_id):
+        publish_parent_event(current["parent_id"], "device_status_changed", _device_payload(row))
     return {"status": "acknowledged", "device": _device_payload(row)}
+
+
+@app.websocket("/ws/events")
+async def ws_events(websocket: WebSocket):
+    auth_header = websocket.headers.get("authorization")
+    if not auth_header:
+        await websocket.close(code=1008, reason="missing_authorization_header")
+        return
+    if not auth_header.lower().startswith("bearer "):
+        await websocket.close(code=1008, reason="invalid_authorization_header")
+        return
+
+    token = auth_header.split(" ", 1)[1].strip()
+    try:
+        parent_id = _parent_id_from_access_token(token)
+    except Exception:
+        await websocket.close(code=1008, reason="invalid_access_token")
+        return
+
+    db = SessionLocal()
+    try:
+        svc.get_parent(db, parent_id)
+    except Exception:
+        db.close()
+        await websocket.close(code=1008, reason="parent_not_found")
+        return
+    finally:
+        db.close()
+
+    await websocket.accept()
+    _ws_set_loop(asyncio.get_running_loop())
+
+    client_id = f"{parent_id}:{int(time.time() * 1000)}:{id(websocket)}"
+    queue: asyncio.Queue = asyncio.Queue(maxsize=WS_CLIENT_QUEUE_MAX)
+    await _ws_register_client(parent_id, client_id, queue)
+
+    receiver_task: Optional[asyncio.Task] = asyncio.create_task(websocket.receive_text())
+    try:
+        while True:
+            if receiver_task is not None and receiver_task.done():
+                try:
+                    _ = receiver_task.result()
+                    receiver_task = asyncio.create_task(websocket.receive_text())
+                except WebSocketDisconnect:
+                    break
+                except Exception:
+                    break
+
+            try:
+                queued = await asyncio.wait_for(queue.get(), timeout=WS_PING_INTERVAL_SEC)
+                queued_at_ms = int(queued.get("queued_at_ms", now_ms()))
+                event = queued.get("event", {})
+                lag_ms = max(0, now_ms() - queued_at_ms)
+                global _WS_LAST_QUEUE_LAG_MS
+                _WS_LAST_QUEUE_LAG_MS = lag_ms
+                await websocket.send_json(event)
+            except asyncio.TimeoutError:
+                await websocket.send_json({"type": "ping", "timestamp_ms": now_ms()})
+    except WebSocketDisconnect:
+        pass
+    finally:
+        if receiver_task is not None:
+            receiver_task.cancel()
+        await _ws_unregister_client(parent_id, client_id)
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    with _WS_STATE_LOCK:
+        active_clients = sum(len(v) for v in _WS_CLIENTS_BY_PARENT.values())
+        published_counts = dict(_WS_PUBLISHED_COUNTS)
+        queue_lag_ms = int(_WS_LAST_QUEUE_LAG_MS)
+    return {
+        "status": "ok",
+        "metrics": {
+            "active_ws_clients": active_clients,
+            "event_queue_lag_ms": queue_lag_ms,
+            "events_published": published_counts,
+        },
+    }
 
 
 @app.get("/")

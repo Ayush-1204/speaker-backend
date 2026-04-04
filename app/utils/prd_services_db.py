@@ -360,14 +360,13 @@ def create_device(
     return device
 
 
-def list_devices(db: Session, parent_id: str) -> List[Device]:
+def list_devices(db: Session, parent_id: str, since_ms: Optional[int] = None) -> List[Device]:
     parent_uuid = _as_uuid(parent_id, "parent_id")
-    return (
-        db.query(Device)
-        .filter(Device.parent_id == parent_uuid)
-        .order_by(Device.created_at.desc())
-        .all()
-    )
+    query = db.query(Device).filter(Device.parent_id == parent_uuid)
+    if since_ms is not None:
+        since_dt = datetime.utcfromtimestamp(float(since_ms) / 1000.0)
+        query = query.filter(Device.updated_at >= since_dt)
+    return query.order_by(Device.created_at.desc()).all()
 
 
 def _send_monitoring_command_to_device(device: Device, monitoring_enabled: bool) -> bool:
@@ -459,19 +458,34 @@ def update_device_heartbeat(
     return device
 
 
+def update_device_battery(
+    db: Session,
+    parent_id: str,
+    device_id: str,
+    battery_percent: Optional[int],
+) -> Device:
+    """Persist battery telemetry when provided from chunk/location/ack flows."""
+    device = get_device(db, parent_id, device_id)
+    if battery_percent is None:
+        return device
+
+    battery = int(max(0, min(100, battery_percent)))
+    if device.battery_percent == battery:
+        return device
+
+    device.battery_percent = battery
+    device.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(device)
+    return device
+
+
 def get_effective_online(device: Device) -> bool:
-    """Compute if device is online based on recent heartbeat or activity.
-    
-    Device is considered online if:
-    1. is_online flag is true, AND
-    2. Recent activity (last_activity_at OR last_heartbeat_at) within TTL
-    
-    last_activity_at includes: chunk uploads, location updates, explicit heartbeats.
-    This ensures parent sees child as online while actively streaming.
+    """Compute online status from freshness window (last_seen semantics).
+
+    A device is online when recent activity was observed within TTL.
+    Activity includes chunk upload, location update, heartbeat, and monitoring ack.
     """
-    if not bool(device.is_online):
-        return False
-    
     # Check most recent activity timestamp (could be from chunk, location, or heartbeat)
     latest_activity = None
     if device.last_activity_at:
@@ -812,11 +826,19 @@ def create_alert(
     return alert
 
 
-def list_alerts(db: Session, parent_id: str, limit: int = 50, offset: int = 0) -> List[AlertModel]:
+def list_alerts(
+    db: Session,
+    parent_id: str,
+    limit: int = 50,
+    offset: int = 0,
+    since_ms: Optional[int] = None,
+) -> List[AlertModel]:
     parent_uuid = _as_uuid(parent_id, "parent_id")
-    return db.query(AlertModel).filter(
-        AlertModel.parent_id == parent_uuid
-    ).order_by(AlertModel.timestamp.desc()).offset(offset).limit(limit).all()
+    query = db.query(AlertModel).filter(AlertModel.parent_id == parent_uuid)
+    if since_ms is not None:
+        since_dt = datetime.utcfromtimestamp(float(since_ms) / 1000.0)
+        query = query.filter(AlertModel.updated_at >= since_dt)
+    return query.order_by(AlertModel.timestamp.desc()).offset(offset).limit(limit).all()
 
 
 def ack_alert(db: Session, parent_id: str, alert_id: str) -> AlertModel:
