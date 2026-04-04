@@ -2,6 +2,7 @@
 
 from typing import List, Optional, Tuple
 import logging
+import time
 
 import numpy as np
 import soundfile as sf
@@ -13,12 +14,19 @@ from .audio_preprocess import normalize_waveform
 from .vad import apply_vad
 
 _redimnet = None
+_redimnet_retry_after_ts = 0.0
 logger = logging.getLogger(__name__)
 
 
 def _get_redimnet():
     global _redimnet
+    global _redimnet_retry_after_ts
     if _redimnet is None:
+        now = time.time()
+        if _redimnet_retry_after_ts > now:
+            remaining = int(_redimnet_retry_after_ts - now)
+            raise RuntimeError(f"ReDimNet temporarily unavailable; retry after {remaining}s")
+
         # Prefer official ReDimNet2 source; fallback to legacy ReDimNet for compatibility.
         last_exc: Optional[Exception] = None
 
@@ -93,6 +101,8 @@ def _get_redimnet():
                     str(exc),
                 )
         if _redimnet is None:
+            # Avoid hammering torch.hub/GitHub when rate-limited.
+            _redimnet_retry_after_ts = time.time() + 300.0
             raise RuntimeError("Failed to load ReDimNet model via torch.hub") from last_exc
         _redimnet.eval()
         _redimnet.to(config.DEVICE)

@@ -1100,7 +1100,28 @@ def evaluate_window(db: Session, parent_id: str, waveform: np.ndarray, sr: int =
 
     logger.info(f"TIER2_PASSED | parent_id={parent_id} | proceeding_to_tier3_speaker_match")
 
-    query_embs = future_embs.result()
+    try:
+        query_embs = future_embs.result()
+    except Exception as exc:
+        perf = _perf_metrics(len(waveform), sr, started_at)
+        logger.warning(
+            "TIER3_UNAVAILABLE | parent_id=%s | reason=%s",
+            parent_id,
+            str(exc),
+        )
+        return {
+            "tier1_vad": {"passed": True, "voiced_ms": voiced_ms},
+            "tier2": {"passed": True, "confidence": confidence, **yamnet_result, **speech_metrics},
+            "tier3": {
+                "passed": False,
+                "score": 0.0,
+                "closest_speaker_id": None,
+                "error": "tier3_unavailable",
+            },
+            "decision": "tier3_unavailable",
+            "perf": perf,
+        }
+
     score, closest_speaker_id = _score_against_candidates(parent_candidates, query_embs, parent_id)
     
     logger.info(f"TIER3_SCORED | parent_id={parent_id} | score={score:.4f} | closest_speaker_id={closest_speaker_id} | t_high={T_HIGH} | t_low={T_LOW}")

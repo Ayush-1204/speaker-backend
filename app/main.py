@@ -916,6 +916,24 @@ async def detect_chunk(
     tier2_confidence = float(stage.get("tier2", {}).get("confidence", 0.0))
     logger.info(f"STAGE_RESULT | score={score:.4f} | tier1_vad={tier1_pass} | tier2={tier2_pass} | tier3={tier3_pass} | stage_decision={stage.get('decision', 'unknown')}")
 
+    if not tier3_pass:
+        logger.warning(
+            "DETECT_CHUNK_TIER3_UNAVAILABLE | parent_id=%s | device_id=%s | stage_decision=%s",
+            parent_id,
+            device_id,
+            stage.get("decision", "unknown"),
+        )
+        return {
+            "status": "ok",
+            "decision": "hold_tier3_unavailable",
+            "stranger_streak": session.stranger_streak,
+            "score": score,
+            "thresholds": {"t_high": T_HIGH, "t_low": T_LOW},
+            "stage": stage,
+            "alert_fired": False,
+            "alert_id": None,
+        }
+
     if score >= T_HIGH:
         session.familiar_recovery_streak += 1
         if session.stranger_streak > 0 and session.familiar_recovery_streak < FAMILIAR_RESET_MIN_STREAK:
@@ -1503,6 +1521,10 @@ async def ws_events(websocket: WebSocket):
             # Keep the receiver task alive across loop ticks; only dispose per-iteration queue wait.
             if queue_task in pending:
                 queue_task.cancel()
+                try:
+                    await queue_task
+                except asyncio.CancelledError:
+                    pass
     except WebSocketDisconnect:
         pass
     finally:
