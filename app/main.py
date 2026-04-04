@@ -363,7 +363,7 @@ def _verify_google_like_token(id_token: str) -> Dict[str, Any]:
 
     if not allowed_client_ids:
         logger.warning("GOOGLE_AUTH_SKIPPED | reason=no_google_client_id_configured")
-        raise HTTPException(status_code=500, detail="missing_google_client_id")
+        raise HTTPException(status_code=401, detail="missing_google_client_id")
 
     try:
         import importlib
@@ -1476,7 +1476,7 @@ async def ws_events(websocket: WebSocket):
                     await websocket.send_json(event)
                 except (RuntimeError, WebSocketDisconnect):
                     break
-            elif websocket.client_state == WebSocketState.CONNECTED:
+            elif websocket.client_state == WebSocketState.CONNECTED and websocket.application_state == WebSocketState.CONNECTED:
                 try:
                     await websocket.send_json({"type": "ping", "timestamp_ms": now_ms()})
                 except (RuntimeError, WebSocketDisconnect):
