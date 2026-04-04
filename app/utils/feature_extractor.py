@@ -2,6 +2,7 @@
 
 from typing import List, Optional, Tuple
 import logging
+import os
 import time
 
 import numpy as np
@@ -15,12 +16,14 @@ from .vad import apply_vad
 
 _redimnet = None
 _redimnet_retry_after_ts = 0.0
+_redimnet_load_failures = 0
 logger = logging.getLogger(__name__)
 
 
 def _get_redimnet():
     global _redimnet
     global _redimnet_retry_after_ts
+    global _redimnet_load_failures
     if _redimnet is None:
         now = time.time()
         if _redimnet_retry_after_ts > now:
@@ -38,55 +41,86 @@ def _get_redimnet():
         if v1_train_type == "lm":
             v1_train_type = "ft_lm"
 
-        load_attempts = [
-            (
-                config.REDIMNET_HUB_REPO,
-                config.REDIMNET_HUB_ENTRY,
-                {
-                    "model_name": config.REDIMNET_MODEL_NAME,
-                    "train_type": v2_train_type,
-                    "dataset": config.REDIMNET_DATASET,
-                    "pretrained": True,
-                },
-            ),
-            (
-                "PalabraAI/redimnet2",
-                "redimnet2",
-                {
-                    "model_name": config.REDIMNET_MODEL_NAME,
-                    "train_type": v2_train_type,
-                    "dataset": config.REDIMNET_DATASET,
-                    "pretrained": True,
-                },
-            ),
-            (
-                "IDRnD/ReDimNet",
-                "ReDimNet",
-                {
-                    "model_name": config.REDIMNET_MODEL_NAME,
-                    "train_type": v1_train_type,
-                    "dataset": config.REDIMNET_DATASET,
-                },
-            ),
-        ]
+        load_attempts = []
+        local_repo = config.REDIMNET_LOCAL_REPO_DIR
+        if local_repo and os.path.isdir(local_repo):
+            load_attempts.append(
+                (
+                    local_repo,
+                    config.REDIMNET_HUB_ENTRY,
+                    {
+                        "model_name": config.REDIMNET_MODEL_NAME,
+                        "train_type": v2_train_type,
+                        "dataset": config.REDIMNET_DATASET,
+                        "pretrained": True,
+                    },
+                    "local",
+                )
+            )
+        elif local_repo:
+            logger.warning("REDIMNET_LOCAL_REPO_MISSING | path=%s", local_repo)
+
+        if not config.REDIMNET_DISABLE_HUB_NETWORK:
+            load_attempts.extend(
+                [
+                    (
+                        config.REDIMNET_HUB_REPO,
+                        config.REDIMNET_HUB_ENTRY,
+                        {
+                            "model_name": config.REDIMNET_MODEL_NAME,
+                            "train_type": v2_train_type,
+                            "dataset": config.REDIMNET_DATASET,
+                            "pretrained": True,
+                        },
+                        None,
+                    ),
+                    (
+                        "PalabraAI/redimnet2",
+                        "redimnet2",
+                        {
+                            "model_name": config.REDIMNET_MODEL_NAME,
+                            "train_type": v2_train_type,
+                            "dataset": config.REDIMNET_DATASET,
+                            "pretrained": True,
+                        },
+                        None,
+                    ),
+                    (
+                        "IDRnD/ReDimNet",
+                        "ReDimNet",
+                        {
+                            "model_name": config.REDIMNET_MODEL_NAME,
+                            "train_type": v1_train_type,
+                            "dataset": config.REDIMNET_DATASET,
+                        },
+                        None,
+                    ),
+                ]
+            )
 
         seen = set()
-        for hub_repo, hub_entry, load_kwargs in load_attempts:
-            key = (hub_repo, hub_entry)
+        for hub_repo, hub_entry, load_kwargs, load_source in load_attempts:
+            key = (hub_repo, hub_entry, load_source)
             if key in seen:
                 continue
             seen.add(key)
             try:
-                _redimnet = torch.hub.load(
-                    hub_repo,
-                    hub_entry,
+                hub_kwargs = {
+                    "repo_or_dir": hub_repo,
+                    "model": hub_entry,
+                    "trust_repo": True,
                     **load_kwargs,
-                    trust_repo=True,
+                }
+                if load_source is not None:
+                    hub_kwargs["source"] = load_source
+                _redimnet = torch.hub.load(
+                    **hub_kwargs,
                 )
                 logger.info(
-                    "REDIMNET_LOADED | hub_repo=%s | hub_entry=%s | model_name=%s | train_type=%s | dataset=%s",
+                    "REDIMNET_LOADED | hub_repo=%s | hub_entry=%s | source=%s | model_name=%s | train_type=%s | dataset=%s",
                     hub_repo,
                     hub_entry,
+                    load_source or "github",
                     load_kwargs.get("model_name"),
                     load_kwargs.get("train_type"),
                     load_kwargs.get("dataset"),
@@ -101,9 +135,16 @@ def _get_redimnet():
                     str(exc),
                 )
         if _redimnet is None:
-            # Avoid hammering torch.hub/GitHub when rate-limited.
-            _redimnet_retry_after_ts = time.time() + 300.0
+            # Avoid hammering torch.hub/GitHub when unavailable, but recover sooner than fixed 5m.
+            _redimnet_load_failures += 1
+            backoff = min(
+                max(1, config.REDIMNET_RETRY_MAX_SEC),
+                max(1, config.REDIMNET_RETRY_BASE_SEC) * (2 ** (_redimnet_load_failures - 1)),
+            )
+            _redimnet_retry_after_ts = time.time() + float(backoff)
             raise RuntimeError("Failed to load ReDimNet model via torch.hub") from last_exc
+
+        _redimnet_load_failures = 0
         _redimnet.eval()
         _redimnet.to(config.DEVICE)
     return _redimnet

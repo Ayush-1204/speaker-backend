@@ -7,6 +7,10 @@ REDIMNET_HUB_ENTRY = os.environ.get("REDIMNET_HUB_ENTRY", "redimnet2")
 REDIMNET_MODEL_NAME = os.environ.get("REDIMNET_MODEL_NAME", "b6")
 REDIMNET_TRAIN_TYPE = os.environ.get("REDIMNET_TRAIN_TYPE", "lm")
 REDIMNET_DATASET = os.environ.get("REDIMNET_DATASET", "vox2")
+REDIMNET_LOCAL_REPO_DIR = os.environ.get("REDIMNET_LOCAL_REPO_DIR", "").strip()
+REDIMNET_DISABLE_HUB_NETWORK = os.environ.get("REDIMNET_DISABLE_HUB_NETWORK", "false").strip().lower() in {"1", "true", "yes", "on"}
+REDIMNET_RETRY_BASE_SEC = int(os.environ.get("REDIMNET_RETRY_BASE_SEC", "30"))
+REDIMNET_RETRY_MAX_SEC = int(os.environ.get("REDIMNET_RETRY_MAX_SEC", "300"))
 
 EMBEDDING_DIM = 192
 
