@@ -17,6 +17,7 @@ from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from starlette.websockets import WebSocketState
 
 from app.database.models import Device, DeviceRole
 from app.database.session import SessionLocal, get_db, init_db
@@ -1446,25 +1447,43 @@ async def ws_events(websocket: WebSocket):
     receiver_task: Optional[asyncio.Task] = asyncio.create_task(websocket.receive_text())
     try:
         while True:
-            if receiver_task is not None and receiver_task.done():
+            queue_task = asyncio.create_task(queue.get())
+            done, pending = await asyncio.wait(
+                {queue_task, receiver_task},
+                timeout=WS_PING_INTERVAL_SEC,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            if receiver_task in done:
                 try:
-                    _ = receiver_task.result()
-                    receiver_task = asyncio.create_task(websocket.receive_text())
+                    await receiver_task
                 except WebSocketDisconnect:
                     break
                 except Exception:
                     break
+                receiver_task = asyncio.create_task(websocket.receive_text())
 
-            try:
-                queued = await asyncio.wait_for(queue.get(), timeout=WS_PING_INTERVAL_SEC)
+            if queue_task in done:
+                queued = queue_task.result()
                 queued_at_ms = int(queued.get("queued_at_ms", now_ms()))
                 event = queued.get("event", {})
                 lag_ms = max(0, now_ms() - queued_at_ms)
                 global _WS_LAST_QUEUE_LAG_MS
                 _WS_LAST_QUEUE_LAG_MS = lag_ms
-                await websocket.send_json(event)
-            except asyncio.TimeoutError:
-                await websocket.send_json({"type": "ping", "timestamp_ms": now_ms()})
+                if websocket.client_state != WebSocketState.CONNECTED:
+                    break
+                try:
+                    await websocket.send_json(event)
+                except (RuntimeError, WebSocketDisconnect):
+                    break
+            elif websocket.client_state == WebSocketState.CONNECTED:
+                try:
+                    await websocket.send_json({"type": "ping", "timestamp_ms": now_ms()})
+                except (RuntimeError, WebSocketDisconnect):
+                    break
+
+            for task in pending:
+                task.cancel()
     except WebSocketDisconnect:
         pass
     finally:
