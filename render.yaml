@@ -9,3 +9,6 @@ services:
     plan: free
     region: singapore
     autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11
