@@ -22,6 +22,9 @@ from starlette.websockets import WebSocketState
 from app.database.models import Device, DeviceRole
 from app.database.session import SessionLocal, get_db, init_db
 from app.utils import prd_services_db as svc
+from app.utils import feature_extractor as feature_extractor_module
+from app.utils import yamnet_classifier as yamnet_classifier_module
+from app.utils import vad as vad_module
 from app.utils.audio_preprocess import normalize_waveform
 from app.utils.notification_worker import escalate_alert
 from app.utils.prd_services import (
@@ -207,6 +210,30 @@ def _speaker_payload(row, request: Request, parent_id: str) -> Dict[str, Any]:
 @app.on_event("startup")
 def startup_event() -> None:
     init_db()
+    # Eagerly warm model singletons so first detect request does not pay load latency.
+    try:
+        feature_extractor_module._get_redimnet()
+        logger.info("MODEL_WARMUP_OK | model=redimnet")
+    except Exception as exc:
+        logger.warning("MODEL_WARMUP_FAILED | model=redimnet | reason=%s", str(exc))
+
+    try:
+        yamnet_model = yamnet_classifier_module._get_yamnet_model()
+        if yamnet_model is None:
+            logger.warning("MODEL_WARMUP_SKIPPED | model=yamnet | reason=unavailable")
+        else:
+            logger.info("MODEL_WARMUP_OK | model=yamnet")
+    except Exception as exc:
+        logger.warning("MODEL_WARMUP_FAILED | model=yamnet | reason=%s", str(exc))
+
+    try:
+        silero_model, silero_utils = vad_module._get_silero()
+        if silero_model is None or silero_utils is None:
+            logger.warning("MODEL_WARMUP_SKIPPED | model=silero_vad | reason=unavailable")
+        else:
+            logger.info("MODEL_WARMUP_OK | model=silero_vad")
+    except Exception as exc:
+        logger.warning("MODEL_WARMUP_FAILED | model=silero_vad | reason=%s", str(exc))
 
 
 class GoogleAuthRequest(BaseModel):
