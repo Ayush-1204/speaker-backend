@@ -66,6 +66,11 @@ _LOCK = threading.Lock()
 _SESSIONS: Dict[str, "SessionState"] = {}
 _INFER_POOL = ThreadPoolExecutor(max_workers=int(os.environ.get("SAFEEAR_INFER_WORKERS", "2")))
 
+# Track empty chunks per device to detect audio capture failures
+_EMPTY_CHUNK_COUNTS: Dict[str, Tuple[int, float]] = {}  # device_id -> (count, last_reset_time)
+_EMPTY_CHUNK_THRESHOLD = int(os.environ.get("SAFEEAR_EMPTY_CHUNK_THRESHOLD", "5"))
+_EMPTY_CHUNK_RESET_SEC = int(os.environ.get("SAFEEAR_EMPTY_CHUNK_RESET_SEC", "10"))
+
 
 def _as_uuid(value: Any, field_name: str) -> uuid.UUID:
     if isinstance(value, uuid.UUID):
@@ -87,6 +92,37 @@ def _ensure_parent_dirs(parent_id: str) -> Dict[str, str]:
 
 def now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def track_empty_chunk(device_id: str) -> Tuple[int, bool]:
+    """Track consecutive empty chunks per device to detect audio capture failures.
+    
+    Args:
+        device_id: The device sending empty chunks
+    
+    Returns:
+        Tuple of (count, exceeded_threshold)
+        - count: Current consecutive empty chunk count
+        - exceeded_threshold: True if count >= SAFEEAR_EMPTY_CHUNK_THRESHOLD
+    
+    Resets count after SAFEEAR_EMPTY_CHUNK_RESET_SEC (default 10s) of inactivity.
+    Helps diagnose audio capture failures on child device.
+    """
+    now_sec = time.time()
+    with _LOCK:
+        if device_id not in _EMPTY_CHUNK_COUNTS:
+            _EMPTY_CHUNK_COUNTS[device_id] = (1, now_sec)
+            return 1, False
+        
+        count, last_reset = _EMPTY_CHUNK_COUNTS[device_id]
+        if now_sec - last_reset > _EMPTY_CHUNK_RESET_SEC:
+            # Reset counter after timeout
+            _EMPTY_CHUNK_COUNTS[device_id] = (1, now_sec)
+            return 1, False
+        
+        count += 1
+        _EMPTY_CHUNK_COUNTS[device_id] = (count, now_sec)
+        return count, count >= _EMPTY_CHUNK_THRESHOLD
 
 
 def _perf_metrics(waveform_len: int, sr: int, started_at: float) -> Dict[str, float]:

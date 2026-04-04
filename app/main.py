@@ -622,12 +622,26 @@ async def detect_chunk(
 
     raw = await upload.read()
     if not raw:
+        parent_id = current["parent_id"]
         logger.warning(
-            "DETECT_CHUNK_EMPTY | filename=%s | content_type=%s | bytes=0",
+            "DETECT_CHUNK_EMPTY | parent_id=%s | device_id=%s | filename=%s | content_type=%s | bytes=0 "
+            "| DIAGNOSTIC: Possible audio capture failure on child - check audio permissions and initialization",
+            parent_id,
+            device_id,
             getattr(upload, "filename", None),
             getattr(upload, "content_type", None),
         )
-        return {"status": "no_hop", "reason": "empty_chunk", "chunk_samples": 0}
+        empty_count, threshold_exceeded = svc.track_empty_chunk(device_id)
+        if threshold_exceeded:
+            logger.error(
+                "DETECT_CHUNK_FAILURE | parent_id=%s | device_id=%s | empty_chunk_count=%d | threshold=%d "
+                "| ACTION: Audio capture failure detected - child device may have permission issues, audio muting, or initialization problem",
+                parent_id,
+                device_id,
+                empty_count,
+                svc._EMPTY_CHUNK_THRESHOLD,
+            )
+        return {"status": "no_hop", "reason": "empty_chunk", "chunk_samples": 0, "consecutive_empty_chunks": empty_count}
 
     try:
         arr, sr, decode_method = _decode_audio_chunk(raw)
