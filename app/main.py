@@ -1288,7 +1288,7 @@ def get_alert_clip(alert_id: str, current=Depends(get_current_parent), db: Sessi
 
 @app.post("/devices")
 def create_device(
-    device_name: Optional[str] = Form(None),
+    device_name: str = Form(...),
     role: str = Form(...),
     device_token: Optional[str] = Form(None),
     current=Depends(get_current_parent),

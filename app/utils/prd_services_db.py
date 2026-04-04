@@ -327,11 +327,33 @@ def create_device(
     device_token: Optional[str] = None,
 ) -> Device:
     parent_uuid = _as_uuid(parent_id, "parent_id")
-    normalized_name = (device_name or "").strip() or (
-        "Parent Device" if role == DeviceRole.parent_device else "Child Device"
-    )
+    normalized_name = (device_name or "").strip()
+    if not normalized_name:
+        raise HTTPException(status_code=422, detail="stable_device_identifier_required")
 
     token = (device_token or "").strip() or None
+
+    existing = db.query(Device).filter(Device.device_name == normalized_name).first()
+    if existing is not None:
+        # Canonical upsert by stable device identifier.
+        existing.parent_id = parent_uuid
+        existing.device_name = normalized_name
+        existing.role = role
+        if token is not None and existing.device_token != token:
+            token_owner = db.query(Device).filter(Device.device_token == token, Device.id != existing.id).first()
+            if token_owner is not None:
+                token_owner.device_token = None
+                token_owner.updated_at = datetime.utcnow()
+            existing.device_token = token
+        elif token is not None:
+            existing.device_token = token
+        if existing.monitoring_enabled is None:
+            existing.monitoring_enabled = True
+        existing.updated_at = datetime.utcnow()
+        db.commit()
+        db.refresh(existing)
+        return existing
+
     if token is not None:
         existing = db.query(Device).filter(Device.device_token == token).first()
         if existing is not None:
