@@ -643,9 +643,15 @@ async def enroll_speaker(
     for emb in embs:
         svc.save_speaker_embedding(db, parent_id, str(speaker.id), emb)
 
+    speaker_payload = _speaker_payload(speaker, request, parent_id)
     return {
         "status": "enrolled",
-        "speaker": _speaker_payload(speaker, request, parent_id),
+        # Current schema.
+        "speaker": speaker_payload,
+        # Backward compatibility for legacy clients.
+        "speakerResponse": speaker_payload,
+        "speaker_id": str(speaker.id),
+        "display_name": speaker.display_name,
         "samples_saved": len(embs),
         "embedding_dim": int(embs[0].shape[0]),
         "stages": stage_info,
@@ -669,9 +675,11 @@ def patch_speaker(
     db: Session = Depends(get_db),
 ):
     row = svc.rename_speaker(db, current["parent_id"], speaker_id, body.display_name)
+    speaker_payload = _speaker_payload(row, request, current["parent_id"])
     return {
         "status": "ok",
-        "speaker": _speaker_payload(row, request, current["parent_id"]),
+        "speaker": speaker_payload,
+        "speakerResponse": speaker_payload,
     }
 
 
@@ -1413,14 +1421,22 @@ def post_monitoring_ack(
 @app.websocket("/ws/events")
 async def ws_events(websocket: WebSocket):
     auth_header = websocket.headers.get("authorization")
-    if not auth_header:
-        await websocket.close(code=1008, reason="missing_authorization_header")
-        return
-    if not auth_header.lower().startswith("bearer "):
-        await websocket.close(code=1008, reason="invalid_authorization_header")
+    query_token = (websocket.query_params.get("access_token") or "").strip()
+    token = ""
+    if auth_header:
+        if not auth_header.lower().startswith("bearer "):
+            await websocket.close(code=1008, reason="invalid_authorization_header")
+            return
+        token = auth_header.split(" ", 1)[1].strip()
+    elif query_token:
+        token = query_token
+    else:
+        await websocket.close(code=1008, reason="missing_authorization")
         return
 
-    token = auth_header.split(" ", 1)[1].strip()
+    if not token:
+        await websocket.close(code=1008, reason="empty_access_token")
+        return
     try:
         parent_id = _parent_id_from_access_token(token)
     except Exception:
@@ -1457,6 +1473,8 @@ async def ws_events(websocket: WebSocket):
             if receiver_task in done:
                 try:
                     await receiver_task
+                except asyncio.CancelledError:
+                    break
                 except WebSocketDisconnect:
                     break
                 except Exception:
@@ -1482,13 +1500,18 @@ async def ws_events(websocket: WebSocket):
                 except (RuntimeError, WebSocketDisconnect):
                     break
 
-            for task in pending:
-                task.cancel()
+            # Keep the receiver task alive across loop ticks; only dispose per-iteration queue wait.
+            if queue_task in pending:
+                queue_task.cancel()
     except WebSocketDisconnect:
         pass
     finally:
         if receiver_task is not None:
             receiver_task.cancel()
+            try:
+                await receiver_task
+            except (asyncio.CancelledError, WebSocketDisconnect, RuntimeError):
+                pass
         await _ws_unregister_client(parent_id, client_id)
 
 @app.get("/health")
