@@ -4,11 +4,15 @@ from typing import List, Optional, Tuple
 import logging
 import os
 import time
+import tempfile
+import tarfile
+import zipfile
 
 import numpy as np
 import soundfile as sf
 import librosa
 import torch
+import requests
 
 from . import config
 from .audio_preprocess import normalize_waveform
@@ -18,6 +22,57 @@ _redimnet = None
 _redimnet_retry_after_ts = 0.0
 _redimnet_load_failures = 0
 logger = logging.getLogger(__name__)
+
+
+def _bootstrap_local_repo_if_needed(configured_dir: str) -> str:
+    """Return an existing local repo directory, optionally bootstrapping from an archive URL."""
+    if configured_dir and os.path.isdir(configured_dir):
+        return configured_dir
+
+    archive_url = config.REDIMNET_LOCAL_REPO_ARCHIVE_URL
+    extract_dir = config.REDIMNET_LOCAL_REPO_EXTRACT_DIR
+    if not archive_url:
+        return configured_dir
+
+    try:
+        os.makedirs(extract_dir, exist_ok=True)
+        marker = os.path.join(extract_dir, ".ready")
+        if not os.path.exists(marker):
+            fd, archive_path = tempfile.mkstemp(prefix="redimnet2_", suffix=".archive")
+            os.close(fd)
+            try:
+                with requests.get(archive_url, stream=True, timeout=60) as resp:
+                    resp.raise_for_status()
+                    with open(archive_path, "wb") as handle:
+                        for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                            if chunk:
+                                handle.write(chunk)
+
+                extracted = False
+                try:
+                    with zipfile.ZipFile(archive_path) as zf:
+                        zf.extractall(extract_dir)
+                        extracted = True
+                except zipfile.BadZipFile:
+                    pass
+
+                if not extracted:
+                    with tarfile.open(archive_path, "r:*") as tf:
+                        tf.extractall(extract_dir)
+
+                with open(marker, "w", encoding="ascii") as handle:
+                    handle.write("ok")
+            finally:
+                if os.path.exists(archive_path):
+                    os.remove(archive_path)
+
+        if os.path.isdir(extract_dir):
+            logger.info("REDIMNET_LOCAL_REPO_BOOTSTRAPPED | path=%s", extract_dir)
+            return extract_dir
+    except Exception as exc:
+        logger.warning("REDIMNET_LOCAL_REPO_BOOTSTRAP_FAILED | reason=%s", str(exc))
+
+    return configured_dir
 
 
 def _get_redimnet():
@@ -42,7 +97,7 @@ def _get_redimnet():
             v1_train_type = "ft_lm"
 
         load_attempts = []
-        local_repo = config.REDIMNET_LOCAL_REPO_DIR
+        local_repo = _bootstrap_local_repo_if_needed(config.REDIMNET_LOCAL_REPO_DIR)
         if local_repo and os.path.isdir(local_repo):
             load_attempts.append(
                 (
@@ -60,7 +115,15 @@ def _get_redimnet():
         elif local_repo:
             logger.warning("REDIMNET_LOCAL_REPO_MISSING | path=%s", local_repo)
 
-        if not config.REDIMNET_DISABLE_HUB_NETWORK:
+        allow_hub_network = not config.REDIMNET_DISABLE_HUB_NETWORK
+        if config.REDIMNET_DISABLE_HUB_NETWORK and not (local_repo and os.path.isdir(local_repo)):
+            if config.REDIMNET_STRICT_LOCAL:
+                logger.warning("REDIMNET_STRICT_LOCAL_ENABLED | hub_network_fallback=disabled")
+            else:
+                logger.warning("REDIMNET_LOCAL_MISSING_FALLBACK_TO_HUB | strict_local=false")
+                allow_hub_network = True
+
+        if allow_hub_network:
             load_attempts.extend(
                 [
                     (

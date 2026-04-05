@@ -183,7 +183,8 @@ def _should_publish_device_status(parent_id: str, device_id: str) -> bool:
         _DEVICE_STATUS_EVENT_LAST_SENT[key] = now
         return True
 
-TEMP_DIR = os.path.join("app", "data", "temp_audio")
+DATA_ROOT = (os.environ.get("SAFEEAR_DATA_ROOT", os.path.join("app", "data")) or "").strip() or os.path.join("app", "data")
+TEMP_DIR = os.path.join(DATA_ROOT, "temp_audio")
 os.makedirs(TEMP_DIR, exist_ok=True)
 
 AVATAR_MAX_SIZE_BYTES = int(os.environ.get("SAFEEAR_AVATAR_MAX_SIZE_BYTES", str(5 * 1024 * 1024)))

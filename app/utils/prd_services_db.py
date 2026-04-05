@@ -31,13 +31,15 @@ from app.database.models import (
     AuthCredential,
     AuthProvider,
 )
+from app.utils import config
 from app.utils.audio_preprocess import normalize_waveform
 from app.utils.feature_extractor import embed_waveform_chunks
 from app.utils.speech_gate import assess_speech_likeness
 from app.utils.vad import get_speech_segments
 from app.utils.yamnet_classifier import classify_audio_event_windowed
 
-TENANTS_ROOT = os.path.join("app", "data", "tenants")
+DATA_ROOT = (os.environ.get("SAFEEAR_DATA_ROOT", os.path.join("app", "data")) or "").strip() or os.path.join("app", "data")
+TENANTS_ROOT = os.path.join(DATA_ROOT, "tenants")
 
 JWT_SECRET = os.environ.get("SAFEEAR_JWT_SECRET", "change-me-in-production")
 JWT_EXPIRE_SEC = int(os.environ.get("SAFEEAR_JWT_EXPIRE_SEC", "604800"))
@@ -587,12 +589,20 @@ def create_speaker(db: Session, parent_id: str, display_name: str) -> EnrolledSp
     )
 
     if matches:
-        primary = matches[0]
+        # Prefer rows that still have real embeddings on disk over stale metadata-only rows.
+        primary = max(
+            matches,
+            key=lambda sp: (
+                _count_speaker_embedding_files(parent_id, sp.id),
+                int(sp.sample_count or 0),
+                sp.updated_at,
+            ),
+        )
         primary_dir = _speaker_dir(parent_id, primary.id)
         os.makedirs(primary_dir, exist_ok=True)
 
         # Merge duplicate rows/files into the primary row so UI shows a single entry.
-        for dup in matches[1:]:
+        for dup in [sp for sp in matches if sp.id != primary.id]:
             dup_dir = _speaker_dir(parent_id, dup.id)
             moved = 0
             if os.path.isdir(dup_dir):
@@ -617,6 +627,8 @@ def create_speaker(db: Session, parent_id: str, display_name: str) -> EnrolledSp
             primary.sample_count = int(primary.sample_count or 0) + int(max(moved, int(dup.sample_count or 0)))
             db.delete(dup)
 
+        actual_count, _ = _sync_speaker_sample_count(primary, parent_id)
+        primary.sample_count = actual_count
         primary.display_name = normalized_name
         primary.updated_at = datetime.utcnow()
         db.commit()
@@ -639,6 +651,22 @@ def create_speaker(db: Session, parent_id: str, display_name: str) -> EnrolledSp
 def _speaker_dir(parent_id: str, speaker_id: str) -> str:
     dirs = _ensure_parent_dirs(parent_id)
     return os.path.join(dirs["embeddings"], str(speaker_id))
+
+
+def _count_speaker_embedding_files(parent_id: str, speaker_id: str) -> int:
+    sdir = _speaker_dir(parent_id, speaker_id)
+    if not os.path.isdir(sdir):
+        return 0
+    return len([f for f in os.listdir(sdir) if f.endswith(".npy")])
+
+
+def _sync_speaker_sample_count(speaker: EnrolledSpeaker, parent_id: str) -> Tuple[int, bool]:
+    actual_count = _count_speaker_embedding_files(parent_id, speaker.id)
+    changed = int(speaker.sample_count or 0) != actual_count
+    if changed:
+        speaker.sample_count = actual_count
+        speaker.updated_at = datetime.utcnow()
+    return actual_count, changed
 
 
 def _speaker_avatar_candidates(parent_id: str, speaker_id: str) -> List[str]:
@@ -691,15 +719,29 @@ def save_speaker_avatar(
 
 def list_speakers(db: Session, parent_id: str) -> List[EnrolledSpeaker]:
     parent_uuid = _as_uuid(parent_id, "parent_id")
-    return (
+    rows = (
         db.query(EnrolledSpeaker)
-        .filter(
-            EnrolledSpeaker.parent_id == parent_uuid,
-            EnrolledSpeaker.sample_count > 0,
-        )
+        .filter(EnrolledSpeaker.parent_id == parent_uuid)
         .order_by(EnrolledSpeaker.created_at.desc())
         .all()
     )
+
+    valid_rows: List[EnrolledSpeaker] = []
+    dirty = False
+    for row in rows:
+        actual_count, changed = _sync_speaker_sample_count(row, parent_id)
+        if changed:
+            dirty = True
+        if actual_count > 0:
+            valid_rows.append(row)
+
+    if dirty:
+        db.commit()
+
+    if rows and not valid_rows:
+        logger.warning("SPEAKER_LIST_EMPTY_EMBEDDINGS | parent_id=%s | metadata_rows=%s", parent_id, len(rows))
+
+    return valid_rows
 
 
 def get_speaker(db: Session, parent_id: str, speaker_id: str) -> EnrolledSpeaker:
@@ -739,7 +781,10 @@ def save_speaker_embedding(db: Session, parent_id: str, speaker_id: str, emb: np
     files = [f for f in os.listdir(sdir) if f.endswith(".npy")]
     idx = len(files) + 1
     fpath = os.path.join(sdir, f"emb_{idx}.npy")
-    np.save(fpath, np.asarray(emb, dtype=np.float32).reshape(-1))
+    arr = np.asarray(emb, dtype=np.float32).reshape(-1)
+    if arr.shape[0] != config.EMBEDDING_DIM:
+        raise HTTPException(status_code=400, detail=f"invalid_embedding_dim_{arr.shape[0]}")
+    np.save(fpath, arr)
 
     speaker = get_speaker(db, parent_id, speaker_id)
     speaker.sample_count = idx
@@ -762,7 +807,7 @@ def load_parent_embeddings(db: Session, parent_id: str) -> Dict[str, List[np.nda
                 arr = np.asarray(np.load(os.path.join(sdir, fname)), dtype=np.float32).reshape(-1)
             except Exception:
                 continue
-            if arr.ndim == 1 and arr.shape[0] > 0:
+            if arr.ndim == 1 and arr.shape[0] == config.EMBEDDING_DIM:
                 embs.append(arr)
         if embs:
             out[str(sp.id)] = embs

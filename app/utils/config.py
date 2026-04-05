@@ -11,6 +11,9 @@ REDIMNET_LOCAL_REPO_DIR = os.environ.get("REDIMNET_LOCAL_REPO_DIR", "").strip()
 REDIMNET_DISABLE_HUB_NETWORK = os.environ.get("REDIMNET_DISABLE_HUB_NETWORK", "false").strip().lower() in {"1", "true", "yes", "on"}
 REDIMNET_RETRY_BASE_SEC = int(os.environ.get("REDIMNET_RETRY_BASE_SEC", "30"))
 REDIMNET_RETRY_MAX_SEC = int(os.environ.get("REDIMNET_RETRY_MAX_SEC", "300"))
+REDIMNET_LOCAL_REPO_ARCHIVE_URL = os.environ.get("REDIMNET_LOCAL_REPO_ARCHIVE_URL", "").strip()
+REDIMNET_LOCAL_REPO_EXTRACT_DIR = os.environ.get("REDIMNET_LOCAL_REPO_EXTRACT_DIR", "/tmp/redimnet2_repo").strip()
+REDIMNET_STRICT_LOCAL = os.environ.get("REDIMNET_STRICT_LOCAL", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 EMBEDDING_DIM = 192
 
