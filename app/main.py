@@ -1515,9 +1515,12 @@ async def ws_events(websocket: WebSocket):
     await _ws_register_client(parent_id, client_id, queue)
 
     receiver_task: Optional[asyncio.Task] = asyncio.create_task(websocket.receive_text())
+    queue_task: Optional[asyncio.Task] = None
     try:
         while True:
-            queue_task = asyncio.create_task(queue.get())
+            if queue_task is None or queue_task.done():
+                queue_task = asyncio.create_task(queue.get())
+
             done, pending = await asyncio.wait(
                 {queue_task, receiver_task},
                 timeout=WS_PING_INTERVAL_SEC,
@@ -1536,7 +1539,14 @@ async def ws_events(websocket: WebSocket):
                 receiver_task = asyncio.create_task(websocket.receive_text())
 
             if queue_task in done:
-                queued = queue_task.result()
+                try:
+                    queued = queue_task.result()
+                except Exception:
+                    queued = None
+                queue_task = None
+                if queued is None:
+                    continue
+
                 queued_at_ms = int(queued.get("queued_at_ms", now_ms()))
                 event = queued.get("event", {})
                 lag_ms = max(0, now_ms() - queued_at_ms)
@@ -1553,23 +1563,16 @@ async def ws_events(websocket: WebSocket):
                     await websocket.send_json({"type": "ping", "timestamp_ms": now_ms()})
                 except (RuntimeError, WebSocketDisconnect):
                     break
-
-            # Keep the receiver task alive across loop ticks; only dispose per-iteration queue wait.
-            if queue_task in pending:
-                queue_task.cancel()
-                try:
-                    await queue_task
-                except asyncio.CancelledError:
-                    pass
     except WebSocketDisconnect:
         pass
     finally:
-        if receiver_task is not None:
-            receiver_task.cancel()
-            try:
-                await receiver_task
-            except (asyncio.CancelledError, WebSocketDisconnect, RuntimeError):
-                pass
+        cleanup: List[asyncio.Task] = []
+        for task in (receiver_task, queue_task):
+            if task is not None and not task.done():
+                task.cancel()
+                cleanup.append(task)
+        if cleanup:
+            await asyncio.gather(*cleanup, return_exceptions=True)
         await _ws_unregister_client(parent_id, client_id)
 
 @app.get("/health")
