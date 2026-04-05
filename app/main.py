@@ -672,6 +672,8 @@ async def enroll_speaker(
         svc.save_speaker_embedding(db, parent_id, str(speaker.id), emb)
 
     speaker_payload = _speaker_payload(speaker, request, parent_id)
+    refreshed_rows = svc.list_speakers(db, parent_id)
+    refreshed_items = [_speaker_payload(row, request, parent_id) for row in refreshed_rows]
     return {
         "status": "enrolled",
         # Current schema.
@@ -682,6 +684,7 @@ async def enroll_speaker(
         "display_name": speaker.display_name,
         "samples_saved": len(embs),
         "embedding_dim": int(embs[0].shape[0]),
+        "items": refreshed_items,
         "stages": stage_info,
     }
 
@@ -1271,6 +1274,7 @@ def fire_test_alert(body: TestFireAlertRequest, current=Depends(get_current_pare
 @app.post("/alerts/{alert_id}/flag-familiar")
 def flag_alert_as_familiar(
     alert_id: str,
+    request: Request,
     body: FlagFamiliarRequest,
     current=Depends(get_current_parent),
     db: Session = Depends(get_db),
@@ -1295,12 +1299,16 @@ def flag_alert_as_familiar(
     for emb in embs:
         svc.save_speaker_embedding(db, parent_id, str(speaker.id), emb)
 
+    refreshed_rows = svc.list_speakers(db, parent_id)
+    refreshed_items = [_speaker_payload(row, request, parent_id) for row in refreshed_rows]
+
     return {
         "status": "flagged_familiar",
         "source_alert_id": alert_id,
         "speaker_id": str(speaker.id),
         "display_name": speaker.display_name,
         "samples_saved": len(embs),
+        "items": refreshed_items,
         "stages": stage_info,
     }
 
