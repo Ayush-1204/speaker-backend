@@ -1,0 +1,3 @@
+[submodule "vendor/redimnet2"]
+	path = vendor/redimnet2
+	url = https://github.com/PalabraAI/redimnet2.git
