@@ -20,6 +20,7 @@ torchaudio==2.2.2 --index-url https://download.pytorch.org/whl/cpu
 
 # ---------------- SPEAKER MODEL ----------------
 # ReDimNet B6 loads via torch.hub (IDRnD/ReDimNet); first run downloads weights.
+tensorflow-cpu==2.16.1
 silero-vad==6.2.0
 
 # ---------------- ML / NUMERICAL ----------------

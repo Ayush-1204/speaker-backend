@@ -19,6 +19,8 @@ torch==2.2.2 --index-url https://download.pytorch.org/whl/cpu
 torchaudio==2.2.2 --index-url https://download.pytorch.org/whl/cpu
 
 # ---------------- SPEAKER MODEL ----------------
+# TensorFlow is required for the YAMNet TFLite interpreter.
+tensorflow-cpu==2.16.1
 silero-vad==6.2.0
 
 # ---------------- ML / NUMERICAL ----------------
