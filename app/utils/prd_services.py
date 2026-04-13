@@ -517,14 +517,28 @@ def save_alert_clip(parent_id: str, session: SessionState, waveform: np.ndarray)
     adir = os.path.join(dirs["alerts"], alert_id)
     os.makedirs(adir, exist_ok=True)
     clip_path = os.path.join(adir, "clip.wav")
-    sf.write(clip_path, waveform, session.sr)
     metadata_path = os.path.join(adir, "metadata.json")
     metadata = {
-        "segment_started_ms": int(session.stranger_segment_started_ms) or None,
-        "segment_ended_ms": int(session.stranger_segment_ended_ms) or None,
+        "segment_started_ms": int(session.stranger_segment_started_ms) if session.stranger_segment_started_ms else None,
+        "segment_ended_ms": int(session.stranger_segment_ended_ms) if session.stranger_segment_ended_ms else None,
         "sample_rate": int(session.sr),
         "samples": int(np.asarray(waveform).reshape(-1).shape[0]),
     }
-    with open(metadata_path, "w", encoding="utf-8") as handle:
-        json.dump(metadata, handle, indent=2)
+    try:
+        sf.write(clip_path, waveform, session.sr)
+        with open(metadata_path, "w", encoding="utf-8") as handle:
+            json.dump(metadata, handle, indent=2)
+    except Exception as exc:
+        for path in (metadata_path, clip_path):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError:
+                pass
+        try:
+            if os.path.isdir(adir) and not os.listdir(adir):
+                os.rmdir(adir)
+        except OSError:
+            pass
+        raise HTTPException(status_code=500, detail="failed_to_write_alert_clip") from exc
     return clip_path

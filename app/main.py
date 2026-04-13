@@ -1130,20 +1130,25 @@ async def detect_chunk(
                 token_source,
             )
             # Wire background thread for notification escalation
+            def _run_escalation() -> None:
+                try:
+                    escalate_alert(
+                        parent.email,
+                        parent.phone_number,
+                        parent_fcm_token,
+                        alert_id,
+                        device_id,
+                        _dt_to_epoch_ms(row.timestamp) or now_ms(),
+                        session.lat,
+                        session.lon,
+                        f"/alerts/{alert_id}/clip",
+                        score,
+                    )
+                except Exception:
+                    logger.exception("ALERT_ESCALATION_FAILED | alert_id=%s | device_id=%s", alert_id, device_id)
+
             thread = threading.Thread(
-                target=escalate_alert,
-                args=(
-                    parent.email,
-                    parent.phone_number,
-                    parent_fcm_token,
-                    alert_id,
-                    device_id,
-                    _dt_to_epoch_ms(row.timestamp) or now_ms(),
-                    session.lat,
-                    session.lon,
-                    f"/alerts/{alert_id}/clip",
-                    score,
-                ),
+                target=_run_escalation,
                 daemon=True,
             )
             thread.start()
@@ -1501,7 +1506,6 @@ async def ws_events(websocket: WebSocket):
     try:
         svc.get_parent(db, parent_id)
     except Exception:
-        db.close()
         await websocket.close(code=1008, reason="parent_not_found")
         return
     finally:
@@ -1552,8 +1556,6 @@ async def ws_events(websocket: WebSocket):
                 lag_ms = max(0, now_ms() - queued_at_ms)
                 global _WS_LAST_QUEUE_LAG_MS
                 _WS_LAST_QUEUE_LAG_MS = lag_ms
-                if websocket.client_state != WebSocketState.CONNECTED:
-                    break
                 try:
                     await websocket.send_json(event)
                 except (RuntimeError, WebSocketDisconnect):
