@@ -60,6 +60,7 @@ class Device(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     parent_id = Column(UUID(as_uuid=True), ForeignKey("parents.id"), nullable=False, index=True)
+    installation_id = Column(String, index=True)
     device_name = Column(String)
     role = Column(Enum(DeviceRole), nullable=False, index=True)
     device_token = Column(String, unique=True, index=True)

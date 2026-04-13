@@ -326,20 +326,38 @@ def create_device(
     parent_id: str,
     device_name: Optional[str],
     role: DeviceRole,
+    installation_id: Optional[str] = None,
     device_token: Optional[str] = None,
 ) -> Device:
     parent_uuid = _as_uuid(parent_id, "parent_id")
     normalized_name = (device_name or "").strip()
-    if not normalized_name:
+    normalized_installation_id = (installation_id or "").strip()
+    if not normalized_installation_id and not normalized_name:
         raise HTTPException(status_code=422, detail="stable_device_identifier_required")
 
     token = (device_token or "").strip() or None
 
-    existing = db.query(Device).filter(Device.device_name == normalized_name).first()
+    existing = None
+    if normalized_installation_id:
+        existing = (
+            db.query(Device)
+            .filter(Device.parent_id == parent_uuid, Device.installation_id == normalized_installation_id)
+            .first()
+        )
+    if existing is None and normalized_name:
+        existing = (
+            db.query(Device)
+            .filter(Device.parent_id == parent_uuid, Device.device_name == normalized_name)
+            .first()
+        )
     if existing is not None:
+        previous_role = existing.role
         # Canonical upsert by stable device identifier.
         existing.parent_id = parent_uuid
-        existing.device_name = normalized_name
+        if normalized_installation_id:
+            existing.installation_id = normalized_installation_id
+        if normalized_name:
+            existing.device_name = normalized_name
         existing.role = role
         if token is not None and existing.device_token != token:
             token_owner = db.query(Device).filter(Device.device_token == token, Device.id != existing.id).first()
@@ -351,6 +369,16 @@ def create_device(
             existing.device_token = token
         if existing.monitoring_enabled is None:
             existing.monitoring_enabled = True
+        if previous_role != role and previous_role == DeviceRole.child_device and role == DeviceRole.parent_device:
+            existing.monitoring_enabled = False
+            try:
+                stop_session(str(parent_uuid), str(existing.id))
+            except Exception:
+                logger.warning("DEVICE_ROLE_SWITCH_SESSION_STOP_FAILED | device_id=%s", str(existing.id))
+            _send_monitoring_command_to_device(existing, False)
+        elif previous_role != role and role == DeviceRole.child_device:
+            existing.monitoring_enabled = True
+            _send_monitoring_command_to_device(existing, True)
         existing.updated_at = datetime.utcnow()
         db.commit()
         db.refresh(existing)
@@ -360,12 +388,26 @@ def create_device(
         existing = db.query(Device).filter(Device.device_token == token).first()
         if existing is not None:
             # Reuse the existing row for this installation token and refresh its binding.
+            previous_role = existing.role
             existing.parent_id = parent_uuid
-            existing.device_name = normalized_name
+            if normalized_installation_id:
+                existing.installation_id = normalized_installation_id
+            if normalized_name:
+                existing.device_name = normalized_name
             existing.role = role
             existing.device_token = token
             if existing.monitoring_enabled is None:
                 existing.monitoring_enabled = True
+            if previous_role != role and previous_role == DeviceRole.child_device and role == DeviceRole.parent_device:
+                existing.monitoring_enabled = False
+                try:
+                    stop_session(str(parent_uuid), str(existing.id))
+                except Exception:
+                    logger.warning("DEVICE_ROLE_SWITCH_SESSION_STOP_FAILED | device_id=%s", str(existing.id))
+                _send_monitoring_command_to_device(existing, False)
+            elif previous_role != role and role == DeviceRole.child_device:
+                existing.monitoring_enabled = True
+                _send_monitoring_command_to_device(existing, True)
             existing.updated_at = datetime.utcnow()
             db.commit()
             db.refresh(existing)
@@ -374,11 +416,32 @@ def create_device(
     device = Device(
         id=uuid.uuid4(),
         parent_id=parent_uuid,
-        device_name=normalized_name,
+        installation_id=normalized_installation_id or None,
+        device_name=normalized_name or normalized_installation_id,
         role=role,
         device_token=token
     )
     db.add(device)
+    db.commit()
+    db.refresh(device)
+    return device
+
+
+def update_device_token(db: Session, parent_id: str, device_id: str, device_token: Optional[str]) -> Device:
+    device = get_device(db, parent_id, device_id)
+    token = (device_token or "").strip() or None
+
+    if token == device.device_token:
+        return device
+
+    if token is not None:
+        token_owner = db.query(Device).filter(Device.device_token == token, Device.id != device.id).first()
+        if token_owner is not None:
+            token_owner.device_token = None
+            token_owner.updated_at = datetime.utcnow()
+
+    device.device_token = token
+    device.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(device)
     return device
@@ -449,6 +512,12 @@ def set_device_monitoring(
     device.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(device)
+
+    if not monitoring_enabled:
+        try:
+            stop_session(parent_id, device_id)
+        except Exception:
+            logger.warning("DEVICE_SESSION_STOP_FAILED | device_id=%s", device_id)
 
     command_sent = False
     if device.role == DeviceRole.child_device:

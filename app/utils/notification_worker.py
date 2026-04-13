@@ -55,7 +55,8 @@ def send_fcm_push(
     timestamp_ms: int,
     lat: Optional[float],
     lon: Optional[float],
-    confidence: float
+    confidence: float,
+    recipient_role: Optional[str] = None,
 ) -> bool:
     """Send FCM push notification to parent device."""
     messaging = _init_firebase()
@@ -79,7 +80,8 @@ def send_fcm_push(
                 "timestamp_ms": str(timestamp_ms),
                 "type": "stranger_detected",
                 "maps_url": maps_url,
-                "confidence": str(confidence)
+                "confidence": str(confidence),
+                "target_role": recipient_role or "parent_device",
             },
             android=messaging.AndroidConfig(
                 priority="high",
@@ -170,6 +172,7 @@ def escalate_alert(
     lon: Optional[float],
     audio_url: str,
     confidence: float,
+    recipient_role: Optional[str] = None,
 ) -> dict:
     """
     Escalation chain: FCM (T+0) -> SMS (T+30s) -> Email (T+90s).
@@ -185,7 +188,7 @@ def escalate_alert(
 
     # T+0: Try FCM
     if fcm_token:
-        result["fcm"]["sent"] = send_fcm_push(fcm_token, alert_id, device_id, timestamp_ms, lat, lon, confidence)
+        result["fcm"]["sent"] = send_fcm_push(fcm_token, alert_id, device_id, timestamp_ms, lat, lon, confidence, recipient_role=recipient_role)
         if result["fcm"]["sent"]:
             result["fcm"]["at_ms"] = int(time.time() * 1000 - start_ms)
             logger.info(f"[escalate] FCM sent at {result['fcm']['at_ms']}ms")

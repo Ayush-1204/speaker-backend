@@ -41,6 +41,8 @@ def _ensure_device_columns() -> None:
 
     if "battery_percent" not in existing:
         statements.append("ALTER TABLE devices ADD COLUMN battery_percent INTEGER")
+    if "installation_id" not in existing:
+        statements.append("ALTER TABLE devices ADD COLUMN installation_id VARCHAR")
     if "is_online" not in existing:
         statements.append("ALTER TABLE devices ADD COLUMN is_online BOOLEAN NOT NULL DEFAULT 0")
     if "monitoring_enabled" not in existing:

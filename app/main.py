@@ -498,6 +498,7 @@ def _device_payload(row: Device) -> Dict[str, Any]:
     return {
         "id": str(row.id),
         "parent_id": str(row.parent_id),
+        "installation_id": row.installation_id,
         "device_name": row.device_name,
         "role": row.role.value,
         "battery_percent": row.battery_percent,  # null if unknown, not 0
@@ -1092,7 +1093,7 @@ async def detect_chunk(
                 int(np.asarray(clip_waveform).reshape(-1).shape[0]),
             )
             parent = svc.get_parent(db, parent_id)
-            # Prefer parent-device FCM token (fallback to stored parent token).
+            # Stranger alerts must only target the parent device token.
             parent_device = (
                 db.query(Device)
                 .filter(
@@ -1103,25 +1104,8 @@ async def detect_chunk(
                 .order_by(Device.updated_at.desc())
                 .first()
             )
-            any_recent_device = (
-                db.query(Device)
-                .filter(
-                    Device.parent_id == parent.id,
-                    Device.device_token.isnot(None),
-                )
-                .order_by(Device.updated_at.desc())
-                .first()
-            )
-            parent_fcm_token = (
-                (parent_device.device_token if parent_device else None)
-                or (any_recent_device.device_token if any_recent_device else None)
-                or parent.fcm_token
-            )
-            token_source = (
-                "parent_device"
-                if parent_device and parent_device.device_token
-                else ("recent_device" if any_recent_device and any_recent_device.device_token else ("parent_profile" if parent.fcm_token else "none"))
-            )
+            parent_fcm_token = parent_device.device_token if parent_device else None
+            token_source = "parent_device" if parent_fcm_token else "none"
             logger.info(
                 "ALERT_ESCALATION_START | alert_id=%s | parent_email=%s | fcm_token_available=%s | token_source=%s",
                 alert_id,
@@ -1143,6 +1127,7 @@ async def detect_chunk(
                         session.lon,
                         f"/alerts/{alert_id}/clip",
                         score,
+                        recipient_role="parent_device",
                     )
                 except Exception:
                     logger.exception("ALERT_ESCALATION_FAILED | alert_id=%s | device_id=%s", alert_id, device_id)
@@ -1330,6 +1315,7 @@ def get_alert_clip(alert_id: str, current=Depends(get_current_parent), db: Sessi
 @app.post("/devices")
 def create_device(
     device_name: str = Form(...),
+    installation_id: Optional[str] = Form(None),
     role: str = Form(...),
     device_token: Optional[str] = Form(None),
     current=Depends(get_current_parent),
@@ -1349,7 +1335,7 @@ def create_device(
         device_token[:15] + "..." if device_token else None,
     )
     
-    device = svc.create_device(db, parent_id, device_name, device_role, device_token)
+    device = svc.create_device(db, parent_id, device_name, device_role, installation_id=installation_id, device_token=device_token)
     
     logger.info(
         "DEVICE_REGISTRATION_SUCCESS | device_id=%s | parent_id=%s | role=%s | device_name=%s",
@@ -1364,11 +1350,31 @@ def create_device(
         "device": {
             "id": str(device.id),
             "parent_id": str(device.parent_id),
+            "installation_id": device.installation_id,
             "device_name": device.device_name,
             "role": device.role.value,
             "device_token": device.device_token
         }
     }
+
+
+@app.post("/devices/upsert")
+def upsert_device(
+    device_name: str = Form(...),
+    installation_id: Optional[str] = Form(None),
+    role: str = Form(...),
+    device_token: Optional[str] = Form(None),
+    current=Depends(get_current_parent),
+    db: Session = Depends(get_db),
+):
+    return create_device(
+        device_name=device_name,
+        installation_id=installation_id,
+        role=role,
+        device_token=device_token,
+        current=current,
+        db=db,
+    )
 
 @app.get("/devices")
 def list_devices(
@@ -1424,6 +1430,21 @@ def patch_device_monitoring(
     response = _device_payload(row)
     response["command_sent"] = command_sent
     return response
+
+
+class DeviceTokenPatchRequest(BaseModel):
+    device_token: Optional[str] = None
+
+
+@app.patch("/devices/{device_id}/token")
+def patch_device_token(
+    device_id: str,
+    body: DeviceTokenPatchRequest,
+    current=Depends(get_current_parent),
+    db: Session = Depends(get_db),
+):
+    row = svc.update_device_token(db, current["parent_id"], device_id, body.device_token)
+    return {"status": "ok", "device": _device_payload(row)}
 
 @app.post("/devices/{device_id}/heartbeat")
 def post_device_heartbeat(
