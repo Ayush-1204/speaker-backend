@@ -50,7 +50,7 @@ FAMILIAR_GRACE_MIN_CONF = float(os.environ.get("SAFEEAR_FAMILIAR_GRACE_MIN_CONF"
 FAMILIAR_RESET_MIN_STREAK = int(os.environ.get("SAFEEAR_FAMILIAR_RESET_MIN_STREAK", "2"))
 SOFT_STRANGER_MARGIN = float(os.environ.get("SAFEEAR_SOFT_STRANGER_MARGIN", "0.08"))
 SOFT_STRANGER_MIN_CONF = float(os.environ.get("SAFEEAR_SOFT_STRANGER_MIN_CONF", "0.30"))
-STRANGER_PREROLL_SEC = float(os.environ.get("SAFEEAR_STRANGER_PREROLL_SEC", "2.0"))
+STRANGER_PREROLL_SEC = float(os.environ.get("SAFEEAR_STRANGER_PREROLL_SEC", "5.0"))
 
 # Keep TF/Google runtime logs readable in local dev.
 os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
