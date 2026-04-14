@@ -54,6 +54,8 @@ FAMILIAR_GRACE_MIN_CONF = float(os.environ.get("SAFEEAR_FAMILIAR_GRACE_MIN_CONF"
 FAMILIAR_RESET_MIN_STREAK = int(os.environ.get("SAFEEAR_FAMILIAR_RESET_MIN_STREAK", "2"))
 SOFT_STRANGER_MARGIN = float(os.environ.get("SAFEEAR_SOFT_STRANGER_MARGIN", "0.03"))
 SOFT_STRANGER_MIN_CONF = float(os.environ.get("SAFEEAR_SOFT_STRANGER_MIN_CONF", "0.30"))
+STRANGER_MIN_TIER2_CONF = float(os.environ.get("SAFEEAR_STRANGER_MIN_TIER2_CONF", "0.70"))
+STRANGER_UNCERTAIN_CONF_FLOOR = float(os.environ.get("SAFEEAR_STRANGER_UNCERTAIN_CONF_FLOOR", "0.88"))
 STRANGER_PREROLL_SEC = float(os.environ.get("SAFEEAR_STRANGER_PREROLL_SEC", "5.0"))
 SPEAKER_CHANGE_THRESHOLD = float(os.environ.get("SAFEEAR_SPEAKER_CHANGE_THRESHOLD", "0.30"))
 
@@ -1270,6 +1272,10 @@ async def detect_chunk(
     tier3_pass = stage.get("tier3", {}).get("passed", False)
     tier2_category = str(stage.get("tier2", {}).get("category", "uncertain"))
     tier2_confidence = float(stage.get("tier2", {}).get("confidence", 0.0))
+    allow_stranger_increment = (
+        (tier2_category == "human_speech" and tier2_confidence >= STRANGER_MIN_TIER2_CONF)
+        or (tier2_category == "uncertain" and tier2_confidence >= STRANGER_UNCERTAIN_CONF_FLOOR)
+    )
     perf_latency_ms = float(stage.get("perf", {}).get("processing_ms", 0.0))
     logger.info(f"STAGE_RESULT | score={score:.4f} | tier1_vad={tier1_pass} | tier2={tier2_pass} | tier3={tier3_pass} | stage_decision={stage.get('decision', 'unknown')}")
     _log_pipeline_decision(
@@ -1361,6 +1367,16 @@ async def detect_chunk(
                 f"SCORE_DECISION | score={score:.4f} <= t_low={T_LOW} but held_by_familiar_grace "
                 f"| decision=uncertain_post_familiar | grace_sec={FAMILIAR_GRACE_SEC} | floor={FAMILIAR_HOLD_FLOOR}"
             )
+        elif not allow_stranger_increment:
+            decision = "uncertain_noise"
+            logger.info(
+                "SCORE_DECISION | score=%.4f <= t_low=%.2f but blocked_by_tier2_guard "
+                "| decision=uncertain_noise | tier2_category=%s | tier2_confidence=%.4f",
+                score,
+                T_LOW,
+                tier2_category,
+                tier2_confidence,
+            )
         else:
             session.stranger_streak += 1
             decision = "stranger_candidate"
@@ -1369,7 +1385,7 @@ async def detect_chunk(
     else:
         session.familiar_recovery_streak = 0
         soft_limit = T_LOW + SOFT_STRANGER_MARGIN
-        likely_human_speech = tier2_category in {"human_speech", "uncertain"} and tier2_confidence >= SOFT_STRANGER_MIN_CONF
+        likely_human_speech = tier2_category == "human_speech" and tier2_confidence >= SOFT_STRANGER_MIN_CONF
 
         if score <= soft_limit and likely_human_speech:
             session.stranger_streak += 1
@@ -1542,6 +1558,8 @@ async def detect_chunk(
             "familiar_reset_min_streak": FAMILIAR_RESET_MIN_STREAK,
             "soft_stranger_margin": SOFT_STRANGER_MARGIN,
             "soft_stranger_min_conf": SOFT_STRANGER_MIN_CONF,
+            "stranger_min_tier2_conf": STRANGER_MIN_TIER2_CONF,
+            "stranger_uncertain_conf_floor": STRANGER_UNCERTAIN_CONF_FLOOR,
             "debounce_sec": DEBOUNCE_SEC,
             "speaker_change_threshold": SPEAKER_CHANGE_THRESHOLD,
             "block_reason": alert_block_reason,

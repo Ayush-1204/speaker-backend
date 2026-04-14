@@ -462,3 +462,34 @@ async def test_detect_chunk_duplicate_chunk_id_returns_cached_response(client: A
     assert second.status_code == 200
     assert first.json().get("idempotent_replay") is None
     assert second.json().get("idempotent_replay") is True
+
+
+@pytest.mark.anyio
+async def test_detect_chunk_low_confidence_uncertain_does_not_increment_stranger_streak(client: AsyncClient):
+    token, _ = await _register_parent(client)
+    child_device_id = await _create_device(client, token, "child-noise-guard", "child_device", f"ng_{uuid.uuid4().hex}")
+
+    fake_stage = {
+        "tier1_vad": {"passed": True},
+        "tier2": {"passed": True, "category": "uncertain", "confidence": 0.2},
+        "tier3": {"passed": True, "score": 0.1, "closest_speaker_id": None},
+        "decision": "tier3_scored",
+        "perf": {"processing_ms": 1.0},
+        "_query_centroid": np.ones(192, dtype=np.float32),
+    }
+
+    with patch("app.main._decode_audio_chunk", return_value=(np.ones(24000, dtype=np.float32), 16000, "mock")), patch(
+        "app.utils.prd_services_db.evaluate_window", return_value=fake_stage
+    ):
+        resp = await client.post(
+            "/detect/chunk",
+            headers={"Authorization": f"Bearer {token}"},
+            data={"device_id": child_device_id},
+            files={"file": ("c.wav", _wav_bytes(), "audio/wav")},
+        )
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["decision"] == "uncertain_noise"
+    assert payload["stranger_streak"] == 0
+    assert payload["alert_fired"] is False
