@@ -24,6 +24,14 @@ SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY")
 SENDGRID_FROM_EMAIL = os.environ.get("SENDGRID_FROM_EMAIL", "alerts@safeear.app")
 
 
+def _resolve_redis_url() -> str:
+    return (
+        (os.environ.get("REDIS_URL") or "").strip()
+        or (os.environ.get("SAFEEAR_REDIS_URL") or "").strip()
+        or "redis://localhost:6379"
+    )
+
+
 def _init_firebase():
     """Initialize Firebase Admin SDK."""
     try:
@@ -218,7 +226,7 @@ def escalate_alert(
 """
 from celery import Celery
 
-celery_app = Celery('safeear_notifications', broker=os.environ.get('CELERY_BROKER_URL', 'redis://localhost:6379'))
+celery_app = Celery('safeear_notifications', broker=os.environ.get('CELERY_BROKER_URL', _resolve_redis_url()))
 
 @celery_app.task
 def notify_parent_async(parent_email, parent_phone, fcm_token, alert_id, lat, lon, audio_url, confidence):

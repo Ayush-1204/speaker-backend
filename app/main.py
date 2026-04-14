@@ -133,6 +133,14 @@ _CACHE_WARMUP_SUMMARY: Dict[str, Any] = {
 }
 
 
+def _resolve_redis_url() -> str:
+    return (
+        (os.environ.get("REDIS_URL") or "").strip()
+        or (os.environ.get("SAFEEAR_REDIS_URL") or "").strip()
+        or "redis://localhost:6379/0"
+    )
+
+
 def _normalized_embedding(vec: Any) -> Optional[np.ndarray]:
     arr = np.asarray(vec, dtype=np.float32).reshape(-1)
     if arr.size == 0:
@@ -214,7 +222,7 @@ def _get_redis_client():
     if redis is None:
         return None
 
-    redis_url = (os.environ.get("SAFEEAR_REDIS_URL") or "").strip() or "redis://localhost:6379/0"
+    redis_url = _resolve_redis_url()
     try:
         client = redis.Redis.from_url(redis_url, decode_responses=False, socket_connect_timeout=2, socket_timeout=2)
         client.ping()

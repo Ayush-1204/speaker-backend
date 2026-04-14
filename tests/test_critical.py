@@ -9,6 +9,7 @@ import soundfile as sf
 from httpx import ASGITransport, AsyncClient
 
 from app.main import app
+from app.main import _resolve_redis_url
 from app.database.models import Alert, Device
 from app.database.session import SessionLocal, init_db
 from app.utils import prd_services_db as svc
@@ -194,6 +195,18 @@ async def test_enrolled_speaker_list_does_not_default_to_poor(client: AsyncClien
     items = listed.json()["items"]
     assert len(items) == 1
     assert items[0]["quality_label"] != "poor"
+
+
+def test_resolve_redis_url_prefers_render_env(monkeypatch):
+    monkeypatch.setenv("REDIS_URL", "redis://render.example:6379/0")
+    monkeypatch.setenv("SAFEEAR_REDIS_URL", "redis://legacy.example:6379/0")
+    assert _resolve_redis_url() == "redis://render.example:6379/0"
+
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    assert _resolve_redis_url() == "redis://legacy.example:6379/0"
+
+    monkeypatch.delenv("SAFEEAR_REDIS_URL", raising=False)
+    assert _resolve_redis_url() == "redis://localhost:6379/0"
 
 
 @pytest.mark.anyio
