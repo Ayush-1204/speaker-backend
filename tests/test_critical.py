@@ -493,3 +493,51 @@ async def test_detect_chunk_low_confidence_uncertain_does_not_increment_stranger
     assert payload["decision"] == "uncertain_noise"
     assert payload["stranger_streak"] == 0
     assert payload["alert_fired"] is False
+
+
+@pytest.mark.anyio
+async def test_detect_chunk_borderline_scores_tighten_monitoring(client: AsyncClient):
+    token, _ = await _register_parent(client)
+    child_device_id = await _create_device(client, token, "child-strict-monitoring", "child_device", f"sm_{uuid.uuid4().hex}")
+
+    low_stage = {
+        "tier1_vad": {"passed": True},
+        "tier2": {"passed": True, "category": "human_speech", "confidence": 0.92},
+        "tier3": {"passed": True, "score": 0.25, "closest_speaker_id": None},
+        "decision": "tier3_scored",
+        "perf": {"processing_ms": 1.0},
+        "_query_centroid": np.ones(192, dtype=np.float32),
+    }
+    borderline_stage = {
+        "tier1_vad": {"passed": True},
+        "tier2": {"passed": True, "category": "human_speech", "confidence": 0.92},
+        "tier3": {"passed": True, "score": 0.4348, "closest_speaker_id": None},
+        "decision": "tier3_scored",
+        "perf": {"processing_ms": 1.0},
+        "_query_centroid": np.ones(192, dtype=np.float32),
+    }
+
+    with patch("app.main._decode_audio_chunk", return_value=(np.ones(24000, dtype=np.float32), 16000, "mock")), patch(
+        "app.utils.prd_services_db.evaluate_window", side_effect=[low_stage, borderline_stage]
+    ):
+        first = await client.post(
+            "/detect/chunk",
+            headers={"Authorization": f"Bearer {token}"},
+            data={"device_id": child_device_id},
+            files={"file": ("c1.wav", _wav_bytes(), "audio/wav")},
+        )
+        second = await client.post(
+            "/detect/chunk",
+            headers={"Authorization": f"Bearer {token}"},
+            data={"device_id": child_device_id},
+            files={"file": ("c2.wav", _wav_bytes(), "audio/wav")},
+        )
+
+    assert first.status_code == 200
+    assert first.json()["decision"] == "stranger_candidate"
+    assert first.json()["stranger_streak"] == 1
+
+    assert second.status_code == 200
+    assert second.json()["decision"] == "uncertain"
+    assert second.json()["stranger_streak"] == 1
+    assert second.json()["alert_fired"] is False

@@ -54,8 +54,8 @@ _REDIMNET_HUB_REPO = os.environ.get("REDIMNET_HUB_REPO", "PalabraAI/redimnet2")
 _REDIMNET_HUB_ENTRY = os.environ.get("REDIMNET_HUB_ENTRY", "redimnet2")
 _IS_REDIMNET2 = ("redimnet2" in _REDIMNET_HUB_REPO.lower()) or ("redimnet2" in _REDIMNET_HUB_ENTRY.lower())
 
-_DEFAULT_T_HIGH = "0.40" if _IS_REDIMNET2 else "0.72"
-_DEFAULT_T_LOW = "0.24" if _IS_REDIMNET2 else "0.60"
+_DEFAULT_T_HIGH = "0.47" if _IS_REDIMNET2 else "0.72"
+_DEFAULT_T_LOW = "0.31" if _IS_REDIMNET2 else "0.60"
 _DEFAULT_CONFIRM_WINDOWS = "3"
 
 T_HIGH = float(os.environ.get("SAFEEAR_T_HIGH", _DEFAULT_T_HIGH))
