@@ -278,6 +278,34 @@ def test_embedding_dimension_guard(tmp_path):
         db.close()
 
 
+def test_enrollment_quality_monotone_chunks_not_labeled_good(tmp_path):
+    db = SessionLocal()
+    parent = None
+    try:
+        email = f"mono_{uuid.uuid4().hex}@example.com"
+        parent = svc.register_parent_with_email(db, email, "password123", "Mono Guard")
+        speaker = svc.create_speaker(db, str(parent.id), "Monotone")
+
+        base = np.ones(192, dtype=np.float32)
+        for _ in range(4):
+            svc.save_speaker_embedding(db, str(parent.id), str(speaker.id), base)
+
+        score, label = svc.compute_and_store_enrollment_quality(db, str(parent.id), str(speaker.id))
+
+        assert score is not None
+        assert label in {"fair", "poor"}
+        assert label != "good"
+    finally:
+        if parent is not None:
+            try:
+                parent_row = svc.get_parent(db, str(parent.id))
+                db.delete(parent_row)
+                db.commit()
+            except Exception:
+                pass
+        db.close()
+
+
 @pytest.mark.anyio
 async def test_refresh_returns_fresh_access_and_refresh_tokens(client: AsyncClient):
     register = await client.post(

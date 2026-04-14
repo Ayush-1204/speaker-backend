@@ -1442,10 +1442,25 @@ def compute_and_store_enrollment_quality(db: Session, parent_id: str, speaker_id
         return None, None
 
     pair_scores = [_cos(a, b) for a, b in combinations(embs, 2)]
-    mean_similarity = float(np.mean(pair_scores)) if pair_scores else 0.0
-    if mean_similarity >= 0.75:
+    if not pair_scores:
+        speaker.quality_score = None
+        speaker.quality_label = None
+        speaker.updated_at = datetime.utcnow()
+        db.commit()
+        db.refresh(speaker)
+        return None, None
+
+    pair_arr = np.asarray(pair_scores, dtype=np.float32)
+    median_similarity = float(np.median(pair_arr))
+    lower_quartile = float(np.percentile(pair_arr, 25))
+    spread = float(np.std(pair_arr))
+
+    # Robust score favors consistency of most chunk pairs without over-weighting a few easy matches.
+    robust_similarity = float((0.65 * median_similarity) + (0.35 * lower_quartile))
+
+    if robust_similarity >= 0.74 and lower_quartile >= 0.62:
         label = "good"
-    elif mean_similarity >= 0.55:
+    elif robust_similarity >= 0.52:
         label = "fair"
     elif len(embs) <= 3:
         # Small enrollment sets are too noisy for a strict poor label.
@@ -1453,12 +1468,16 @@ def compute_and_store_enrollment_quality(db: Session, parent_id: str, speaker_id
     else:
         label = "poor"
 
-    speaker.quality_score = mean_similarity
+    # Guard against gaming the metric with monotone near-identical chunks (e.g., prolonged vowel only).
+    if len(embs) >= 4 and median_similarity >= 0.93 and spread <= 0.015 and label == "good":
+        label = "fair"
+
+    speaker.quality_score = robust_similarity
     speaker.quality_label = label
     speaker.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(speaker)
-    return mean_similarity, label
+    return robust_similarity, label
 
 
 def should_hop(frame_samples: int, sr: int = 16000) -> bool:
