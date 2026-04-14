@@ -173,6 +173,30 @@ async def test_tenant_isolation_speakers(client: AsyncClient):
 
 
 @pytest.mark.anyio
+async def test_enrolled_speaker_list_does_not_default_to_poor(client: AsyncClient):
+    token, _ = await _register_parent(client)
+
+    emb_1 = np.ones(192, dtype=np.float32)
+    emb_2 = np.ones(192, dtype=np.float32) * 0.92
+
+    with patch("app.main.run_enroll_embedding", return_value=([emb_1, emb_2], {"ok": True})):
+        enroll = await client.post(
+            "/enroll/speaker",
+            headers={"Authorization": f"Bearer {token}"},
+            data={"display_name": "Quality Check"},
+            files={"file": ("q.wav", _wav_bytes(), "audio/wav")},
+        )
+
+    assert enroll.status_code == 200
+
+    listed = await client.get("/enroll/speakers", headers={"Authorization": f"Bearer {token}"})
+    assert listed.status_code == 200
+    items = listed.json()["items"]
+    assert len(items) == 1
+    assert items[0]["quality_label"] != "poor"
+
+
+@pytest.mark.anyio
 async def test_detect_chunk_blocked_for_parent_device(client: AsyncClient):
     token, _ = await _register_parent(client)
     parent_device_id = await _create_device(

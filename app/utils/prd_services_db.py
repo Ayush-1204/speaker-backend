@@ -1447,6 +1447,9 @@ def compute_and_store_enrollment_quality(db: Session, parent_id: str, speaker_id
         label = "good"
     elif mean_similarity >= 0.55:
         label = "fair"
+    elif len(embs) <= 3:
+        # Small enrollment sets are too noisy for a strict poor label.
+        label = "fair"
     else:
         label = "poor"
 
