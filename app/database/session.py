@@ -28,6 +28,7 @@ def init_db():
     """Create all tables."""
     Base.metadata.create_all(bind=engine)
     _ensure_device_columns()
+    _ensure_speaker_columns()
 
 
 def _ensure_device_columns() -> None:
@@ -51,6 +52,28 @@ def _ensure_device_columns() -> None:
         statements.append("ALTER TABLE devices ADD COLUMN last_heartbeat_at DATETIME")
     if "last_activity_at" not in existing:
         statements.append("ALTER TABLE devices ADD COLUMN last_activity_at DATETIME")
+
+    if not statements:
+        return
+
+    with engine.begin() as conn:
+        for stmt in statements:
+            conn.execute(text(stmt))
+
+
+def _ensure_speaker_columns() -> None:
+    """Backfill enrolled_speakers columns for quality scoring support."""
+    inspector = inspect(engine)
+    if "enrolled_speakers" not in inspector.get_table_names():
+        return
+
+    existing = {col["name"] for col in inspector.get_columns("enrolled_speakers")}
+    statements = []
+
+    if "quality_score" not in existing:
+        statements.append("ALTER TABLE enrolled_speakers ADD COLUMN quality_score FLOAT")
+    if "quality_label" not in existing:
+        statements.append("ALTER TABLE enrolled_speakers ADD COLUMN quality_label VARCHAR")
 
     if not statements:
         return

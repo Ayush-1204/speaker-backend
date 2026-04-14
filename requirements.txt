@@ -56,4 +56,5 @@ sendgrid==6.11.0
 # -------- ASYNC TASKS --------
 celery==5.4.0
 redis==5.2.0
+pytest==8.3.3
 

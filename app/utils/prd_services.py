@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import secrets
 import threading
@@ -40,6 +41,7 @@ DEBOUNCE_SEC = int(os.environ.get("SAFEEAR_DEBOUNCE_SEC", "60"))
 
 _LOCK = threading.Lock()
 _SESSIONS: Dict[str, "SessionState"] = {}
+logger = logging.getLogger(__name__)
 
 
 def _ensure_parent_dirs(parent_id: str) -> Dict[str, str]:
@@ -90,7 +92,12 @@ def make_jwt(parent_id: str) -> str:
     import hashlib
 
     header = {"alg": "HS256", "typ": "JWT"}
-    payload = {"sub": parent_id, "iat": int(time.time()), "exp": int(time.time()) + JWT_EXPIRE_SEC}
+    payload = {
+        "sub": parent_id,
+        "iat": int(time.time()),
+        "exp": int(time.time()) + JWT_EXPIRE_SEC,
+        "jti": secrets.token_urlsafe(8),
+    }
     h = _b64(json.dumps(header, separators=(",", ":")).encode("utf-8"))
     p = _b64(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
     sig = hmac.new(JWT_SECRET.encode("utf-8"), f"{h}.{p}".encode("ascii"), hashlib.sha256).digest()
@@ -517,6 +524,7 @@ def save_alert_clip(parent_id: str, session: SessionState, waveform: np.ndarray)
     adir = os.path.join(dirs["alerts"], alert_id)
     os.makedirs(adir, exist_ok=True)
     clip_path = os.path.join(adir, "clip.wav")
+    tmp_clip_path = f"{clip_path}.tmp"
     metadata_path = os.path.join(adir, "metadata.json")
     metadata = {
         "segment_started_ms": int(session.stranger_segment_started_ms) if session.stranger_segment_started_ms else None,
@@ -525,10 +533,26 @@ def save_alert_clip(parent_id: str, session: SessionState, waveform: np.ndarray)
         "samples": int(np.asarray(waveform).reshape(-1).shape[0]),
     }
     try:
-        sf.write(clip_path, waveform, session.sr)
+        sf.write(tmp_clip_path, waveform, session.sr, format="WAV")
+        try:
+            os.replace(tmp_clip_path, clip_path)
+        except Exception as rename_exc:
+            logger.error(
+                "ALERT_CLIP_RENAME_FAILED | parent_id=%s | clip_path=%s | tmp_path=%s | reason=%s",
+                parent_id,
+                clip_path,
+                tmp_clip_path,
+                str(rename_exc),
+            )
+            raise
         with open(metadata_path, "w", encoding="utf-8") as handle:
             json.dump(metadata, handle, indent=2)
     except Exception as exc:
+        if os.path.exists(tmp_clip_path):
+            try:
+                os.remove(tmp_clip_path)
+            except OSError:
+                pass
         for path in (metadata_path, clip_path):
             try:
                 if os.path.exists(path):

@@ -14,12 +14,14 @@ import base64
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from itertools import combinations
 
 import numpy as np
 import soundfile as sf
 from fastapi import HTTPException
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.database.models import (
@@ -72,6 +74,30 @@ _INFER_POOL = ThreadPoolExecutor(max_workers=int(os.environ.get("SAFEEAR_INFER_W
 _EMPTY_CHUNK_COUNTS: Dict[str, Tuple[int, float]] = {}  # device_id -> (count, last_reset_time)
 _EMPTY_CHUNK_THRESHOLD = int(os.environ.get("SAFEEAR_EMPTY_CHUNK_THRESHOLD", "5"))
 _EMPTY_CHUNK_RESET_SEC = int(os.environ.get("SAFEEAR_EMPTY_CHUNK_RESET_SEC", "10"))
+
+
+def _normalized_embedding(vec: np.ndarray) -> Optional[np.ndarray]:
+    arr = np.asarray(vec, dtype=np.float32).reshape(-1)
+    if arr.size == 0:
+        return None
+    norm = float(np.linalg.norm(arr))
+    if norm <= 1e-12:
+        return None
+    return (arr / norm).astype(np.float32)
+
+
+def _compute_query_centroid(query_embs: List[np.ndarray]) -> Optional[np.ndarray]:
+    normalized_chunks: List[np.ndarray] = []
+    for emb in query_embs or []:
+        normed = _normalized_embedding(emb)
+        if normed is not None and normed.shape[0] == config.EMBEDDING_DIM:
+            normalized_chunks.append(normed)
+
+    if not normalized_chunks:
+        return None
+
+    centroid = np.mean(np.stack(normalized_chunks, axis=0), axis=0)
+    return _normalized_embedding(centroid)
 
 
 def _as_uuid(value: Any, field_name: str) -> uuid.UUID:
@@ -154,7 +180,12 @@ def make_jwt(parent_id: str) -> str:
     import json
 
     header = {"alg": "HS256", "typ": "JWT"}
-    payload = {"sub": str(parent_id), "iat": int(time.time()), "exp": int(time.time()) + JWT_EXPIRE_SEC}
+    payload = {
+        "sub": str(parent_id),
+        "iat": int(time.time()),
+        "exp": int(time.time()) + JWT_EXPIRE_SEC,
+        "jti": secrets.token_urlsafe(8),
+    }
     h = _b64(json.dumps(header, separators=(",", ":")).encode("utf-8"))
     p = _b64(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
     sig = hmac.new(JWT_SECRET.encode("utf-8"), f"{h}.{p}".encode("ascii"), hashlib.sha256).digest()
@@ -347,7 +378,10 @@ def create_device(
     if existing is None and normalized_name:
         existing = (
             db.query(Device)
-            .filter(Device.parent_id == parent_uuid, Device.device_name == normalized_name)
+            .filter(
+                Device.parent_id == parent_uuid,
+                func.lower(Device.device_name) == normalized_name.lower(),
+            )
             .first()
         )
     if existing is not None:
@@ -434,15 +468,37 @@ def update_device_token(db: Session, parent_id: str, device_id: str, device_toke
     if token == device.device_token:
         return device
 
-    if token is not None:
-        token_owner = db.query(Device).filter(Device.device_token == token, Device.id != device.id).first()
-        if token_owner is not None:
-            token_owner.device_token = None
-            token_owner.updated_at = datetime.utcnow()
+    try:
+        now = datetime.utcnow()
+        if token is not None:
+            (
+                db.query(Device)
+                .filter(Device.device_token == token, Device.id != device.id)
+                .update(
+                    {
+                        Device.device_token: None,
+                        Device.updated_at: now,
+                    },
+                    synchronize_session=False,
+                )
+            )
 
-    device.device_token = token
-    device.updated_at = datetime.utcnow()
-    db.commit()
+        (
+            db.query(Device)
+            .filter(Device.id == device.id)
+            .update(
+                {
+                    Device.device_token: token,
+                    Device.updated_at: now,
+                },
+                synchronize_session=False,
+            )
+        )
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="device_token_conflict") from exc
+
     db.refresh(device)
     return device
 
@@ -722,6 +778,10 @@ def _speaker_dir(parent_id: str, speaker_id: str) -> str:
     return os.path.join(dirs["embeddings"], str(speaker_id))
 
 
+def get_speaker_embedding_dir(parent_id: str, speaker_id: str) -> str:
+    return _speaker_dir(parent_id, speaker_id)
+
+
 def _count_speaker_embedding_files(parent_id: str, speaker_id: str) -> int:
     sdir = _speaker_dir(parent_id, speaker_id)
     if not os.path.isdir(sdir):
@@ -872,12 +932,23 @@ def load_parent_embeddings(db: Session, parent_id: str) -> Dict[str, List[np.nda
         for fname in sorted(os.listdir(sdir)):
             if not fname.endswith(".npy"):
                 continue
+            fpath = os.path.join(sdir, fname)
             try:
-                arr = np.asarray(np.load(os.path.join(sdir, fname)), dtype=np.float32).reshape(-1)
-            except Exception:
-                continue
-            if arr.ndim == 1 and arr.shape[0] == config.EMBEDDING_DIM:
-                embs.append(arr)
+                arr = np.asarray(np.load(fpath), dtype=np.float32).reshape(-1)
+            except Exception as exc:
+                logger.error("EMBEDDING_LOAD_FAILED | file=%s | reason=%s", fpath, str(exc))
+                raise ValueError(f"dim mismatch or unreadable embedding: {fpath}") from exc
+            if arr.ndim != 1 or arr.shape[0] != config.EXPECTED_EMBEDDING_DIM:
+                logger.error(
+                    "EMBEDDING_DIM_MISMATCH | file=%s | expected=%s | got=%s",
+                    fpath,
+                    config.EXPECTED_EMBEDDING_DIM,
+                    int(arr.shape[0]) if arr.ndim == 1 else -1,
+                )
+                raise ValueError(
+                    f"dim mismatch for embedding {fpath}: expected {config.EXPECTED_EMBEDDING_DIM}, got {arr.shape[0] if arr.ndim == 1 else 'non-1d'}"
+                )
+            embs.append(arr)
         if embs:
             out[str(sp.id)] = embs
     return out
@@ -1058,7 +1129,8 @@ class SessionState:
     parent_id: str
     device_id: str
     sr: int = 16000
-    ring: Optional[np.ndarray] = None
+    inference_buffer: Optional[np.ndarray] = None
+    clip_buffer: Optional[np.ndarray] = None
     stranger_segment: Optional[np.ndarray] = None
     stranger_segment_started_ms: int = 0
     stranger_segment_ended_ms: int = 0
@@ -1069,6 +1141,8 @@ class SessionState:
     last_familiar_ms: int = 0
     last_familiar_speaker_id: Optional[str] = None
     familiar_recovery_streak: int = 0
+    active_stranger_embedding: Optional[np.ndarray] = None
+    recent_confirmed_stranger_embeddings: List[np.ndarray] = field(default_factory=list)
 
 
 def _session_key(parent_id: str, device_id: str) -> str:
@@ -1121,6 +1195,29 @@ def clear_stranger_segment(session: SessionState) -> None:
     session.stranger_segment_ended_ms = 0
 
 
+def clear_stranger_identity(session: SessionState) -> None:
+    session.active_stranger_embedding = None
+    session.recent_confirmed_stranger_embeddings = []
+
+
+def record_confirmed_stranger_window(session: SessionState, centroid: Optional[np.ndarray]) -> None:
+    normed = _normalized_embedding(centroid) if centroid is not None else None
+    if normed is None:
+        return
+    session.recent_confirmed_stranger_embeddings.append(normed)
+    if len(session.recent_confirmed_stranger_embeddings) > 3:
+        session.recent_confirmed_stranger_embeddings = session.recent_confirmed_stranger_embeddings[-3:]
+
+
+def set_active_stranger_embedding(session: SessionState) -> Optional[np.ndarray]:
+    if not session.recent_confirmed_stranger_embeddings:
+        return None
+    centroid = np.mean(np.stack(session.recent_confirmed_stranger_embeddings, axis=0), axis=0)
+    normed = _normalized_embedding(centroid)
+    session.active_stranger_embedding = normed
+    return normed
+
+
 def get_stranger_segment_waveform(session: SessionState, fallback: np.ndarray) -> np.ndarray:
     if session.stranger_segment is not None and session.stranger_segment.size > 0:
         return session.stranger_segment
@@ -1131,6 +1228,10 @@ def update_session_location(parent_id: str, device_id: str, lat: Optional[float]
     s = get_or_create_session(parent_id, device_id)
     s.lat = lat
     s.lon = lon
+
+
+def clear_clip_buffer(session: SessionState) -> None:
+    session.clip_buffer = None
 
 
 def evaluate_window(db: Session, parent_id: str, waveform: np.ndarray, sr: int = 16000) -> Dict[str, Any]:
@@ -1259,6 +1360,7 @@ def evaluate_window(db: Session, parent_id: str, waveform: np.ndarray, sr: int =
         }
 
     score, closest_speaker_id = _score_against_candidates(parent_candidates, query_embs, parent_id)
+    query_centroid = _compute_query_centroid(query_embs)
     
     logger.info(f"TIER3_SCORED | parent_id={parent_id} | score={score:.4f} | closest_speaker_id={closest_speaker_id} | t_high={T_HIGH} | t_low={T_LOW}")
     perf = _perf_metrics(len(waveform), sr, started_at)
@@ -1283,19 +1385,77 @@ def evaluate_window(db: Session, parent_id: str, waveform: np.ndarray, sr: int =
         },
         "decision": "tier3_scored",
         "perf": perf,
+        "_query_centroid": query_centroid,
     }
 
 
 def append_frame(session: SessionState, frame: np.ndarray) -> np.ndarray:
     frame = np.asarray(frame, dtype=np.float32).reshape(-1)
-    if session.ring is None:
-        session.ring = frame
+    if session.inference_buffer is None:
+        session.inference_buffer = frame
     else:
-        session.ring = np.concatenate([session.ring, frame])
-    keep = int(max(ALERT_RING_SEC, WINDOW_SEC) * session.sr)
-    if session.ring.shape[0] > keep:
-        session.ring = session.ring[-keep:]
-    return session.ring
+        session.inference_buffer = np.concatenate([session.inference_buffer, frame])
+
+    infer_keep = int(WINDOW_SEC * session.sr)
+    if session.inference_buffer.shape[0] > infer_keep:
+        session.inference_buffer = session.inference_buffer[-infer_keep:]
+
+    if session.clip_buffer is None:
+        session.clip_buffer = frame.copy()
+    else:
+        session.clip_buffer = np.concatenate([session.clip_buffer, frame])
+
+    clip_keep = int(ALERT_RING_SEC * session.sr)
+    if session.clip_buffer.shape[0] > clip_keep:
+        session.clip_buffer = session.clip_buffer[-clip_keep:]
+
+    return session.inference_buffer
+
+
+def get_clip_buffer_waveform(session: SessionState, fallback: np.ndarray) -> np.ndarray:
+    if session.clip_buffer is not None and session.clip_buffer.size > 0:
+        return np.asarray(session.clip_buffer, dtype=np.float32).reshape(-1)
+    return np.asarray(fallback, dtype=np.float32).reshape(-1)
+
+
+def compute_and_store_enrollment_quality(db: Session, parent_id: str, speaker_id: str) -> Tuple[Optional[float], Optional[str]]:
+    speaker = get_speaker(db, parent_id, speaker_id)
+    sdir = _speaker_dir(parent_id, speaker.id)
+    embs: List[np.ndarray] = []
+    if os.path.isdir(sdir):
+        for fname in sorted(os.listdir(sdir)):
+            if not fname.endswith(".npy"):
+                continue
+            try:
+                arr = np.asarray(np.load(os.path.join(sdir, fname)), dtype=np.float32).reshape(-1)
+            except Exception:
+                continue
+            if arr.shape[0] == config.EMBEDDING_DIM:
+                embs.append(arr)
+
+    if len(embs) < 2:
+        speaker.quality_score = None
+        speaker.quality_label = None
+        speaker.updated_at = datetime.utcnow()
+        db.commit()
+        db.refresh(speaker)
+        return None, None
+
+    pair_scores = [_cos(a, b) for a, b in combinations(embs, 2)]
+    mean_similarity = float(np.mean(pair_scores)) if pair_scores else 0.0
+    if mean_similarity >= 0.75:
+        label = "good"
+    elif mean_similarity >= 0.55:
+        label = "fair"
+    else:
+        label = "poor"
+
+    speaker.quality_score = mean_similarity
+    speaker.quality_label = label
+    speaker.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(speaker)
+    return mean_similarity, label
 
 
 def should_hop(frame_samples: int, sr: int = 16000) -> bool:
@@ -1308,6 +1468,7 @@ def save_alert_clip(parent_id: str, session: SessionState, waveform: np.ndarray)
     adir = os.path.join(dirs["alerts"], alert_id)
     os.makedirs(adir, exist_ok=True)
     clip_path = os.path.join(adir, "clip.wav")
+    tmp_clip_path = f"{clip_path}.tmp"
     metadata_path = os.path.join(adir, "metadata.json")
     metadata = {
         "segment_started_ms": int(session.stranger_segment_started_ms) if session.stranger_segment_started_ms else None,
@@ -1316,10 +1477,33 @@ def save_alert_clip(parent_id: str, session: SessionState, waveform: np.ndarray)
         "samples": int(np.asarray(waveform).reshape(-1).shape[0]),
     }
     try:
-        sf.write(clip_path, waveform, session.sr)
+        sf.write(tmp_clip_path, waveform, session.sr, format="WAV")
+        try:
+            os.replace(tmp_clip_path, clip_path)
+        except Exception as rename_exc:
+            logger.error(
+                "ALERT_CLIP_RENAME_FAILED | parent_id=%s | clip_path=%s | tmp_path=%s | reason=%s",
+                parent_id,
+                clip_path,
+                tmp_clip_path,
+                str(rename_exc),
+            )
+            raise
         with open(metadata_path, "w", encoding="utf-8") as handle:
             json.dump(metadata, handle, indent=2)
     except Exception as exc:
+        if os.path.exists(tmp_clip_path):
+            try:
+                os.remove(tmp_clip_path)
+            except OSError:
+                pass
+        logger.error(
+            "ALERT_CLIP_WRITE_FAILED | parent_id=%s | clip_path=%s | tmp_path=%s | reason=%s",
+            parent_id,
+            clip_path,
+            tmp_clip_path,
+            str(exc),
+        )
         for path in (metadata_path, clip_path):
             try:
                 if os.path.exists(path):

@@ -86,6 +86,8 @@ class EnrolledSpeaker(Base):
     parent_id = Column(UUID(as_uuid=True), ForeignKey("parents.id"), nullable=False, index=True)
     display_name = Column(String, nullable=False)
     sample_count = Column(Integer, default=0)
+    quality_score = Column(Float)
+    quality_label = Column(String)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 

@@ -1,6 +1,7 @@
 import io
 import asyncio
 import logging
+import json
 import os
 import shutil
 import tempfile
@@ -14,19 +15,24 @@ import numpy as np
 import soundfile as sf
 import librosa
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from starlette.websockets import WebSocketState
 
-from app.database.models import Device, DeviceRole
+try:
+    import redis
+except Exception:  # pragma: no cover - optional dependency behavior
+    redis = None
+
+from app.database.models import Device, DeviceRole, Parent, EnrolledSpeaker
 from app.database.session import SessionLocal, get_db, init_db
 from app.utils import prd_services_db as svc
 from app.utils import feature_extractor as feature_extractor_module
 from app.utils import yamnet_classifier as yamnet_classifier_module
 from app.utils import vad as vad_module
 from app.utils.audio_preprocess import normalize_waveform
-from app.utils.notification_worker import escalate_alert
+from app.utils.notification_worker import escalate_alert, send_fcm_push
 from app.utils.prd_services import (
     DEBOUNCE_SEC,
     STRANGER_CONFIRM_COUNT,
@@ -34,9 +40,7 @@ from app.utils.prd_services import (
     T_LOW,
     WINDOW_SEC,
     HOP_SEC,
-    append_frame,
     now_ms,
-    should_hop,
 )
 from app.utils.verification_pipeline import run_enroll_embedding
 
@@ -51,6 +55,7 @@ FAMILIAR_RESET_MIN_STREAK = int(os.environ.get("SAFEEAR_FAMILIAR_RESET_MIN_STREA
 SOFT_STRANGER_MARGIN = float(os.environ.get("SAFEEAR_SOFT_STRANGER_MARGIN", "0.08"))
 SOFT_STRANGER_MIN_CONF = float(os.environ.get("SAFEEAR_SOFT_STRANGER_MIN_CONF", "0.30"))
 STRANGER_PREROLL_SEC = float(os.environ.get("SAFEEAR_STRANGER_PREROLL_SEC", "5.0"))
+SPEAKER_CHANGE_THRESHOLD = float(os.environ.get("SAFEEAR_SPEAKER_CHANGE_THRESHOLD", "0.30"))
 
 # Keep TF/Google runtime logs readable in local dev.
 os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
@@ -70,10 +75,33 @@ app = FastAPI(title="SafeEar Backend", version="2.0.0")
 
 # Configure logging for score and acknowledgement tracking
 logger = logging.getLogger(__name__)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - [%(funcName)s] %(message)s"
-)
+
+
+class _JsonLogFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        return json.dumps(payload)
+
+
+def _configure_logging() -> None:
+    root = logging.getLogger()
+    if not root.handlers:
+        root.addHandler(logging.StreamHandler())
+    handler = root.handlers[0]
+    log_format = (os.environ.get("LOG_FORMAT") or "").strip().lower()
+    if log_format == "json":
+        handler.setFormatter(_JsonLogFormatter())
+    else:
+        handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - [%(funcName)s] %(message)s"))
+    root.setLevel(logging.INFO)
+
+
+_configure_logging()
 
 WS_PING_INTERVAL_SEC = int(os.environ.get("SAFEEAR_WS_PING_INTERVAL_SEC", "20"))
 WS_CLIENT_QUEUE_MAX = int(os.environ.get("SAFEEAR_WS_CLIENT_QUEUE_MAX", "256"))
@@ -90,6 +118,203 @@ _WS_PUBLISHED_COUNTS: Dict[str, int] = {
 _WS_LAST_QUEUE_LAG_MS: int = 0
 _DEVICE_STATUS_EVENT_LAST_SENT: Dict[str, int] = {}
 DEVICE_STATUS_EVENT_MIN_INTERVAL_MS = int(os.environ.get("SAFEEAR_DEVICE_STATUS_EVENT_MIN_INTERVAL_MS", "800"))
+DETECT_CHUNK_IDEMPOTENCY_WINDOW_MS = int(os.environ.get("SAFEEAR_DETECT_CHUNK_IDEMPOTENCY_WINDOW_MS", "120000"))
+_RECENT_DETECT_CHUNK_RESULTS: Dict[str, Tuple[int, Dict[str, Any]]] = {}
+_RECENT_DETECT_CHUNK_RESULTS_LOCK = threading.Lock()
+
+_REDIS_CLIENT = None
+_CACHE_WARMUP_SUMMARY: Dict[str, Any] = {
+    "parents_loaded": 0,
+    "cached_parents": 0,
+    "speakers_loaded": 0,
+    "embeddings_loaded": 0,
+    "failed_files": [],
+    "parents_with_zero_embeddings": [],
+}
+
+
+def _normalized_embedding(vec: Any) -> Optional[np.ndarray]:
+    arr = np.asarray(vec, dtype=np.float32).reshape(-1)
+    if arr.size == 0:
+        return None
+    norm = float(np.linalg.norm(arr))
+    if norm <= 1e-12:
+        return None
+    return arr / norm
+
+
+def _cos_sim(a: np.ndarray, b: np.ndarray) -> float:
+    an = _normalized_embedding(a)
+    bn = _normalized_embedding(b)
+    if an is None or bn is None:
+        return 0.0
+    return float(np.dot(an, bn))
+
+
+def _has_speaker_changed(session: svc.SessionState, current_embedding: Optional[np.ndarray]) -> Tuple[bool, Optional[float]]:
+    if session.active_stranger_embedding is None:
+        return False, None
+    current = _normalized_embedding(current_embedding) if current_embedding is not None else None
+    if current is None:
+        return False, None
+    similarity = _cos_sim(session.active_stranger_embedding, current)
+    return similarity < SPEAKER_CHANGE_THRESHOLD, similarity
+
+
+def _log_pipeline_decision(
+    *,
+    stage: str,
+    device_id: str,
+    parent_id: str,
+    result: str,
+    score: Optional[float],
+    streak: Optional[int],
+    latency_ms: float,
+) -> None:
+    payload = {
+        "event": "pipeline_decision",
+        "stage": stage,
+        "device_id": str(device_id),
+        "parent_id": str(parent_id),
+        "result": result,
+        "score": float(score) if score is not None else None,
+        "streak": int(streak) if streak is not None else None,
+        "latency_ms": float(latency_ms),
+    }
+    logger.debug(json.dumps(payload))
+
+
+def _find_eer_threshold(familiar_scores: List[float], stranger_scores: List[float]) -> Tuple[float, float]:
+    all_scores = sorted(set(float(s) for s in (familiar_scores + stranger_scores)))
+    if not all_scores:
+        raise HTTPException(status_code=422, detail="scores_required")
+
+    best_threshold = all_scores[0]
+    best_far = 1.0
+    best_frr = 1.0
+    best_gap = float("inf")
+    for t in all_scores:
+        far = sum(1 for s in stranger_scores if float(s) >= t) / max(1, len(stranger_scores))
+        frr = sum(1 for s in familiar_scores if float(s) < t) / max(1, len(familiar_scores))
+        gap = abs(far - frr)
+        if gap < best_gap:
+            best_gap = gap
+            best_threshold = t
+            best_far = far
+            best_frr = frr
+
+    eer_percent = ((best_far + best_frr) / 2.0) * 100.0
+    return float(best_threshold), float(eer_percent)
+
+
+def _get_redis_client():
+    global _REDIS_CLIENT
+    if _REDIS_CLIENT is not None:
+        return _REDIS_CLIENT
+    if redis is None:
+        return None
+
+    redis_url = (os.environ.get("SAFEEAR_REDIS_URL") or "").strip() or "redis://localhost:6379/0"
+    try:
+        client = redis.Redis.from_url(redis_url, decode_responses=False, socket_connect_timeout=2, socket_timeout=2)
+        client.ping()
+        _REDIS_CLIENT = client
+        return _REDIS_CLIENT
+    except Exception as exc:
+        logger.warning("CACHE_WARMUP_SKIPPED | reason=redis_unavailable | error=%s", str(exc))
+        return None
+
+
+def _warmup_embeddings_to_redis() -> None:
+    global _CACHE_WARMUP_SUMMARY
+
+    failed_files: List[str] = []
+    parents_with_zero_embeddings: List[str] = []
+    parents_loaded = 0
+    cached_parents = 0
+    speakers_loaded = 0
+    embeddings_loaded = 0
+
+    client = _get_redis_client()
+    if client is None:
+        _CACHE_WARMUP_SUMMARY = {
+            "parents_loaded": 0,
+            "cached_parents": 0,
+            "speakers_loaded": 0,
+            "embeddings_loaded": 0,
+            "failed_files": ["redis_unavailable"],
+            "parents_with_zero_embeddings": [],
+        }
+        logger.info(json.dumps({"event": "cache_warmup_complete", **_CACHE_WARMUP_SUMMARY}))
+        return
+
+    with SessionLocal() as db:
+        parents = db.query(Parent).all()
+        parents_loaded = len(parents)
+
+        for parent in parents:
+            parent_id = str(parent.id)
+            parent_embedding_count = 0
+
+            speakers = svc.list_speakers(db, parent_id)
+            enrolled_count = (
+                db.query(EnrolledSpeaker)
+                .filter(EnrolledSpeaker.parent_id == parent.id)
+                .count()
+            )
+            for speaker in speakers:
+                speaker_id = str(speaker.id)
+                speaker_dir = svc.get_speaker_embedding_dir(parent_id, speaker_id)
+                if not os.path.isdir(speaker_dir):
+                    reason = f"{speaker_dir}:missing_dir"
+                    failed_files.append(reason)
+                    logger.warning("CACHE_WARMUP_FILE_SKIPPED | file=%s | reason=missing_dir", speaker_dir)
+                    continue
+
+                speaker_embeddings = 0
+                for fname in sorted(os.listdir(speaker_dir)):
+                    if not fname.endswith(".npy"):
+                        continue
+                    fpath = os.path.join(speaker_dir, fname)
+                    try:
+                        arr = np.asarray(np.load(fpath), dtype=np.float32).reshape(-1)
+                    except Exception as exc:
+                        failed_files.append(f"{fpath}:load_failed")
+                        logger.warning("CACHE_WARMUP_FILE_SKIPPED | file=%s | reason=load_failed | error=%s", fpath, str(exc))
+                        continue
+
+                    if arr.shape[0] != feature_extractor_module.config.EMBEDDING_DIM:
+                        failed_files.append(f"{fpath}:invalid_dim_{arr.shape[0]}")
+                        logger.warning(
+                            "CACHE_WARMUP_FILE_SKIPPED | file=%s | reason=invalid_dim | dim=%s",
+                            fpath,
+                            arr.shape[0],
+                        )
+                        continue
+
+                    key = f"safeear:emb:{parent_id}:{speaker_id}:{fname}"
+                    client.set(key, arr.astype(np.float32).tobytes())
+                    embeddings_loaded += 1
+                    speaker_embeddings += 1
+
+                if speaker_embeddings > 0:
+                    speakers_loaded += 1
+                    parent_embedding_count += speaker_embeddings
+
+            if enrolled_count > 0 and parent_embedding_count == 0:
+                parents_with_zero_embeddings.append(parent_id)
+            if parent_embedding_count > 0:
+                cached_parents += 1
+
+    _CACHE_WARMUP_SUMMARY = {
+        "parents_loaded": parents_loaded,
+        "cached_parents": cached_parents,
+        "speakers_loaded": speakers_loaded,
+        "embeddings_loaded": embeddings_loaded,
+        "failed_files": failed_files,
+        "parents_with_zero_embeddings": parents_with_zero_embeddings,
+    }
+    logger.info(json.dumps({"event": "cache_warmup_complete", **_CACHE_WARMUP_SUMMARY}))
 
 
 def _ws_set_loop(loop: asyncio.AbstractEventLoop) -> None:
@@ -183,6 +408,47 @@ def _should_publish_device_status(parent_id: str, device_id: str) -> bool:
         _DEVICE_STATUS_EVENT_LAST_SENT[key] = now
         return True
 
+
+def _make_detect_chunk_cache_key(parent_id: str, device_id: str, chunk_id: str) -> str:
+    return f"{parent_id}:{device_id}:{chunk_id}"
+
+
+def _get_detect_chunk_cached_response(parent_id: str, device_id: str, chunk_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not chunk_id:
+        return None
+
+    key = _make_detect_chunk_cache_key(parent_id, device_id, chunk_id)
+    now = now_ms()
+    stale_before = now - DETECT_CHUNK_IDEMPOTENCY_WINDOW_MS
+
+    with _RECENT_DETECT_CHUNK_RESULTS_LOCK:
+        # Lightweight in-memory pruning keeps cache bounded over long uptime.
+        stale_keys = [k for k, (ts, _resp) in _RECENT_DETECT_CHUNK_RESULTS.items() if ts < stale_before]
+        for stale_key in stale_keys:
+            _RECENT_DETECT_CHUNK_RESULTS.pop(stale_key, None)
+
+        record = _RECENT_DETECT_CHUNK_RESULTS.get(key)
+        if record is None:
+            return None
+        ts, response = record
+        if ts < stale_before:
+            _RECENT_DETECT_CHUNK_RESULTS.pop(key, None)
+            return None
+        return dict(response)
+
+
+def _remember_detect_chunk_response(
+    parent_id: str,
+    device_id: str,
+    chunk_id: Optional[str],
+    response_payload: Dict[str, Any],
+) -> None:
+    if not chunk_id:
+        return
+    key = _make_detect_chunk_cache_key(parent_id, device_id, chunk_id)
+    with _RECENT_DETECT_CHUNK_RESULTS_LOCK:
+        _RECENT_DETECT_CHUNK_RESULTS[key] = (now_ms(), dict(response_payload))
+
 DATA_ROOT = (os.environ.get("SAFEEAR_DATA_ROOT", os.path.join("app", "data")) or "").strip() or os.path.join("app", "data")
 TEMP_DIR = os.path.join(DATA_ROOT, "temp_audio")
 os.makedirs(TEMP_DIR, exist_ok=True)
@@ -202,6 +468,8 @@ def _speaker_payload(row, request: Request, parent_id: str) -> Dict[str, Any]:
         "parent_id": str(row.parent_id),
         "display_name": row.display_name,
         "sample_count": row.sample_count,
+        "quality_score": row.quality_score,
+        "quality_label": row.quality_label,
         "profile_image_url": _speaker_avatar_url(request, row.id) if avatar_exists else None,
         "created_at": row.created_at,
         "updated_at": row.updated_at,
@@ -235,6 +503,8 @@ def startup_event() -> None:
             logger.info("MODEL_WARMUP_OK | model=silero_vad")
     except Exception as exc:
         logger.warning("MODEL_WARMUP_FAILED | model=silero_vad | reason=%s", str(exc))
+
+    _warmup_embeddings_to_redis()
 
 
 class GoogleAuthRequest(BaseModel):
@@ -293,6 +563,11 @@ class TestFireAlertRequest(BaseModel):
     confidence_score: float = 0.05
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+
+
+class CalibrateThresholdsRequest(BaseModel):
+    familiar_scores: List[float]
+    stranger_scores: List[float]
 
 
 class DetectLocationRequest(BaseModel):
@@ -669,13 +944,31 @@ async def enroll_speaker(
     if speaker is None:
         speaker = svc.create_speaker(db, parent_id, display_name)
 
+    for idx, emb in enumerate(embs):
+        emb_arr = np.asarray(emb, dtype=np.float32).reshape(-1)
+        if emb_arr.shape[0] != feature_extractor_module.config.EXPECTED_EMBEDDING_DIM:
+            logger.error(
+                "ENROLL_EMBEDDING_DIM_MISMATCH | parent_id=%s | speaker_id=%s | index=%s | expected=%s | got=%s",
+                parent_id,
+                str(speaker.id),
+                idx,
+                feature_extractor_module.config.EXPECTED_EMBEDDING_DIM,
+                emb_arr.shape[0],
+            )
+            raise HTTPException(
+                status_code=400,
+                detail=f"dim mismatch: expected {feature_extractor_module.config.EXPECTED_EMBEDDING_DIM}, got {emb_arr.shape[0]}",
+            )
+
     for emb in embs:
         svc.save_speaker_embedding(db, parent_id, str(speaker.id), emb)
+
+    quality_score, quality_label = svc.compute_and_store_enrollment_quality(db, parent_id, str(speaker.id))
 
     speaker_payload = _speaker_payload(speaker, request, parent_id)
     refreshed_rows = svc.list_speakers(db, parent_id)
     refreshed_items = [_speaker_payload(row, request, parent_id) for row in refreshed_rows]
-    return {
+    response = {
         "status": "enrolled",
         # Current schema.
         "speaker": speaker_payload,
@@ -688,6 +981,9 @@ async def enroll_speaker(
         "items": refreshed_items,
         "stages": stage_info,
     }
+    if quality_label == "poor":
+        response["warning"] = "Low enrollment quality. Try recording in a quieter space, speaking naturally, or adding more samples."
+    return response
 
 
 @app.get("/enroll/speakers")
@@ -783,6 +1079,7 @@ def detect_location(body: DetectLocationRequest, current=Depends(get_current_par
 @app.post("/detect/chunk")
 async def detect_chunk(
     device_id: str = Form(...),
+    chunk_id: Optional[str] = Form(None),
     file: Optional[UploadFile] = File(None),
     audio: Optional[UploadFile] = File(None),
     latitude: Optional[float] = Form(None),
@@ -792,14 +1089,20 @@ async def detect_chunk(
     current=Depends(get_current_parent),
     db: Session = Depends(get_db),
 ):
-    from app.utils.prd_services import save_alert_clip
     upload = file or audio
     if upload is None:
         raise HTTPException(status_code=422, detail="missing_audio_chunk")
 
+    parent_id = current["parent_id"]
+    normalized_chunk_id = (chunk_id or "").strip() or None
+    if normalized_chunk_id:
+        cached = _get_detect_chunk_cached_response(parent_id, device_id, normalized_chunk_id)
+        if cached is not None:
+            cached["idempotent_replay"] = True
+            return cached
+
     raw = await upload.read()
     if not raw:
-        parent_id = current["parent_id"]
         try:
             svc.update_device_activity(db, parent_id, device_id)
         except Exception:
@@ -828,7 +1131,14 @@ async def detect_chunk(
                 publish_parent_event(parent_id, "device_status_changed", _device_payload(row))
             except Exception:
                 pass
-        return {"status": "no_hop", "reason": "empty_chunk", "chunk_samples": 0, "consecutive_empty_chunks": empty_count}
+        response_payload = {
+            "status": "no_hop",
+            "reason": "empty_chunk",
+            "chunk_samples": 0,
+            "consecutive_empty_chunks": empty_count,
+        }
+        _remember_detect_chunk_response(parent_id, device_id, normalized_chunk_id, response_payload)
+        return response_payload
 
     try:
         arr, sr, decode_method = _decode_audio_chunk(raw)
@@ -853,7 +1163,9 @@ async def detect_chunk(
             len(raw),
             decode_method,
         )
-        return {"status": "no_hop", "reason": "empty_chunk", "chunk_samples": 0}
+        response_payload = {"status": "no_hop", "reason": "empty_chunk", "chunk_samples": 0}
+        _remember_detect_chunk_response(parent_id, device_id, normalized_chunk_id, response_payload)
+        return response_payload
 
     if sr != 16000:
         try:
@@ -872,7 +1184,6 @@ async def detect_chunk(
 
     arr = normalize_waveform(arr)
 
-    parent_id = current["parent_id"]
     # Validate device role: only child_device can stream detection chunks
     device = svc.get_device(db, parent_id, device_id)
     if device.role != DeviceRole.child_device:
@@ -913,24 +1224,29 @@ async def detect_chunk(
             session.lat = float(device.last_location_lat)
             session.lon = float(device.last_location_lon)
 
-    ring = append_frame(session, arr)
+    inference_buffer = svc.append_frame(session, arr)
     window_samples = int(WINDOW_SEC * session.sr)
-    if ring.shape[0] < window_samples:
-        ack_msg = f"warming_up | ring_samples={int(ring.shape[0])} | required={window_samples}"
+    if inference_buffer.shape[0] < window_samples:
+        ack_msg = f"warming_up | ring_samples={int(inference_buffer.shape[0])} | required={window_samples}"
         logger.info(f"ACK | {ack_msg}")
-        return {
+        response_payload = {
             "status": "warming_up",
-            "ring_samples": int(ring.shape[0]),
+            "ring_samples": int(inference_buffer.shape[0]),
             "required_samples": window_samples,
         }
+        _remember_detect_chunk_response(parent_id, device_id, normalized_chunk_id, response_payload)
+        return response_payload
 
-    if not should_hop(len(arr), session.sr):
+    if not svc.should_hop(len(arr), session.sr):
         ack_msg = f"no_hop | chunk_samples={int(len(arr))} | required_hop={int(HOP_SEC * session.sr)}"
         logger.info(f"ACK | {ack_msg}")
-        return {"status": "no_hop", "reason": "chunk_too_small", "chunk_samples": int(len(arr))}
+        response_payload = {"status": "no_hop", "reason": "chunk_too_small", "chunk_samples": int(len(arr))}
+        _remember_detect_chunk_response(parent_id, device_id, normalized_chunk_id, response_payload)
+        return response_payload
 
-    window = ring[-window_samples:]
+    window = inference_buffer[-window_samples:]
     stage = svc.evaluate_window(db, parent_id, window, session.sr)
+    current_stranger_centroid = _normalized_embedding(stage.pop("_query_centroid", None))
     score = float(stage["tier3"].get("score", 0.0))
     closest_speaker_id = stage.get("tier3", {}).get("closest_speaker_id")
     now = now_ms()
@@ -946,7 +1262,35 @@ async def detect_chunk(
     tier3_pass = stage.get("tier3", {}).get("passed", False)
     tier2_category = str(stage.get("tier2", {}).get("category", "uncertain"))
     tier2_confidence = float(stage.get("tier2", {}).get("confidence", 0.0))
+    perf_latency_ms = float(stage.get("perf", {}).get("processing_ms", 0.0))
     logger.info(f"STAGE_RESULT | score={score:.4f} | tier1_vad={tier1_pass} | tier2={tier2_pass} | tier3={tier3_pass} | stage_decision={stage.get('decision', 'unknown')}")
+    _log_pipeline_decision(
+        stage="vad",
+        device_id=device_id,
+        parent_id=parent_id,
+        result="passed" if tier1_pass else "failed",
+        score=None,
+        streak=session.stranger_streak,
+        latency_ms=perf_latency_ms,
+    )
+    _log_pipeline_decision(
+        stage="tier2",
+        device_id=device_id,
+        parent_id=parent_id,
+        result="passed" if tier2_pass else "failed",
+        score=None,
+        streak=session.stranger_streak,
+        latency_ms=perf_latency_ms,
+    )
+    _log_pipeline_decision(
+        stage="tier3",
+        device_id=device_id,
+        parent_id=parent_id,
+        result="passed" if tier3_pass else "failed",
+        score=score,
+        streak=session.stranger_streak,
+        latency_ms=perf_latency_ms,
+    )
 
     if not tier3_pass:
         logger.warning(
@@ -955,7 +1299,7 @@ async def detect_chunk(
             device_id,
             stage.get("decision", "unknown"),
         )
-        return {
+        response_payload = {
             "status": "ok",
             "decision": "hold_tier3_unavailable",
             "stranger_streak": session.stranger_streak,
@@ -965,6 +1309,8 @@ async def detect_chunk(
             "alert_fired": False,
             "alert_id": None,
         }
+        _remember_detect_chunk_response(parent_id, device_id, normalized_chunk_id, response_payload)
+        return response_payload
 
     if score >= T_HIGH:
         session.familiar_recovery_streak += 1
@@ -983,6 +1329,7 @@ async def detect_chunk(
             session.stranger_streak = 0
             session.last_familiar_ms = now
             session.last_familiar_speaker_id = str(closest_speaker_id) if closest_speaker_id else None
+            svc.clear_stranger_identity(session)
             decision = "familiar"
             logger.info(f"SCORE_DECISION | score={score:.4f} >= t_high={T_HIGH} | decision=familiar | streak_reset")
     elif score <= T_LOW:
@@ -1009,6 +1356,7 @@ async def detect_chunk(
         else:
             session.stranger_streak += 1
             decision = "stranger_candidate"
+            svc.record_confirmed_stranger_window(session, current_stranger_centroid)
             logger.info(f"SCORE_DECISION | score={score:.4f} <= t_low={T_LOW} | decision=stranger_candidate | streak_incremented={session.stranger_streak}")
     else:
         session.familiar_recovery_streak = 0
@@ -1018,6 +1366,7 @@ async def detect_chunk(
         if score <= soft_limit and likely_human_speech:
             session.stranger_streak += 1
             decision = "stranger_candidate_soft"
+            svc.record_confirmed_stranger_window(session, current_stranger_centroid)
             logger.info(
                 "SCORE_DECISION | soft_stranger_window | score=%.4f | soft_limit=%.4f | "
                 "tier2_category=%s | tier2_confidence=%.4f | streak_incremented=%s",
@@ -1045,8 +1394,8 @@ async def detect_chunk(
         if session.stranger_segment is None:
             pre_roll_samples = int(STRANGER_PREROLL_SEC * session.sr)
             pre_roll_waveform = None
-            if ring is not None and ring.shape[0] > len(arr):
-                pre_roll_source = ring[:-len(arr)]
+            if session.clip_buffer is not None and session.clip_buffer.shape[0] > len(arr):
+                pre_roll_source = session.clip_buffer[:-len(arr)]
                 if pre_roll_source.shape[0] > 0:
                     pre_roll_waveform = pre_roll_source[-pre_roll_samples:]
             svc.start_stranger_segment(session, arr, now, pre_roll_waveform=pre_roll_waveform)
@@ -1064,10 +1413,24 @@ async def detect_chunk(
         svc.clear_stranger_segment(session)
 
     if session.stranger_streak >= ALERT_TRIGGER_STREAK:
-        if now - session.last_alert_ms >= DEBOUNCE_SEC * 1000:
+        debounce_elapsed = (now - session.last_alert_ms) >= DEBOUNCE_SEC * 1000
+        if not debounce_elapsed:
+            speaker_changed, similarity = _has_speaker_changed(session, current_stranger_centroid)
+            if speaker_changed:
+                session.last_alert_ms = 0
+                debounce_elapsed = True
+                logger.info(
+                    "DEBOUNCE_RESET_SPEAKER_CHANGE | parent_id=%s | device_id=%s | similarity=%.4f | threshold=%.2f",
+                    parent_id,
+                    device_id,
+                    similarity if similarity is not None else -1.0,
+                    SPEAKER_CHANGE_THRESHOLD,
+                )
+
+        if debounce_elapsed:
             session.stranger_segment_ended_ms = now
-            clip_waveform = svc.get_stranger_segment_waveform(session, ring)
-            clip_path = save_alert_clip(parent_id, session, clip_waveform)
+            clip_waveform = svc.get_clip_buffer_waveform(session, inference_buffer)
+            clip_path = svc.save_alert_clip(parent_id, session, clip_waveform)
             row = svc.create_alert(
                 db=db,
                 parent_id=parent_id,
@@ -1082,6 +1445,9 @@ async def detect_chunk(
             alert_id = str(row.id)
             session.last_alert_ms = now
             session.stranger_streak = 0
+            if not session.recent_confirmed_stranger_embeddings:
+                svc.record_confirmed_stranger_window(session, current_stranger_centroid)
+            svc.set_active_stranger_embedding(session)
             logger.info(
                 "ALERT_FIRED | alert_id=%s | score=%.4f | streak_satisfied=%s | clip_path=%s | segment_started_ms=%s | segment_ended_ms=%s | segment_samples=%s",
                 alert_id,
@@ -1138,14 +1504,20 @@ async def detect_chunk(
             )
             thread.start()
             svc.clear_stranger_segment(session)
+            svc.clear_clip_buffer(session)
         else:
             alert_block_reason = "debounced"
-            logger.info(f"ALERT_BLOCKED | alert_id=None | reason=debounced | last_alert_ms={session.last_alert_ms} | now={now} | debounce_sec={DEBOUNCE_SEC}")
+            logger.info(
+                "ALERT_BLOCKED | alert_id=None | reason=debounced | last_alert_ms=%s | now=%s | debounce_sec=%s",
+                session.last_alert_ms,
+                now,
+                DEBOUNCE_SEC,
+            )
     else:
         alert_block_reason = "insufficient_stranger_streak"
         logger.info(f"ALERT_BLOCKED | alert_id=None | reason=insufficient_stranger_streak | current_streak={session.stranger_streak} | required={ALERT_TRIGGER_STREAK}")
 
-    return {
+    response_payload = {
         "status": "ok",
         "decision": decision,
         "stranger_streak": session.stranger_streak,
@@ -1163,12 +1535,15 @@ async def detect_chunk(
             "soft_stranger_margin": SOFT_STRANGER_MARGIN,
             "soft_stranger_min_conf": SOFT_STRANGER_MIN_CONF,
             "debounce_sec": DEBOUNCE_SEC,
+            "speaker_change_threshold": SPEAKER_CHANGE_THRESHOLD,
             "block_reason": alert_block_reason,
         },
         "stage": stage,
         "alert_fired": alert_fired,
         "alert_id": alert_id,
     }
+    _remember_detect_chunk_response(parent_id, device_id, normalized_chunk_id, response_payload)
+    return response_payload
 
 
 @app.delete("/detect/session")
@@ -1251,6 +1626,30 @@ def fire_test_alert(body: TestFireAlertRequest, current=Depends(get_current_pare
     )
     publish_parent_event(parent_id, "alert_created", _alert_response_payload(row))
 
+    parent = svc.get_parent(db, parent_id)
+    parent_device = (
+        db.query(Device)
+        .filter(
+            Device.parent_id == parent.id,
+            Device.role == DeviceRole.parent_device,
+            Device.device_token.isnot(None),
+        )
+        .order_by(Device.updated_at.desc())
+        .first()
+    )
+    parent_fcm_token = parent_device.device_token if parent_device else None
+    if parent_fcm_token:
+        send_fcm_push(
+            parent_fcm_token,
+            str(row.id),
+            str(row.device_id),
+            _dt_to_epoch_ms(row.timestamp) or now_ms(),
+            row.latitude,
+            row.longitude,
+            float(row.confidence_score or 0.0),
+            recipient_role="parent_device",
+        )
+
     return {
         "status": "test_alert_fired",
         "alert_id": str(row.id),
@@ -1307,14 +1706,17 @@ def flag_alert_as_familiar(
 def get_alert_clip(alert_id: str, current=Depends(get_current_parent), db: Session = Depends(get_db)):
     row = svc.get_alert(db, current["parent_id"], alert_id)
     path = row.audio_clip_path
-    if not path or not os.path.exists(path):
+    # Older alerts may exist without persisted media. Return an empty response cleanly.
+    if not path:
+        return Response(status_code=204)
+    if not os.path.exists(path):
         raise HTTPException(status_code=404, detail="audio_clip_not_found")
     return FileResponse(path, media_type="audio/wav", filename=os.path.basename(path))
 
 
 @app.post("/devices")
 def create_device(
-    device_name: str = Form(...),
+    device_name: Optional[str] = Form(None),
     installation_id: Optional[str] = Form(None),
     role: str = Form(...),
     device_token: Optional[str] = Form(None),
@@ -1360,7 +1762,7 @@ def create_device(
 
 @app.post("/devices/upsert")
 def upsert_device(
-    device_name: str = Form(...),
+    device_name: Optional[str] = Form(None),
     installation_id: Optional[str] = Form(None),
     role: str = Form(...),
     device_token: Optional[str] = Form(None),
@@ -1614,10 +2016,54 @@ def health():
     }
 
 
+@app.post("/admin/calibrate-thresholds")
+def calibrate_thresholds(body: CalibrateThresholdsRequest, current=Depends(get_current_parent)):
+    if not body.familiar_scores or not body.stranger_scores:
+        raise HTTPException(status_code=422, detail="familiar_scores_and_stranger_scores_required")
+
+    eer_threshold, eer_percent = _find_eer_threshold(body.familiar_scores, body.stranger_scores)
+    far_at_current = sum(1 for s in body.stranger_scores if float(s) >= T_HIGH) / max(1, len(body.stranger_scores))
+    frr_at_current = sum(1 for s in body.familiar_scores if float(s) < T_LOW) / max(1, len(body.familiar_scores))
+    suggested_t_high = min(1.0, eer_threshold + 0.05)
+    suggested_t_low = max(0.0, eer_threshold - 0.05)
+
+    return {
+        "current_t_high": float(T_HIGH),
+        "current_t_low": float(T_LOW),
+        "eer_threshold": float(eer_threshold),
+        "eer_percent": float(eer_percent),
+        "far_at_current": float(far_at_current),
+        "frr_at_current": float(frr_at_current),
+        "suggested_t_high": float(suggested_t_high),
+        "suggested_t_low": float(suggested_t_low),
+    }
+
+
+@app.get("/health/cache")
+def health_cache():
+    client = _get_redis_client()
+    redis_ping_ms = -1.0
+    if client is not None:
+        started = time.perf_counter()
+        try:
+            client.ping()
+            redis_ping_ms = round((time.perf_counter() - started) * 1000.0, 2)
+        except Exception:
+            redis_ping_ms = -1.0
+
+    degraded = bool(_CACHE_WARMUP_SUMMARY.get("parents_with_zero_embeddings")) or redis_ping_ms < 0.0
+    return {
+        "status": "degraded" if degraded else "ok",
+        "cached_parents": int(_CACHE_WARMUP_SUMMARY.get("cached_parents", 0)),
+        "cached_speakers": int(_CACHE_WARMUP_SUMMARY.get("speakers_loaded", 0)),
+        "redis_ping_ms": redis_ping_ms,
+    }
+
+
 @app.get("/")
 def home():
     return {
         "name": "SafeEar Backend",
-        "version": "2.0.0",
-        "message": "PRD-aligned API is running",
+        "version": "2.4.12",
+        "message": "API is running",
     }
