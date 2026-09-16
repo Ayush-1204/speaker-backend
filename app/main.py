@@ -1,434 +1,186 @@
-import io
+from dotenv import load_dotenv
+load_dotenv()
+
 import asyncio
+import contextlib
 import logging
-import json
 import os
 import shutil
 import tempfile
 import threading
-import warnings
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple, List
 
 import numpy as np
-import soundfile as sf
-import librosa
+try:
+    import librosa
+except Exception:  # pragma: no cover - optional dependency in some environments
+    librosa = None
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from starlette.websockets import WebSocketState
 
-try:
-    import redis
-except Exception:  # pragma: no cover - optional dependency behavior
-    redis = None
-
-from app.database.models import Device, DeviceRole, Parent, EnrolledSpeaker
+from app.database.models import Device, DeviceRole
 from app.database.session import SessionLocal, get_db, init_db
 from app.utils import prd_services_db as svc
+from app.utils.audio_preprocess import normalize_waveform
+from app.utils.audio_decoder import decode_audio_chunk
+from app.utils.verification_pipeline import run_enroll_embedding
 from app.utils import feature_extractor as feature_extractor_module
 from app.utils import yamnet_classifier as yamnet_classifier_module
 from app.utils import vad as vad_module
-from app.utils.audio_preprocess import normalize_waveform
-from app.utils.notification_worker import escalate_alert, send_fcm_push
-from app.utils.prd_services import (
-    DEBOUNCE_SEC,
-    STRANGER_CONFIRM_COUNT,
-    T_HIGH,
-    T_LOW,
-    WINDOW_SEC,
-    HOP_SEC,
-    now_ms,
+from app.services.detection_service import DetectionService
+from app.utils.notification_worker import send_fcm_push
+from app.services.websocket_manager import (
+    publish_parent_event,
+    _should_publish_device_status,
+    _ws_set_loop,
+    _ws_register_client,
+    _ws_unregister_client,
+    _WS_STATE_LOCK,
+    _WS_CLIENTS_BY_PARENT,
+    _WS_PUBLISHED_COUNTS,
+    _WS_LAST_QUEUE_LAG_MS,
 )
-from app.utils.verification_pipeline import run_enroll_embedding
-
-ALERT_TRIGGER_STREAK = int(os.environ.get("SAFEEAR_ALERT_TRIGGER_STREAK", str(STRANGER_CONFIRM_COUNT)))
-FORCE_ALERT_SCORE = float(os.environ.get("SAFEEAR_FORCE_ALERT_SCORE", "0.15"))
-FORCE_ALERT_MIN_STREAK = int(os.environ.get("SAFEEAR_FORCE_ALERT_MIN_STREAK", "2"))
-FAMILIAR_GRACE_SEC = int(os.environ.get("SAFEEAR_FAMILIAR_GRACE_SEC", "20"))
-FAMILIAR_HOLD_FLOOR = float(os.environ.get("SAFEEAR_FAMILIAR_HOLD_FLOOR", "0.30"))
-FAMILIAR_GRACE_MARGIN = float(os.environ.get("SAFEEAR_FAMILIAR_GRACE_MARGIN", "0.05"))
-FAMILIAR_GRACE_MIN_CONF = float(os.environ.get("SAFEEAR_FAMILIAR_GRACE_MIN_CONF", "0.65"))
-FAMILIAR_RESET_MIN_STREAK = int(os.environ.get("SAFEEAR_FAMILIAR_RESET_MIN_STREAK", "2"))
-SOFT_STRANGER_MARGIN = float(os.environ.get("SAFEEAR_SOFT_STRANGER_MARGIN", "0.03"))
-SOFT_STRANGER_MIN_CONF = float(os.environ.get("SAFEEAR_SOFT_STRANGER_MIN_CONF", "0.30"))
-STRANGER_MIN_TIER2_CONF = float(os.environ.get("SAFEEAR_STRANGER_MIN_TIER2_CONF", "0.70"))
-STRANGER_UNCERTAIN_CONF_FLOOR = float(os.environ.get("SAFEEAR_STRANGER_UNCERTAIN_CONF_FLOOR", "0.88"))
-STRANGER_PREROLL_SEC = float(os.environ.get("SAFEEAR_STRANGER_PREROLL_SEC", "5.0"))
-SPEAKER_CHANGE_THRESHOLD = float(os.environ.get("SAFEEAR_SPEAKER_CHANGE_THRESHOLD", "0.30"))
-
-# Keep TF/Google runtime logs readable in local dev.
-os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
-warnings.filterwarnings(
-    "ignore",
-    message=r".*tf\.lite\.Interpreter is deprecated.*",
-    category=UserWarning,
+import app.services.websocket_manager as _ws_manager_module
+from app.services.decision_engine import _has_speaker_changed
+from app.services.cache_service import (
+    warmup_embeddings_to_redis as _warmup_embeddings_to_redis_fn,
+    get_redis_client as _get_redis_client,
+    _CACHE_WARMUP_SUMMARY,
 )
-warnings.filterwarnings(
-    "ignore",
-    message=r".*Google will stop supporting.*",
-    category=FutureWarning,
-)
+from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="SafeEar Backend", version="2.0.0")
-
-# Configure logging for score and acknowledgement tracking
+# Module logger — must be defined before _lifespan which uses it.
 logger = logging.getLogger(__name__)
 
+# Application instance
+@contextlib.asynccontextmanager
+async def _lifespan(app_instance):
+    """FastAPI lifespan: runs startup logic then yields control to the app."""
+    init_db()
+    # Eagerly warm model singletons so first detect request does not pay load latency.
+    try:
+        feature_extractor_module._get_redimnet()
+        logger.info("MODEL_WARMUP_OK | model=redimnet")
+    except Exception as exc:
+        logger.warning("MODEL_WARMUP_FAILED | model=redimnet | reason=%s", str(exc))
 
-class _JsonLogFormatter(logging.Formatter):
-    def format(self, record: logging.LogRecord) -> str:
-        payload = {
-            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
-            "level": record.levelname,
-            "logger": record.name,
-            "message": record.getMessage(),
-        }
-        return json.dumps(payload)
+    try:
+        yamnet_model = yamnet_classifier_module._get_yamnet_model()
+        if yamnet_model is None:
+            logger.warning("MODEL_WARMUP_SKIPPED | model=yamnet | reason=unavailable")
+        else:
+            logger.info("MODEL_WARMUP_OK | model=yamnet")
+    except Exception as exc:
+        logger.warning("MODEL_WARMUP_FAILED | model=yamnet | reason=%s", str(exc))
+
+    try:
+        silero_model, silero_utils = vad_module._get_silero()
+        if silero_model is None or silero_utils is None:
+            logger.warning("MODEL_WARMUP_SKIPPED | model=silero_vad | reason=unavailable")
+        else:
+            logger.info("MODEL_WARMUP_OK | model=silero_vad")
+    except Exception as exc:
+        logger.warning("MODEL_WARMUP_FAILED | model=silero_vad | reason=%s", str(exc))
+
+    _warmup_embeddings_to_redis()
+    yield  # App handles requests here
 
 
-def _configure_logging() -> None:
-    root = logging.getLogger()
-    if not root.handlers:
-        root.addHandler(logging.StreamHandler())
-    handler = root.handlers[0]
-    log_format = (os.environ.get("LOG_FORMAT") or "").strip().lower()
-    if log_format == "json":
-        handler.setFormatter(_JsonLogFormatter())
-    else:
-        handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - [%(funcName)s] %(message)s"))
-    root.setLevel(logging.INFO)
+app = FastAPI(lifespan=_lifespan)
 
+# Allow CORS for local development
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-_configure_logging()
+now_ms = svc.now_ms
 
-WS_PING_INTERVAL_SEC = int(os.environ.get("SAFEEAR_WS_PING_INTERVAL_SEC", "20"))
-WS_CLIENT_QUEUE_MAX = int(os.environ.get("SAFEEAR_WS_CLIENT_QUEUE_MAX", "256"))
-
-_WS_LOOP: Optional[asyncio.AbstractEventLoop] = None
-_WS_STATE_LOCK = threading.Lock()
-_WS_CLIENTS_BY_PARENT: Dict[str, Dict[str, asyncio.Queue]] = {}
-_WS_SEQ_BY_PARENT: Dict[str, int] = {}
-_WS_PUBLISHED_COUNTS: Dict[str, int] = {
-    "alert_created": 0,
-    "device_status_changed": 0,
-    "monitoring_changed": 0,
-}
-_WS_LAST_QUEUE_LAG_MS: int = 0
-_DEVICE_STATUS_EVENT_LAST_SENT: Dict[str, int] = {}
-DEVICE_STATUS_EVENT_MIN_INTERVAL_MS = int(os.environ.get("SAFEEAR_DEVICE_STATUS_EVENT_MIN_INTERVAL_MS", "800"))
-DETECT_CHUNK_IDEMPOTENCY_WINDOW_MS = int(os.environ.get("SAFEEAR_DETECT_CHUNK_IDEMPOTENCY_WINDOW_MS", "120000"))
-_RECENT_DETECT_CHUNK_RESULTS: Dict[str, Tuple[int, Dict[str, Any]]] = {}
+# Route-level threshold aliases kept for compatibility with existing tests and logs.
+T_HIGH = svc.T_HIGH
+T_LOW = svc.T_LOW
+STRANGER_MIN_TIER2_CONF = float(os.environ.get("SAFEEAR_STRANGER_MIN_TIER2_CONF", "0.55"))
+STRANGER_UNCERTAIN_CONF_FLOOR = float(os.environ.get("SAFEEAR_STRANGER_UNCERTAIN_CONF_FLOOR", "0.25"))
+FAMILIAR_GRACE_SEC = int(os.environ.get("SAFEEAR_FAMILIAR_GRACE_SEC", "5"))
+FAMILIAR_HOLD_FLOOR = float(os.environ.get("SAFEEAR_FAMILIAR_HOLD_FLOOR", str(T_LOW)))
+FAMILIAR_GRACE_MARGIN = float(os.environ.get("SAFEEAR_FAMILIAR_GRACE_MARGIN", "0.05"))
+FAMILIAR_GRACE_MIN_CONF = float(os.environ.get("SAFEEAR_FAMILIAR_GRACE_MIN_CONF", "0.75"))
+FAMILIAR_RESET_MIN_STREAK = int(os.environ.get("SAFEEAR_FAMILIAR_RESET_MIN_STREAK", "2"))
+SOFT_STRANGER_MARGIN = float(os.environ.get("SAFEEAR_SOFT_STRANGER_MARGIN", "0.04"))
+SOFT_STRANGER_MIN_CONF = float(os.environ.get("SAFEEAR_SOFT_STRANGER_MIN_CONF", "0.55"))
+FORCE_ALERT_SCORE = float(os.environ.get("SAFEEAR_FORCE_ALERT_SCORE", "0.15"))
+FORCE_ALERT_MIN_STREAK = int(os.environ.get("SAFEEAR_FORCE_ALERT_MIN_STREAK", "2"))
+ALERT_TRIGGER_STREAK = int(os.environ.get("SAFEEAR_ALERT_TRIGGER_STREAK", "3"))
+DEBOUNCE_SEC = int(os.environ.get("SAFEEAR_DEBOUNCE_SEC", "60"))
+SPEAKER_CHANGE_THRESHOLD = float(os.environ.get("SAFEEAR_SPEAKER_CHANGE_THRESHOLD", "0.85"))
+STRANGER_PREROLL_SEC = float(os.environ.get("SAFEEAR_STRANGER_PREROLL_SEC", "5.0"))
+# Idempotency cache for recently processed detect chunks (in-memory)
+DETECT_CHUNK_IDEMPOTENCY_WINDOW_MS = int(os.environ.get("SAFEEAR_DETECT_CHUNK_IDEMPOTENCY_WINDOW_MS", "2000"))
+_RECENT_DETECT_CHUNK_RESULTS: Dict[str, tuple] = {}
 _RECENT_DETECT_CHUNK_RESULTS_LOCK = threading.Lock()
 
-_REDIS_CLIENT = None
-_CACHE_WARMUP_SUMMARY: Dict[str, Any] = {
-    "parents_loaded": 0,
-    "cached_parents": 0,
-    "speakers_loaded": 0,
-    "embeddings_loaded": 0,
-    "failed_files": [],
-    "parents_with_zero_embeddings": [],
-}
 
-
-def _resolve_redis_url() -> str:
-    return (
-        (os.environ.get("REDIS_URL") or "").strip()
-        or (os.environ.get("SAFEEAR_REDIS_URL") or "").strip()
-        or "redis://localhost:6379/0"
-    )
-
-
-def _normalized_embedding(vec: Any) -> Optional[np.ndarray]:
-    arr = np.asarray(vec, dtype=np.float32).reshape(-1)
-    if arr.size == 0:
-        return None
-    norm = float(np.linalg.norm(arr))
-    if norm <= 1e-12:
-        return None
-    return arr / norm
-
-
-def _cos_sim(a: np.ndarray, b: np.ndarray) -> float:
-    an = _normalized_embedding(a)
-    bn = _normalized_embedding(b)
-    if an is None or bn is None:
-        return 0.0
-    return float(np.dot(an, bn))
-
-
-def _has_speaker_changed(session: svc.SessionState, current_embedding: Optional[np.ndarray]) -> Tuple[bool, Optional[float]]:
-    if session.active_stranger_embedding is None:
-        return False, None
-    current = _normalized_embedding(current_embedding) if current_embedding is not None else None
-    if current is None:
-        return False, None
-    similarity = _cos_sim(session.active_stranger_embedding, current)
-    return similarity < SPEAKER_CHANGE_THRESHOLD, similarity
-
-
-def _log_pipeline_decision(
-    *,
-    stage: str,
-    device_id: str,
-    parent_id: str,
-    result: str,
-    score: Optional[float],
-    streak: Optional[int],
-    latency_ms: float,
-) -> None:
-    payload = {
-        "event": "pipeline_decision",
-        "stage": stage,
-        "device_id": str(device_id),
-        "parent_id": str(parent_id),
-        "result": result,
-        "score": float(score) if score is not None else None,
-        "streak": int(streak) if streak is not None else None,
-        "latency_ms": float(latency_ms),
-    }
-    logger.debug(json.dumps(payload))
-
-
-def _find_eer_threshold(familiar_scores: List[float], stranger_scores: List[float]) -> Tuple[float, float]:
-    all_scores = sorted(set(float(s) for s in (familiar_scores + stranger_scores)))
-    if not all_scores:
-        raise HTTPException(status_code=422, detail="scores_required")
-
-    best_threshold = all_scores[0]
-    best_far = 1.0
-    best_frr = 1.0
-    best_gap = float("inf")
-    for t in all_scores:
-        far = sum(1 for s in stranger_scores if float(s) >= t) / max(1, len(stranger_scores))
-        frr = sum(1 for s in familiar_scores if float(s) < t) / max(1, len(familiar_scores))
-        gap = abs(far - frr)
-        if gap < best_gap:
-            best_gap = gap
-            best_threshold = t
-            best_far = far
-            best_frr = frr
-
-    eer_percent = ((best_far + best_frr) / 2.0) * 100.0
-    return float(best_threshold), float(eer_percent)
-
-
-def _get_redis_client():
-    global _REDIS_CLIENT
-    if _REDIS_CLIENT is not None:
-        return _REDIS_CLIENT
-    if redis is None:
-        return None
-
-    redis_url = _resolve_redis_url()
-    try:
-        client = redis.Redis.from_url(redis_url, decode_responses=False, socket_connect_timeout=2, socket_timeout=2)
-        client.ping()
-        _REDIS_CLIENT = client
-        return _REDIS_CLIENT
-    except Exception as exc:
-        logger.warning("CACHE_WARMUP_SKIPPED | reason=redis_unavailable | error=%s", str(exc))
-        return None
+# WebSocket configuration constants
+WS_CLIENT_QUEUE_MAX = int(os.environ.get("SAFEEAR_WS_CLIENT_QUEUE_MAX", "64"))
+WS_PING_INTERVAL_SEC = float(os.environ.get("SAFEEAR_WS_PING_INTERVAL_SEC", "20.0"))
 
 
 def _warmup_embeddings_to_redis() -> None:
-    global _CACHE_WARMUP_SUMMARY
-
-    failed_files: List[str] = []
-    parents_with_zero_embeddings: List[str] = []
-    parents_loaded = 0
-    cached_parents = 0
-    speakers_loaded = 0
-    embeddings_loaded = 0
-
+    """Warm speaker embeddings into Redis on startup (best-effort)."""
     client = _get_redis_client()
-    if client is None:
-        _CACHE_WARMUP_SUMMARY = {
-            "parents_loaded": 0,
-            "cached_parents": 0,
-            "speakers_loaded": 0,
-            "embeddings_loaded": 0,
-            "failed_files": ["redis_unavailable"],
-            "parents_with_zero_embeddings": [],
-        }
-        logger.info(json.dumps({"event": "cache_warmup_complete", **_CACHE_WARMUP_SUMMARY}))
-        return
-
-    with SessionLocal() as db:
-        parents = db.query(Parent).all()
-        parents_loaded = len(parents)
-
-        for parent in parents:
-            parent_id = str(parent.id)
-            parent_embedding_count = 0
-
-            speakers = svc.list_speakers(db, parent_id)
-            enrolled_count = (
-                db.query(EnrolledSpeaker)
-                .filter(EnrolledSpeaker.parent_id == parent.id)
-                .count()
-            )
-            for speaker in speakers:
-                speaker_id = str(speaker.id)
-                speaker_dir = svc.get_speaker_embedding_dir(parent_id, speaker_id)
-                if not os.path.isdir(speaker_dir):
-                    reason = f"{speaker_dir}:missing_dir"
-                    failed_files.append(reason)
-                    logger.warning("CACHE_WARMUP_FILE_SKIPPED | file=%s | reason=missing_dir", speaker_dir)
-                    continue
-
-                speaker_embeddings = 0
-                for fname in sorted(os.listdir(speaker_dir)):
-                    if not fname.endswith(".npy"):
-                        continue
-                    fpath = os.path.join(speaker_dir, fname)
-                    try:
-                        arr = np.asarray(np.load(fpath), dtype=np.float32).reshape(-1)
-                    except Exception as exc:
-                        failed_files.append(f"{fpath}:load_failed")
-                        logger.warning("CACHE_WARMUP_FILE_SKIPPED | file=%s | reason=load_failed | error=%s", fpath, str(exc))
-                        continue
-
-                    if arr.shape[0] != feature_extractor_module.config.EMBEDDING_DIM:
-                        failed_files.append(f"{fpath}:invalid_dim_{arr.shape[0]}")
-                        logger.warning(
-                            "CACHE_WARMUP_FILE_SKIPPED | file=%s | reason=invalid_dim | dim=%s",
-                            fpath,
-                            arr.shape[0],
-                        )
-                        continue
-
-                    key = f"safeear:emb:{parent_id}:{speaker_id}:{fname}"
-                    client.set(key, arr.astype(np.float32).tobytes())
-                    embeddings_loaded += 1
-                    speaker_embeddings += 1
-
-                if speaker_embeddings > 0:
-                    speakers_loaded += 1
-                    parent_embedding_count += speaker_embeddings
-
-            if enrolled_count > 0 and parent_embedding_count == 0:
-                parents_with_zero_embeddings.append(parent_id)
-            if parent_embedding_count > 0:
-                cached_parents += 1
-
-    _CACHE_WARMUP_SUMMARY = {
-        "parents_loaded": parents_loaded,
-        "cached_parents": cached_parents,
-        "speakers_loaded": speakers_loaded,
-        "embeddings_loaded": embeddings_loaded,
-        "failed_files": failed_files,
-        "parents_with_zero_embeddings": parents_with_zero_embeddings,
-    }
-    logger.info(json.dumps({"event": "cache_warmup_complete", **_CACHE_WARMUP_SUMMARY}))
-
-
-def _ws_set_loop(loop: asyncio.AbstractEventLoop) -> None:
-    global _WS_LOOP
-    with _WS_STATE_LOCK:
-        _WS_LOOP = loop
-
-
-def _ws_next_seq(parent_id: str) -> int:
-    with _WS_STATE_LOCK:
-        next_seq = _WS_SEQ_BY_PARENT.get(parent_id, 0) + 1
-        _WS_SEQ_BY_PARENT[parent_id] = next_seq
-        return next_seq
-
-
-async def _ws_register_client(parent_id: str, client_id: str, queue: asyncio.Queue) -> None:
-    with _WS_STATE_LOCK:
-        parent_clients = _WS_CLIENTS_BY_PARENT.setdefault(parent_id, {})
-        parent_clients[client_id] = queue
-        active_count = sum(len(v) for v in _WS_CLIENTS_BY_PARENT.values())
-    logger.info("WS_CONNECT | parent_id=%s | client_id=%s | active_clients=%s", parent_id, client_id, active_count)
-
-
-async def _ws_unregister_client(parent_id: str, client_id: str) -> None:
-    with _WS_STATE_LOCK:
-        parent_clients = _WS_CLIENTS_BY_PARENT.get(parent_id)
-        if parent_clients and client_id in parent_clients:
-            del parent_clients[client_id]
-            if not parent_clients:
-                _WS_CLIENTS_BY_PARENT.pop(parent_id, None)
-        active_count = sum(len(v) for v in _WS_CLIENTS_BY_PARENT.values())
-    logger.info("WS_DISCONNECT | parent_id=%s | client_id=%s | active_clients=%s", parent_id, client_id, active_count)
-
-
-async def _ws_publish_async(parent_id: str, event_type: str, payload: Dict[str, Any]) -> None:
-    global _WS_LAST_QUEUE_LAG_MS
-    seq = _ws_next_seq(parent_id)
-    event = {
-        "type": event_type,
-        "payload": payload,
-        "timestamp_ms": now_ms(),
-        "seq": seq,
-    }
-    queued_at_ms = now_ms()
-
-    with _WS_STATE_LOCK:
-        parent_clients = dict(_WS_CLIENTS_BY_PARENT.get(parent_id, {}))
-        if event_type in _WS_PUBLISHED_COUNTS:
-            _WS_PUBLISHED_COUNTS[event_type] += 1
-
-    delivered = 0
-    for _client_id, queue in parent_clients.items():
-        try:
-            if queue.full():
-                try:
-                    queue.get_nowait()
-                except Exception:
-                    pass
-            queue.put_nowait({"event": event, "queued_at_ms": queued_at_ms})
-            delivered += 1
-        except Exception:
-            continue
-
-    _WS_LAST_QUEUE_LAG_MS = 0
-    logger.info(
-        "WS_EVENT_PUBLISHED | parent_id=%s | type=%s | seq=%s | delivered=%s",
-        parent_id,
-        event_type,
-        seq,
-        delivered,
-    )
-
-
-def publish_parent_event(parent_id: str, event_type: str, payload: Dict[str, Any]) -> None:
-    loop = _WS_LOOP
-    if loop is None:
-        return
     try:
-        asyncio.run_coroutine_threadsafe(_ws_publish_async(parent_id, event_type, payload), loop)
+        _warmup_embeddings_to_redis_fn(client)
     except Exception as exc:
-        logger.warning("WS_EVENT_PUBLISH_FAILED | parent_id=%s | type=%s | reason=%s", parent_id, event_type, str(exc))
+        logger.warning("CACHE_WARMUP_FAILED | reason=%s", str(exc))
 
 
-def _should_publish_device_status(parent_id: str, device_id: str) -> bool:
-    key = f"{parent_id}:{device_id}"
-    now = now_ms()
-    with _WS_STATE_LOCK:
-        last = _DEVICE_STATUS_EVENT_LAST_SENT.get(key)
-        if last is not None and (now - last) < DEVICE_STATUS_EVENT_MIN_INTERVAL_MS:
-            return False
-        _DEVICE_STATUS_EVENT_LAST_SENT[key] = now
-        return True
+def _find_eer_threshold(familiar_scores: list, stranger_scores: list) -> tuple:
+    """Compute the Equal Error Rate (EER) threshold from familiar/stranger score lists.
+
+    Returns (threshold, eer_percent) where threshold minimises |FAR - FRR|.
+    """
+    all_scores = sorted(set(float(s) for s in familiar_scores + stranger_scores))
+    best_threshold = 0.0
+    best_diff = float("inf")
+    best_eer = 1.0
+
+    for t in all_scores:
+        far = sum(1 for s in stranger_scores if float(s) >= t) / max(1, len(stranger_scores))
+        frr = sum(1 for s in familiar_scores if float(s) < t) / max(1, len(familiar_scores))
+        diff = abs(far - frr)
+        if diff < best_diff:
+            best_diff = diff
+            best_threshold = t
+            best_eer = (far + frr) / 2.0
+
+    return best_threshold, round(best_eer * 100.0, 2)
 
 
-def _make_detect_chunk_cache_key(parent_id: str, device_id: str, chunk_id: str) -> str:
-    return f"{parent_id}:{device_id}:{chunk_id}"
+def _make_detect_chunk_cache_key(parent_id: str, device_id: str, chunk_id: Optional[str]) -> str:
+    return f"detect:{parent_id}:{device_id}:{chunk_id}"
 
 
-def _get_detect_chunk_cached_response(parent_id: str, device_id: str, chunk_id: Optional[str]) -> Optional[Dict[str, Any]]:
+def _resolve_redis_url() -> str:
+    """Resolve Redis URL using environment variables.
+
+    Preference order: `REDIS_URL` -> `SAFEEAR_REDIS_URL` -> default localhost.
+    """
+    return os.environ.get("REDIS_URL") or os.environ.get("SAFEEAR_REDIS_URL") or "redis://localhost:6379/0"
+
+
+def _get_detect_chunk_cached_response(parent_id: str, device_id: str, chunk_id: Optional[str]):
     if not chunk_id:
         return None
-
     key = _make_detect_chunk_cache_key(parent_id, device_id, chunk_id)
-    now = now_ms()
+    now = svc.now_ms()
     stale_before = now - DETECT_CHUNK_IDEMPOTENCY_WINDOW_MS
 
     with _RECENT_DETECT_CHUNK_RESULTS_LOCK:
@@ -459,6 +211,27 @@ def _remember_detect_chunk_response(
     with _RECENT_DETECT_CHUNK_RESULTS_LOCK:
         _RECENT_DETECT_CHUNK_RESULTS[key] = (now_ms(), dict(response_payload))
 
+
+def _log_pipeline_decision(
+    stage: str,
+    device_id: str,
+    parent_id: str,
+    result: str,
+    score: Optional[float],
+    streak: int,
+    latency_ms: float,
+) -> None:
+    logger.info(
+        "PIPELINE_DECISION | stage=%s | parent_id=%s | device_id=%s | result=%s | score=%s | streak=%s | latency_ms=%.1f",
+        stage,
+        parent_id,
+        device_id,
+        result,
+        "none" if score is None else f"{float(score):.4f}",
+        streak,
+        latency_ms,
+    )
+
 DATA_ROOT = (os.environ.get("SAFEEAR_DATA_ROOT", os.path.join("app", "data")) or "").strip() or os.path.join("app", "data")
 TEMP_DIR = os.path.join(DATA_ROOT, "temp_audio")
 os.makedirs(TEMP_DIR, exist_ok=True)
@@ -480,41 +253,16 @@ def _speaker_payload(row, request: Request, parent_id: str) -> Dict[str, Any]:
         "sample_count": row.sample_count,
         "quality_score": row.quality_score,
         "quality_label": row.quality_label,
+        # Change 1: speaker role and per-speaker threshold
+        "role": getattr(row, "role", "familiar_adult") or "familiar_adult",
+        "t_high_override": getattr(row, "t_high_override", None),
+        # Change 4: confusability
+        "confusability_score": getattr(row, "confusability_score", None),
+        "confusability_label": getattr(row, "confusability_label", None),
         "profile_image_url": _speaker_avatar_url(request, row.id) if avatar_exists else None,
         "created_at": row.created_at,
         "updated_at": row.updated_at,
     }
-
-
-@app.on_event("startup")
-def startup_event() -> None:
-    init_db()
-    # Eagerly warm model singletons so first detect request does not pay load latency.
-    try:
-        feature_extractor_module._get_redimnet()
-        logger.info("MODEL_WARMUP_OK | model=redimnet")
-    except Exception as exc:
-        logger.warning("MODEL_WARMUP_FAILED | model=redimnet | reason=%s", str(exc))
-
-    try:
-        yamnet_model = yamnet_classifier_module._get_yamnet_model()
-        if yamnet_model is None:
-            logger.warning("MODEL_WARMUP_SKIPPED | model=yamnet | reason=unavailable")
-        else:
-            logger.info("MODEL_WARMUP_OK | model=yamnet")
-    except Exception as exc:
-        logger.warning("MODEL_WARMUP_FAILED | model=yamnet | reason=%s", str(exc))
-
-    try:
-        silero_model, silero_utils = vad_module._get_silero()
-        if silero_model is None or silero_utils is None:
-            logger.warning("MODEL_WARMUP_SKIPPED | model=silero_vad | reason=unavailable")
-        else:
-            logger.info("MODEL_WARMUP_OK | model=silero_vad")
-    except Exception as exc:
-        logger.warning("MODEL_WARMUP_FAILED | model=silero_vad | reason=%s", str(exc))
-
-    _warmup_embeddings_to_redis()
 
 
 class GoogleAuthRequest(BaseModel):
@@ -553,8 +301,10 @@ class FlagFamiliarRequest(BaseModel):
     display_name: str
     speaker_id: Optional[str] = None
 
+
 class DeviceMonitoringPatchRequest(BaseModel):
     monitoring_enabled: bool
+
 
 class DeviceHeartbeatRequest(BaseModel):
     battery_percent: Optional[int] = None
@@ -599,28 +349,7 @@ def _extract_bearer(auth_header: Optional[str]) -> str:
 
 
 def _decode_audio_chunk(raw: bytes) -> Tuple[np.ndarray, int, str]:
-    # 1) Preferred path: decode containerized audio (wav/ogg/webm/etc.) with soundfile.
-    try:
-        arr, sr = sf.read(io.BytesIO(raw), dtype="float32")
-        return np.asarray(arr), int(sr), "soundfile"
-    except Exception:
-        pass
-
-    # 2) Fallback path: librosa may decode formats unavailable to soundfile.
-    try:
-        arr, sr = librosa.load(io.BytesIO(raw), sr=None, mono=True)
-        return np.asarray(arr, dtype=np.float32), int(sr), "librosa"
-    except Exception:
-        pass
-
-    # 3) Last resort: treat payload as raw PCM16LE mono.
-    if len(raw) >= 2 and (len(raw) % 2 == 0):
-        raw_sr = int(os.environ.get("SAFEEAR_RAW_PCM_SR", "16000"))
-        arr = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
-        if arr.size > 0:
-            return arr, raw_sr, "raw_pcm16le"
-
-    raise ValueError("unsupported_audio_chunk_format")
+    return decode_audio_chunk(raw)
 
 
 def get_current_parent(
@@ -922,6 +651,8 @@ async def enroll_speaker(
     request: Request,
     display_name: str = Form(...),
     speaker_id: Optional[str] = Form(None),
+    # Change 1: accept speaker role for 3-category decision logic
+    role: str = Form("familiar_adult"),
     file: Optional[UploadFile] = File(None),
     audio: Optional[UploadFile] = File(None),
     current=Depends(get_current_parent),
@@ -930,6 +661,11 @@ async def enroll_speaker(
     upload = file or audio
     if upload is None:
         raise HTTPException(status_code=422, detail="missing_audio_file")
+
+    # Validate role
+    allowed_roles = {"familiar_adult", "child_self"}
+    if role not in allowed_roles:
+        raise HTTPException(status_code=422, detail=f"invalid_role: must be one of {sorted(allowed_roles)}")
 
     parent_id = current["parent_id"]
     # For updates, ensure the target speaker exists before processing audio.
@@ -943,6 +679,7 @@ async def enroll_speaker(
     try:
         embs, stage_info = run_enroll_embedding(temp_path)
     except ValueError as exc:
+        logger.warning(f"ENROLL_SPEAKER_FAILED | parent_id={parent_id} | reason={str(exc)}")
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
         try:
@@ -953,6 +690,12 @@ async def enroll_speaker(
     # Only create a new speaker after enrollment audio is validated and embeddings are extracted.
     if speaker is None:
         speaker = svc.create_speaker(db, parent_id, display_name)
+
+    # Persist speaker role (Change 1)
+    if hasattr(speaker, "role"):
+        speaker.role = role
+        db.commit()
+        db.refresh(speaker)
 
     for idx, emb in enumerate(embs):
         emb_arr = np.asarray(emb, dtype=np.float32).reshape(-1)
@@ -973,7 +716,36 @@ async def enroll_speaker(
     for emb in embs:
         svc.save_speaker_embedding(db, parent_id, str(speaker.id), emb)
 
-    quality_score, quality_label = svc.compute_and_store_enrollment_quality(db, parent_id, str(speaker.id))
+    # Compute and store speaker quality metrics
+    _, quality_label = svc.compute_and_store_enrollment_quality(db, parent_id, str(speaker.id))
+
+    # Trigger auto-calibration when enough samples are available (Change 5)
+    try:
+        svc.auto_calibrate_thresholds(db, parent_id)
+    except Exception as _cal_exc:
+        logger.warning("AUTO_CALIBRATE_ERROR | parent_id=%s | reason=%s", parent_id, _cal_exc)
+
+    # Confusability check (Change 4)
+    confusability_warnings = []
+    try:
+        conflicts = svc.check_enrollment_confusability(db, parent_id, str(speaker.id))
+        for conflicting_speaker_id, sim in conflicts:
+            confusability_warnings.append({
+                "conflicting_speaker_id": conflicting_speaker_id,
+                "similarity": round(float(sim), 4),
+                "warning": (
+                    "This speaker's voice is very close to an existing enrolled speaker. "
+                    "The system may confuse them during monitoring."
+                ),
+            })
+    except Exception as _conf_exc:
+        logger.warning("CONFUSABILITY_CHECK_ERROR | parent_id=%s | reason=%s", parent_id, _conf_exc)
+
+    # Compute samples_needed for this speaker (Change 2)
+    current_speaker = svc.get_speaker(db, parent_id, str(speaker.id))
+    sample_count = getattr(current_speaker, "sample_count", 0) or 0
+    samples_needed = max(0, 5 - sample_count)
+    enrollment_complete = samples_needed == 0
 
     speaker_payload = _speaker_payload(speaker, request, parent_id)
     refreshed_rows = svc.list_speakers(db, parent_id)
@@ -988,11 +760,15 @@ async def enroll_speaker(
         "display_name": speaker.display_name,
         "samples_saved": len(embs),
         "embedding_dim": int(embs[0].shape[0]),
+        "samples_needed": samples_needed,
+        "enrollment_complete": enrollment_complete,
         "items": refreshed_items,
         "stages": stage_info,
     }
     if quality_label == "poor":
         response["warning"] = "Low enrollment quality. Try recording in a quieter space, speaking naturally, or adding more samples."
+    if confusability_warnings:
+        response["confusability_warnings"] = confusability_warnings
     return response
 
 
@@ -1179,6 +955,8 @@ async def detect_chunk(
 
     if sr != 16000:
         try:
+            if librosa is None:
+                raise ImportError("librosa is not available")
             arr = librosa.resample(arr, orig_sr=sr, target_sr=16000).astype(np.float32)
             sr = 16000
         except Exception as exc:
@@ -1224,42 +1002,40 @@ async def detect_chunk(
         decode_method,
     )
 
-    session = svc.get_or_create_session(parent_id, device_id)
-    if latitude is not None and longitude is not None:
-        session.lat = latitude
-        session.lon = longitude
-    elif session.lat is None and session.lon is None:
-        # Fallback to the last location persisted for this device.
-        if device.last_location_lat is not None and device.last_location_lon is not None:
-            session.lat = float(device.last_location_lat)
-            session.lon = float(device.last_location_lon)
+    svc_result = DetectionService.process_audio_chunk(
+        db=db,
+        parent_id=parent_id,
+        device_id=device_id,
+        arr=arr,
+        sr=sr,
+        latitude=latitude,
+        longitude=longitude,
+    )
 
-    inference_buffer = svc.append_frame(session, arr)
-    window_samples = int(WINDOW_SEC * session.sr)
-    if inference_buffer.shape[0] < window_samples:
-        ack_msg = f"warming_up | ring_samples={int(inference_buffer.shape[0])} | required={window_samples}"
-        logger.info(f"ACK | {ack_msg}")
-        response_payload = {
-            "status": "warming_up",
-            "ring_samples": int(inference_buffer.shape[0]),
-            "required_samples": window_samples,
-        }
-        _remember_detect_chunk_response(parent_id, device_id, normalized_chunk_id, response_payload)
-        return response_payload
+    if svc_result.get("status") != "ok":
+        _remember_detect_chunk_response(parent_id, device_id, normalized_chunk_id, svc_result)
+        svc_result.pop("session", None)
+        return svc_result
 
-    if not svc.should_hop(len(arr), session.sr):
-        ack_msg = f"no_hop | chunk_samples={int(len(arr))} | required_hop={int(HOP_SEC * session.sr)}"
-        logger.info(f"ACK | {ack_msg}")
-        response_payload = {"status": "no_hop", "reason": "chunk_too_small", "chunk_samples": int(len(arr))}
-        _remember_detect_chunk_response(parent_id, device_id, normalized_chunk_id, response_payload)
-        return response_payload
-
-    window = inference_buffer[-window_samples:]
-    stage = svc.evaluate_window(db, parent_id, window, session.sr)
-    current_stranger_centroid = _normalized_embedding(stage.pop("_query_centroid", None))
-    score = float(stage["tier3"].get("score", 0.0))
-    closest_speaker_id = stage.get("tier3", {}).get("closest_speaker_id")
+    session = svc_result["session"]
+    stage = svc_result["stage"]
+    current_stranger_centroid = svc_result.get("current_stranger_centroid")
+    score = svc_result.get("score", 0.0)
+    closest_speaker_id = svc_result.get("closest_speaker_id")
+    # Change 1: extract role for child-self fork in familiar branch below
+    closest_speaker_role = str(stage.get("tier3", {}).get("closest_speaker_role") or "familiar_adult")
+    # Change 7: extract distress sub-dict from evaluate_window result
+    distress_info = stage.get("distress", {"distress": False, "distress_score": 0.0, "distress_class": None})
+    # Change 5: use per-household T_HIGH / T_LOW from tier3 result (already resolved by evaluate_window)
+    _tier3 = stage.get("tier3", {})
+    T_HIGH_eff = float(_tier3.get("t_high", T_HIGH))
+    T_LOW_eff = float(_tier3.get("t_low", T_LOW))
     now = now_ms()
+
+    # Change 12: Fetch/cache household config for context gates
+    if session.last_config_fetch_ms == 0 or (now - session.last_config_fetch_ms) > 300000:
+        session.household_config = svc.get_household_config_dict(db, parent_id)
+        session.last_config_fetch_ms = now
 
     decision = "hold"
     alert_fired = False
@@ -1306,6 +1082,19 @@ async def detect_chunk(
         latency_ms=perf_latency_ms,
     )
 
+    # Phase 5: Device obstruction detection
+    if tier1_pass and not tier2_pass:
+        session.obstruction_counter += 1
+        # 4800 chunks at 4 chunks/sec = 20 minutes of continuous muffled audio
+        if session.obstruction_counter >= 4800:
+            if (now - session.device_obstructed_alert_sent_at) > 3600000:  # throttle 1 hour
+                logger.warning(f"DEVICE_OBSTRUCTION_DETECTED | parent_id={parent_id} | device_id={device_id}")
+                from app.services.alert_service import create_and_escalate_alert
+                create_and_escalate_alert(db, parent_id, device_id, session, score=0.0, alert_type="device_obstructed")
+                session.device_obstructed_alert_sent_at = now
+    elif tier2_pass:
+        session.obstruction_counter = 0
+
     if not tier3_pass:
         logger.warning(
             "DETECT_CHUNK_TIER3_UNAVAILABLE | parent_id=%s | device_id=%s | stage_decision=%s",
@@ -1326,27 +1115,48 @@ async def detect_chunk(
         _remember_detect_chunk_response(parent_id, device_id, normalized_chunk_id, response_payload)
         return response_payload
 
-    if score >= T_HIGH:
+    if score >= T_HIGH_eff:
         session.familiar_recovery_streak += 1
         if session.stranger_streak > 0 and session.familiar_recovery_streak < FAMILIAR_RESET_MIN_STREAK:
             decision = "uncertain_recovery"
             logger.info(
-                "SCORE_DECISION | score=%.4f >= t_high=%.2f but pending_familiar_recovery "
+                "SCORE_DECISION | score=%.4f >= t_high=%.4f but pending_familiar_recovery "
                 "| decision=uncertain_recovery | recovery_streak=%s/%s | stranger_streak=%s",
-                score,
-                T_HIGH,
-                session.familiar_recovery_streak,
-                FAMILIAR_RESET_MIN_STREAK,
-                session.stranger_streak,
+                score, T_HIGH_eff,
+                session.familiar_recovery_streak, FAMILIAR_RESET_MIN_STREAK, session.stranger_streak,
             )
         else:
             session.stranger_streak = 0
-            session.last_familiar_ms = now
-            session.last_familiar_speaker_id = str(closest_speaker_id) if closest_speaker_id else None
-            svc.clear_stranger_identity(session)
-            decision = "familiar"
-            logger.info(f"SCORE_DECISION | score={score:.4f} >= t_high={T_HIGH} | decision=familiar | streak_reset")
-    elif score <= T_LOW:
+            session.stranger_weight_sum = 0.0
+            session.familiar_recovery_streak = 0
+            if closest_speaker_role == "child_self":
+                # Change 1: child match — suppress streak, do NOT update grace window
+                decision = "child_self_match"
+                
+                # Change 10: drift tracking
+                session.child_drift_scores.append(score)
+                # Flush if we have enough scores or it's been a while (handled at end of function or periodically)
+                assert closest_speaker_id is not None
+                drift_warning = svc.flush_child_drift_scores(db, parent_id, closest_speaker_id, session)
+                if drift_warning:
+                    # In a real system, you might emit a WS event or push notification here
+                    logger.warning("DRIFT_WARNING | parent_id=%s | child_id=%s | drift threshold breached", parent_id, closest_speaker_id)
+                
+                logger.info(
+                    "SCORE_DECISION | score=%.4f >= t_high_eff=%.4f | decision=child_self_match | streak_reset",
+                    score, T_HIGH_eff,
+                )
+            else:
+                session.last_familiar_ms = now
+                session.last_familiar_speaker_id = str(closest_speaker_id) if closest_speaker_id else None
+                svc.clear_stranger_identity(session)
+                decision = "familiar"
+                logger.info(
+                    "SCORE_DECISION | score=%.4f >= t_high=%.4f | decision=familiar | streak_reset",
+                    score, T_HIGH_eff,
+                )
+
+    elif score <= T_LOW_eff:
         session.familiar_recovery_streak = 0
         within_familiar_grace = (
             session.last_familiar_ms > 0
@@ -1362,6 +1172,7 @@ async def detect_chunk(
 
         if within_familiar_grace and same_recent_speaker and session.stranger_streak == 0 and mild_post_familiar_dip and strong_human_signal:
             session.stranger_streak = 0
+            session.stranger_weight_sum = 0.0
             decision = "uncertain_post_familiar"
             logger.info(
                 f"SCORE_DECISION | score={score:.4f} <= t_low={T_LOW} but held_by_familiar_grace "
@@ -1379,9 +1190,11 @@ async def detect_chunk(
             )
         else:
             session.stranger_streak += 1
+            from app.services.decision_engine import _streak_weight
+            session.stranger_weight_sum += _streak_weight(score, T_LOW_eff, T_HIGH_eff, tier2_confidence)
             decision = "stranger_candidate"
             svc.record_confirmed_stranger_window(session, current_stranger_centroid)
-            logger.info(f"SCORE_DECISION | score={score:.4f} <= t_low={T_LOW} | decision=stranger_candidate | streak_incremented={session.stranger_streak}")
+            logger.info(f"SCORE_DECISION | score={score:.4f} <= t_low={T_LOW} | decision=stranger_candidate | streak_incremented={session.stranger_streak} weight={session.stranger_weight_sum:.2f}")
     else:
         session.familiar_recovery_streak = 0
         soft_limit = T_LOW + SOFT_STRANGER_MARGIN
@@ -1389,16 +1202,19 @@ async def detect_chunk(
 
         if score <= soft_limit and likely_human_speech:
             session.stranger_streak += 1
+            from app.services.decision_engine import _streak_weight
+            session.stranger_weight_sum += _streak_weight(score, soft_limit, T_HIGH_eff, tier2_confidence)
             decision = "stranger_candidate_soft"
             svc.record_confirmed_stranger_window(session, current_stranger_centroid)
             logger.info(
                 "SCORE_DECISION | soft_stranger_window | score=%.4f | soft_limit=%.4f | "
-                "tier2_category=%s | tier2_confidence=%.4f | streak_incremented=%s",
+                "tier2_category=%s | tier2_confidence=%.4f | streak_incremented=%s weight=%.2f",
                 score,
                 soft_limit,
                 tier2_category,
                 tier2_confidence,
                 session.stranger_streak,
+                session.stranger_weight_sum,
             )
         else:
             decision = "uncertain"
@@ -1407,10 +1223,10 @@ async def detect_chunk(
     # For clearly low scores, fast-track only after at least N consecutive stranger windows.
     if score <= FORCE_ALERT_SCORE and session.stranger_streak >= FORCE_ALERT_MIN_STREAK:
         old_streak = session.stranger_streak
-        session.stranger_streak = max(session.stranger_streak, ALERT_TRIGGER_STREAK)
+        session.stranger_weight_sum = max(session.stranger_weight_sum, 2.5)  # fast track weight
         logger.info(
             f"FAST_TRACK_ALERT | score={score:.4f} <= force_alert_score={FORCE_ALERT_SCORE} | "
-            f"min_streak={FORCE_ALERT_MIN_STREAK} | streak_updated={old_streak}->{session.stranger_streak}"
+            f"min_streak={FORCE_ALERT_MIN_STREAK} | weight_updated_to={session.stranger_weight_sum:.2f}"
         )
 
     # Capture the full stranger episode instead of only the last rolling window.
@@ -1436,117 +1252,102 @@ async def detect_chunk(
     else:
         svc.clear_stranger_segment(session)
 
-    if session.stranger_streak >= ALERT_TRIGGER_STREAK:
+    # ------------------------------------------------------------------ #
+    # Change 7: Distress alert path (parallel to identity streak)         #
+    # Fires independently, bypassing the identity streak and debounce.    #
+    # ------------------------------------------------------------------ #
+    DISTRESS_ALERT_THRESHOLD = float(os.environ.get("SAFEEAR_DISTRESS_ALERT_THRESHOLD", "0.65"))
+    DISTRESS_CONFIRM_WINDOWS = int(os.environ.get("SAFEEAR_DISTRESS_CONFIRM_WINDOWS", "2"))
+
+    distress_score = float(distress_info.get("distress_score", 0.0))
+    distress_class = distress_info.get("distress_class")
+    if distress_score >= DISTRESS_ALERT_THRESHOLD:
+        session.distress_streak = getattr(session, "distress_streak", 0) + 1
+    else:
+        session.distress_streak = 0
+
+    if session.distress_streak >= DISTRESS_CONFIRM_WINDOWS and not alert_fired:
+        distress_debounce_elapsed = (now - session.last_alert_ms) >= 10_000  # 10 s distress debounce
+        if distress_debounce_elapsed:
+            try:
+                from app.services.alert_service import create_and_escalate_alert
+                distress_alert_id = create_and_escalate_alert(
+                    db, parent_id, device_id, session, distress_score,
+                    alert_type="distress",
+                )
+                if distress_alert_id:
+                    alert_fired = True
+                    alert_id = distress_alert_id
+                    decision = "distress_alert"
+                    session.distress_streak = 0
+                    logger.info(
+                        "DISTRESS_ALERT_FIRED | parent_id=%s | device_id=%s | score=%.4f | class=%s | alert_id=%s",
+                        parent_id, device_id, distress_score, distress_class, distress_alert_id,
+                    )
+            except Exception as _da_exc:
+                logger.error("DISTRESS_ALERT_ERROR | parent_id=%s | reason=%s", parent_id, _da_exc)
+    # ------------------------------------------------------------------ #
+    # Identity Alert Triggering (Change 11 & Change 12)                  #
+    # ------------------------------------------------------------------ #
+    alert_weight_threshold = session.household_config.get("alert_weight_threshold", 2.5) if session.household_config else 2.5
+    
+    from app.services.decision_engine import _should_alert
+    can_alert, block_reason = _should_alert(session, now)
+    
+    if not can_alert:
+        alert_block_reason = block_reason
+        session.stranger_streak = 0
+        session.stranger_weight_sum = 0.0
+        svc.clear_stranger_segment(session)
+        svc.clear_stranger_identity(session)
+        logger.info("ALERT_SUPPRESSED | block_reason=%s", block_reason)
+    elif session.stranger_weight_sum >= alert_weight_threshold:
         debounce_elapsed = (now - session.last_alert_ms) >= DEBOUNCE_SEC * 1000
         if not debounce_elapsed:
-            speaker_changed, similarity = _has_speaker_changed(session, current_stranger_centroid)
+            from app.services.decision_engine import _has_speaker_changed
+            speaker_changed, similarity = _has_speaker_changed(
+                session, current_stranger_centroid, float(os.environ.get("SAFEEAR_SPEAKER_CHANGE_THRESHOLD", "0.45"))
+            )
             if speaker_changed:
                 session.last_alert_ms = 0
                 debounce_elapsed = True
                 logger.info(
-                    "DEBOUNCE_RESET_SPEAKER_CHANGE | parent_id=%s | device_id=%s | similarity=%.4f | threshold=%.2f",
-                    parent_id,
-                    device_id,
-                    similarity if similarity is not None else -1.0,
-                    SPEAKER_CHANGE_THRESHOLD,
+                    f"DEBOUNCE_RESET_ON_SPEAKER_CHANGE | old_speaker_reset | "
+                    f"similarity={similarity:.4f} < {os.environ.get('SAFEEAR_SPEAKER_CHANGE_THRESHOLD', '0.45')}"
                 )
-
         if debounce_elapsed:
             session.stranger_segment_ended_ms = now
-            clip_waveform = svc.get_clip_buffer_waveform(session, inference_buffer)
-            clip_path = svc.save_alert_clip(parent_id, session, clip_waveform)
-            row = svc.create_alert(
-                db=db,
-                parent_id=parent_id,
-                device_id=device_id,
-                audio_clip_path=clip_path,
-                confidence_score=score,
-                latitude=session.lat,
-                longitude=session.lon,
-            )
-            publish_parent_event(parent_id, "alert_created", _alert_response_payload(row))
-            alert_fired = True
-            alert_id = str(row.id)
-            session.last_alert_ms = now
-            session.stranger_streak = 0
-            if not session.recent_confirmed_stranger_embeddings:
-                svc.record_confirmed_stranger_window(session, current_stranger_centroid)
-            svc.set_active_stranger_embedding(session)
-            logger.info(
-                "ALERT_FIRED | alert_id=%s | score=%.4f | streak_satisfied=%s | clip_path=%s | segment_started_ms=%s | segment_ended_ms=%s | segment_samples=%s",
-                alert_id,
-                score,
-                ALERT_TRIGGER_STREAK,
-                clip_path,
-                session.stranger_segment_started_ms or None,
-                session.stranger_segment_ended_ms or None,
-                int(np.asarray(clip_waveform).reshape(-1).shape[0]),
-            )
-            parent = svc.get_parent(db, parent_id)
-            # Stranger alerts must only target the parent device token.
-            parent_device = (
-                db.query(Device)
-                .filter(
-                    Device.parent_id == parent.id,
-                    Device.role == DeviceRole.parent_device,
-                    Device.device_token.isnot(None),
-                )
-                .order_by(Device.updated_at.desc())
-                .first()
-            )
-            parent_fcm_token = parent_device.device_token if parent_device else None
-            token_source = "parent_device" if parent_fcm_token else "none"
-            logger.info(
-                "ALERT_ESCALATION_START | alert_id=%s | parent_email=%s | fcm_token_available=%s | token_source=%s",
-                alert_id,
-                parent.email,
-                bool(parent_fcm_token),
-                token_source,
-            )
-            # Wire background thread for notification escalation
-            def _run_escalation() -> None:
-                try:
-                    escalate_alert(
-                        parent.email,
-                        parent.phone_number,
-                        parent_fcm_token,
-                        alert_id,
-                        device_id,
-                        _dt_to_epoch_ms(row.timestamp) or now_ms(),
-                        session.lat,
-                        session.lon,
-                        f"/alerts/{alert_id}/clip",
-                        score,
-                        recipient_role="parent_device",
-                    )
-                except Exception:
-                    logger.exception("ALERT_ESCALATION_FAILED | alert_id=%s | device_id=%s", alert_id, device_id)
-
-            thread = threading.Thread(
-                target=_run_escalation,
-                daemon=True,
-            )
-            thread.start()
-            svc.clear_stranger_segment(session)
-            svc.clear_clip_buffer(session)
+            try:
+                from app.services.alert_service import create_and_escalate_alert
+                aid = create_and_escalate_alert(db, parent_id, device_id, session, score)
+                if aid:
+                    alert_fired = True
+                    alert_id = aid
+                    logger.info(f"IDENTITY_ALERT_FIRED | parent_id={parent_id} | device_id={device_id} | score={score:.4f} | alert_id={aid}")
+            except Exception as e:
+                logger.error(f"ALERT_ESCALATION_FAILED | parent_id={parent_id} | device_id={device_id} | exc={e}")
         else:
             alert_block_reason = "debounced"
             logger.info(
                 "ALERT_BLOCKED | alert_id=None | reason=debounced | last_alert_ms=%s | now=%s | debounce_sec=%s",
-                session.last_alert_ms,
-                now,
-                DEBOUNCE_SEC,
+                session.last_alert_ms, now, DEBOUNCE_SEC,
             )
     else:
         alert_block_reason = "insufficient_stranger_streak"
-        logger.info(f"ALERT_BLOCKED | alert_id=None | reason=insufficient_stranger_streak | current_streak={session.stranger_streak} | required={ALERT_TRIGGER_STREAK}")
+        logger.info(f"ALERT_BLOCKED | alert_id=None | reason=insufficient_stranger_streak | weight={session.stranger_weight_sum:.2f} | required={alert_weight_threshold}")
 
     response_payload = {
         "status": "ok",
         "decision": decision,
         "stranger_streak": session.stranger_streak,
         "score": score,
-        "thresholds": {"t_high": T_HIGH, "t_low": T_LOW},
+        "thresholds": {"t_high": T_HIGH_eff, "t_low": T_LOW_eff},
+        "distress": {
+            "distress": distress_info.get("distress", False),
+            "distress_score": distress_score,
+            "distress_class": distress_class,
+            "distress_streak": getattr(session, "distress_streak", 0),
+        },
         "trigger": {
             "required_streak": ALERT_TRIGGER_STREAK,
             "force_alert_score": FORCE_ALERT_SCORE,
@@ -1666,13 +1467,13 @@ def fire_test_alert(body: TestFireAlertRequest, current=Depends(get_current_pare
     parent_fcm_token = parent_device.device_token if parent_device else None
     if parent_fcm_token:
         send_fcm_push(
-            parent_fcm_token,
+            parent_fcm_token,  # type: ignore
             str(row.id),
             str(row.device_id),
-            _dt_to_epoch_ms(row.timestamp) or now_ms(),
-            row.latitude,
-            row.longitude,
-            float(row.confidence_score or 0.0),
+            _dt_to_epoch_ms(row.timestamp) or now_ms(),  # type: ignore
+            row.latitude,  # type: ignore
+            row.longitude,  # type: ignore
+            float(row.confidence_score or 0.0),  # type: ignore
             recipient_role="parent_device",
         )
 
@@ -1681,7 +1482,7 @@ def fire_test_alert(body: TestFireAlertRequest, current=Depends(get_current_pare
         "alert_id": str(row.id),
         "device_id": str(row.device_id),
         "confidence_score": row.confidence_score,
-        "timestamp_ms": _dt_to_epoch_ms(row.timestamp),
+        "timestamp_ms": _dt_to_epoch_ms(row.timestamp),  # type: ignore
         "clip_url": f"/alerts/{row.id}/clip",
     }
 
@@ -1697,7 +1498,7 @@ def flag_alert_as_familiar(
     parent_id = current["parent_id"]
     alert = svc.get_alert(db, parent_id, alert_id)
     clip_path = alert.audio_clip_path
-    if not clip_path or not os.path.exists(clip_path):
+    if not clip_path or not os.path.exists(clip_path):  # type: ignore
         raise HTTPException(status_code=404, detail="audio_clip_not_found")
 
     speaker = (
@@ -1706,18 +1507,51 @@ def flag_alert_as_familiar(
         else svc.get_speaker(db, parent_id, body.speaker_id)
     )
 
+    # Change 3: stricter quality gate for alert-clip enrollment (2 s voiced floor is enforced
+    # by MIN_VOICED_MS_ENROLL in verification_pipeline; SNR and overlap checks also apply).
+    # run_enroll_embedding already applies all gates — no extra call needed here.
     try:
-        embs, stage_info = run_enroll_embedding(clip_path)
+        embs, stage_info = run_enroll_embedding(clip_path)  # type: ignore
     except ValueError as exc:
+        # Delete the speaker row if we just created it and enrollment failed.
+        if not body.speaker_id:
+            try:
+                svc.delete_speaker(db, parent_id, str(speaker.id))
+            except Exception:
+                pass
+        logger.warning(
+            "ALERT_CLIP_ENROLL_REJECTED | parent_id=%s | alert_id=%s | reason=%s",
+            parent_id, alert_id, str(exc),
+        )
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     for emb in embs:
         svc.save_speaker_embedding(db, parent_id, str(speaker.id), emb)
 
+    _, quality_label = svc.compute_and_store_enrollment_quality(db, parent_id, str(speaker.id))
+    if quality_label == "poor":
+        logger.warning(
+            "ALERT_CLIP_ENROLL_WARNING | parent_id=%s | alert_id=%s | quality_label=poor "
+            "| gallery may be noisy; encourage re-enrollment from a clean recording.",
+            parent_id, alert_id,
+        )
+
+    # Confusability check (Change 4)
+    confusability_warnings = []
+    try:
+        conflicts = svc.check_enrollment_confusability(db, parent_id, str(speaker.id))
+        for conflicting_speaker_id, sim in conflicts:
+            confusability_warnings.append({
+                "conflicting_speaker_id": conflicting_speaker_id,
+                "similarity": round(float(sim), 4),
+            })
+    except Exception as _conf_exc:
+        logger.warning("CONFUSABILITY_CHECK_ERROR | parent_id=%s | reason=%s", parent_id, _conf_exc)
+
     refreshed_rows = svc.list_speakers(db, parent_id)
     refreshed_items = [_speaker_payload(row, request, parent_id) for row in refreshed_rows]
 
-    return {
+    resp = {
         "status": "flagged_familiar",
         "source_alert_id": alert_id,
         "speaker_id": str(speaker.id),
@@ -1726,6 +1560,11 @@ def flag_alert_as_familiar(
         "items": refreshed_items,
         "stages": stage_info,
     }
+    if quality_label == "poor":
+        resp["warning"] = "Alert clip quality is low. Encourage the parent to record a clean enrollment."
+    if confusability_warnings:
+        resp["confusability_warnings"] = confusability_warnings
+    return resp
 
 
 @app.get("/alerts/{alert_id}/clip")
@@ -1735,9 +1574,9 @@ def get_alert_clip(alert_id: str, current=Depends(get_current_parent), db: Sessi
     # Older alerts may exist without persisted media. Return an empty response cleanly.
     if not path:
         return Response(status_code=204)
-    if not os.path.exists(path):
+    if not os.path.exists(path):  # type: ignore
         raise HTTPException(status_code=404, detail="audio_clip_not_found")
-    return FileResponse(path, media_type="audio/wav", filename=os.path.basename(path))
+    return FileResponse(path, media_type="audio/wav", filename=os.path.basename(path))  # type: ignore
 
 
 @app.post("/devices")
@@ -1974,8 +1813,10 @@ async def ws_events(websocket: WebSocket):
             if queue_task is None or queue_task.done():
                 queue_task = asyncio.create_task(queue.get())
 
-            done, pending = await asyncio.wait(
-                {queue_task, receiver_task},
+            assert queue_task is not None
+            assert receiver_task is not None
+            done, _ = await asyncio.wait(
+                [queue_task, receiver_task],
                 timeout=WS_PING_INTERVAL_SEC,
                 return_when=asyncio.FIRST_COMPLETED,
             )
@@ -2003,8 +1844,7 @@ async def ws_events(websocket: WebSocket):
                 queued_at_ms = int(queued.get("queued_at_ms", now_ms()))
                 event = queued.get("event", {})
                 lag_ms = max(0, now_ms() - queued_at_ms)
-                global _WS_LAST_QUEUE_LAG_MS
-                _WS_LAST_QUEUE_LAG_MS = lag_ms
+                _ws_manager_module._WS_LAST_QUEUE_LAG_MS = lag_ms
                 try:
                     await websocket.send_json(event)
                 except (RuntimeError, WebSocketDisconnect):
@@ -2026,12 +1866,13 @@ async def ws_events(websocket: WebSocket):
             await asyncio.gather(*cleanup, return_exceptions=True)
         await _ws_unregister_client(parent_id, client_id)
 
+
 @app.get("/health")
 def health():
     with _WS_STATE_LOCK:
         active_clients = sum(len(v) for v in _WS_CLIENTS_BY_PARENT.values())
         published_counts = dict(_WS_PUBLISHED_COUNTS)
-        queue_lag_ms = int(_WS_LAST_QUEUE_LAG_MS)
+        queue_lag_ms = int(_ws_manager_module._WS_LAST_QUEUE_LAG_MS)
     return {
         "status": "ok",
         "metrics": {

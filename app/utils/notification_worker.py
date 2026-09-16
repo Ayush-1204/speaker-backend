@@ -47,6 +47,9 @@ def _init_firebase():
             elif FIREBASE_CREDENTIALS_JSON:
                 cred = credentials.Certificate(json.loads(FIREBASE_CREDENTIALS_JSON))
                 firebase_admin.initialize_app(cred, options=init_options)
+            elif os.path.exists("firebase-adminsdk.json"):
+                cred = credentials.Certificate("firebase-adminsdk.json")
+                firebase_admin.initialize_app(cred, options=init_options)
             else:
                 # Works on Render if GOOGLE_APPLICATION_CREDENTIALS is set.
                 firebase_admin.initialize_app(credentials.ApplicationDefault(), options=init_options)
@@ -220,15 +223,3 @@ def escalate_alert(
             logger.info(f"[escalate] Email sent at {result['email']['at_ms']}ms")
 
     return result
-
-
-# Placeholder for Celery task (if async worker is enabled)
-"""
-from celery import Celery
-
-celery_app = Celery('safeear_notifications', broker=os.environ.get('CELERY_BROKER_URL', _resolve_redis_url()))
-
-@celery_app.task
-def notify_parent_async(parent_email, parent_phone, fcm_token, alert_id, lat, lon, audio_url, confidence):
-    return escalate_alert(parent_email, parent_phone, fcm_token, alert_id, lat, lon, audio_url, confidence)
-"""

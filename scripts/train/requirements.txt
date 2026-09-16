@@ -1,0 +1,6 @@
+torch>=2.0.0
+torchaudio>=2.0.0
+scikit-learn
+tqdm
+pandas
+numpy

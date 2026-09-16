@@ -234,9 +234,9 @@ def test_alert_clip_atomic_write(tmp_path):
     original_tenants_root = svc.TENANTS_ROOT
     svc.TENANTS_ROOT = str(tmp_path / "tenants")
 
+    parent_id = str(uuid.uuid4())
+    device_id = str(uuid.uuid4())
     try:
-        parent_id = str(uuid.uuid4())
-        device_id = str(uuid.uuid4())
         session = svc.get_or_create_session(parent_id, device_id)
         waveform = np.zeros(16000, dtype=np.float32)
 

@@ -1,8 +1,11 @@
 """YAMNet audio event classifier (Tier 2 of detection pipeline)."""
 
+import logging
 import numpy as np
 import os
-from typing import Dict, Any, Tuple
+from typing import Dict, Any
+
+logger = logging.getLogger(__name__)
 
 YAMNET_HUMAN_CLASSES = {
     "speech", "conversation", "whispering", "shout", "child speech", "talk",
@@ -18,7 +21,22 @@ YAMNET_REJECT = {
     "door slam", "door knock", "static", "white noise", "tone"
 }
 
+# Change 7: Distress classes — screaming, crying, aggression.
+# These map to the simplified yamnet_classes list in _score_to_decision.
+# "shout" and "baby_cry" are already tracked; "crying" is in vocal_non_speech
+# above but also counted here so both paths can fire independently.
+YAMNET_DISTRESS_CLASSES: set = {
+    "shout",
+    "baby_cry",
+    "crying",
+    "screaming",    # may appear in full YAMNet class list as a score index
+    "whimpering",
+    "aggressive",
+    "child_speech",  # included so high-energy child speech can contribute to distress scoring
+}
+
 HUMAN_SPEECH_CONFIDENCE_THRESHOLD = 0.60
+DISTRESS_SCORE_THRESHOLD = float(__import__("os").environ.get("SAFEEAR_DISTRESS_SCORE_THRESHOLD", "0.25"))
 
 
 _YAMNET_MODEL = None
@@ -34,12 +52,12 @@ def _get_yamnet_model():
             import tensorflow as tf
             model_path = os.path.join("app", "models", "yamnet.tflite")
             if not os.path.exists(model_path):
-                print(f"[yamnet] Warning: model not found at {model_path}. Using fallback.")
+                logger.warning("[yamnet] Model not found at %s, using fallback.", model_path)
                 return None
             _YAMNET_MODEL = tf.lite.Interpreter(model_path=model_path)
             _YAMNET_MODEL.allocate_tensors()
         except Exception as e:
-            print(f"[yamnet] Failed to load TFLite model: {e}")
+            logger.warning("[yamnet] Failed to load TFLite model: %s", str(e))
             return None
     return _YAMNET_MODEL
 
@@ -101,7 +119,7 @@ def classify_audio_event(waveform: np.ndarray, sr: int = 16000) -> Dict[str, Any
 
         return _score_to_decision(scores)
     except Exception as e:
-        print(f"[yamnet] Inference failed: {e}")
+        logger.warning("[yamnet] Inference failed: %s", str(e))
         return _fallback_classify(waveform)
 
 
@@ -180,7 +198,7 @@ def _fallback_classify(waveform: np.ndarray) -> Dict[str, Any]:
     """Fallback when YAMNet is unavailable. Use speech gate + energy."""
     from app.utils.speech_gate import assess_speech_likeness
 
-    speech_ok, metrics = assess_speech_likeness(waveform, 16000)
+    speech_ok, _ = assess_speech_likeness(waveform, 16000)
     if speech_ok:
         return {
             "category": "human_speech",
@@ -246,3 +264,65 @@ def _score_to_decision(scores: np.ndarray) -> Dict[str, Any]:
         "all_scores": {yamnet_classes[i] if i < len(yamnet_classes) else f"class_{i}": float(scores[i]) for i in range(len(scores))},
         "method": "yamnet"
     }
+
+
+def classify_distress_event(waveform: np.ndarray, sr: int = 16000) -> Dict[str, Any]:
+    """Distress detection using YAMNet class scores (Change 7).
+
+    Runs windowed classification and sums scores for YAMNET_DISTRESS_CLASSES.
+    Returns a dict with:
+        distress        : bool    — True when distress_score >= DISTRESS_SCORE_THRESHOLD
+        distress_score  : float   — aggregate distress evidence in [0, 1]
+        distress_class  : str     — the distress class with the highest individual score
+
+    This function is designed to run in parallel with the speaker embedding path.
+    It adds no model loading overhead because it reuses the same YAMNet singleton.
+    """
+    # yamnet_classes must match the order used in _score_to_decision
+    yamnet_classes = [
+        "speech", "male_speech", "female_speech", "child_speech", "conversation",
+        "whispering", "shout", "baby_cry", "laughter", "cough", "sneeze", "door",
+        "music", "television", "telephone", "dog", "cat", "birds"
+    ]
+    distress_normalised = {c.lower().replace(" ", "_") for c in YAMNET_DISTRESS_CLASSES}
+
+    try:
+        result = classify_audio_event_windowed(waveform, sr=sr)
+        all_scores = result.get("all_scores", {})
+
+        # Sum scores that correspond to distress classes.
+        distress_score = 0.0
+        best_distress_class: str = ""
+        best_distress_val: float = 0.0
+
+        for cls, score in all_scores.items():
+            # all_scores keys are prefixed with "cat_" from windowed aggregation
+            raw_cls = str(cls).replace("cat_", "").lower().replace(" ", "_")
+            if raw_cls in distress_normalised:
+                distress_score += float(score)
+                if float(score) > best_distress_val:
+                    best_distress_val = float(score)
+                    best_distress_class = raw_cls
+
+        distress_score = min(1.0, distress_score)
+        is_distress = distress_score >= DISTRESS_SCORE_THRESHOLD
+
+        if is_distress:
+            logger.info(
+                "[distress] DISTRESS_DETECTED | score=%.4f | class=%s",
+                distress_score, best_distress_class,
+            )
+
+        return {
+            "distress": is_distress,
+            "distress_score": float(distress_score),
+            "distress_class": best_distress_class or None,
+        }
+
+    except Exception as exc:
+        logger.warning("[distress] classify_distress_event failed: %s", str(exc))
+        return {
+            "distress": False,
+            "distress_score": 0.0,
+            "distress_class": None,
+        }

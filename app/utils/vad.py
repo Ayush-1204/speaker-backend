@@ -7,7 +7,10 @@ Returns a trimmed numpy float32 waveform (speech only) or original audio if VAD 
 from typing import List, Tuple
 
 import numpy as np
-import torch
+try:
+    import torch
+except Exception:
+    torch = None
 
 
 _SILERO_MODEL = None
@@ -25,7 +28,9 @@ def _get_silero():
 
     _SILERO_LOAD_ATTEMPTED = True
     try:
-        model, utils = torch.hub.load(
+        if torch is None:
+            raise ImportError("torch is not available")
+        model, utils = torch.hub.load(  # type: ignore
             repo_or_dir="snakers4/silero-vad",
             model="silero_vad",
             force_reload=False,
@@ -73,7 +78,7 @@ def _energy_segments(audio: np.ndarray, sr: int, frame_ms: int = 30, threshold_r
         start = i * frame_len
         end = min(len(audio), j * frame_len)
         if end > start:
-            segments.append({"start": int(start), "end": int(end)})
+            segments.append({"start": start, "end": end})
         i = j
     return segments if segments else [{"start": 0, "end": len(audio)}]
 
@@ -104,7 +109,7 @@ def _energy_vad_trim(audio: np.ndarray, sr: int, frame_ms: int = 30, threshold_r
         return audio
 
     first = np.argmax(mask)
-    last = len(mask) - 1 - np.argmax(mask[::-1])
+    last = int(len(mask) - 1 - np.argmax(mask[::-1]))
     start_sample = first * frame_len
     end_sample = min(len(audio), (last + 1) * frame_len)
     return audio[start_sample:end_sample]
@@ -118,11 +123,20 @@ def get_speech_segments(audio: np.ndarray, sr: int = 16000, use_silero: bool = T
 
     if use_silero:
         try:
+            if torch is None:
+                raise ImportError("torch is not available")
             model, utils = _get_silero()
             if model is not None and utils is not None:
                 get_speech_ts = utils.get_speech_timestamps
                 audio_t = torch.tensor(audio, dtype=torch.float32)
-                speech_timestamps = get_speech_ts(audio_t, model, sampling_rate=sr)
+                speech_timestamps = get_speech_ts(
+                    audio_t,
+                    model,
+                    sampling_rate=sr,
+                    min_silence_duration_ms=750,  # Bridge pauses between words up to 750ms
+                    min_speech_duration_ms=250,
+                    threshold=0.3
+                )
                 if speech_timestamps:
                     return [(int(t["start"]), int(t["end"])) for t in speech_timestamps]
         except Exception:
@@ -161,8 +175,17 @@ def apply_vad(audio: np.ndarray, sr: int = 16000, use_silero: bool = True):
 
             get_speech_ts = utils.get_speech_timestamps
             # model expects torch tensor on cpu
+            if torch is None:
+                raise ImportError("torch is not available")
             audio_t = torch.tensor(audio, dtype=torch.float32)
-            speech_timestamps = get_speech_ts(audio_t, model, sampling_rate=sr)
+            speech_timestamps = get_speech_ts(
+                audio_t,
+                model,
+                sampling_rate=sr,
+                min_silence_duration_ms=750,  # Bridge pauses between words up to 750ms
+                min_speech_duration_ms=250,
+                threshold=0.3
+            )
 
             if not speech_timestamps:
                 return _energy_vad_trim(audio, sr)

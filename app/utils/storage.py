@@ -1,5 +1,8 @@
+import logging
 import os
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 BASE_DIR = os.path.join("app", "data", "familiar_embeddings")
 EXPECTED_DIM = 192
@@ -36,17 +39,17 @@ def load_user_embeddings(name: str):
         try:
             arr = np.load(path)
         except Exception:
-            print(f"[storage] Warning: failed to load {path}")
+            logger.warning("[storage] Failed to load embedding at %s", path)
             continue
 
         arr = np.asarray(arr, dtype=np.float32).squeeze()
 
         if arr.ndim != 1:
-            print(f"[storage] Warning: skipping embedding with wrong ndim {arr.shape} at {path}")
+            logger.warning("[storage] Skipping embedding with wrong ndim %s at %s", arr.shape, path)
             continue
 
         if arr.shape[0] != EXPECTED_DIM:
-            print(f"[storage] Warning: skipping embedding with wrong length {arr.shape} at {path}")
+            logger.warning("[storage] Skipping embedding with wrong length %s at %s", arr.shape, path)
             continue
 
         embeddings.append(arr)

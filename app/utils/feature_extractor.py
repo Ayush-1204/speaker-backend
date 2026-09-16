@@ -10,8 +10,14 @@ import zipfile
 
 import numpy as np
 import soundfile as sf
-import librosa
-import torch
+try:
+    import librosa
+except Exception:
+    librosa = None
+try:
+    import torch
+except Exception:
+    torch = None
 import requests
 
 from . import config
@@ -176,7 +182,7 @@ def _get_redimnet():
                 }
                 if load_source is not None:
                     hub_kwargs["source"] = load_source
-                _redimnet = torch.hub.load(
+                _redimnet = torch.hub.load(  # type: ignore
                     **hub_kwargs,
                 )
                 logger.info(
@@ -208,8 +214,8 @@ def _get_redimnet():
             raise RuntimeError("Failed to load ReDimNet model via torch.hub") from last_exc
 
         _redimnet_load_failures = 0
-        _redimnet.eval()
-        _redimnet.to(config.DEVICE)
+        _redimnet.eval()  # type: ignore
+        _redimnet.to(config.DEVICE)  # type: ignore
     return _redimnet
 
 
@@ -218,6 +224,8 @@ def _load_audio(path: str, target_sr: int = 16000) -> Tuple[np.ndarray, int]:
     if data.ndim == 2:
         data = data.mean(axis=1)
     if sr != target_sr:
+        if librosa is None:
+            raise ImportError("librosa is required for resampling")
         data = librosa.resample(data, orig_sr=sr, target_sr=target_sr)
     return normalize_waveform(data.astype(np.float32)), target_sr
 
@@ -231,10 +239,12 @@ def _embed_waveform_array(waveform: np.ndarray, sr: int = 16000) -> np.ndarray:
     if len(w) < min_s:
         w = np.pad(w, (0, min_s - len(w)), mode="reflect")
 
+    if torch is None:
+        raise ImportError("torch is not available")
     t = torch.tensor(w, dtype=torch.float32, device=config.DEVICE).unsqueeze(0)
     model = _get_redimnet()
     with torch.no_grad():
-        emb_t = model(t)
+        emb_t = model(t)  # type: ignore
     emb = emb_t.squeeze().detach().cpu().numpy().astype(np.float32).reshape(-1)
     if emb.shape[0] != config.EMBEDDING_DIM:
         raise RuntimeError(f"Embedding dim {emb.shape}; expected ({config.EMBEDDING_DIM},)")

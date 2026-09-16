@@ -12,8 +12,8 @@ import hashlib
 import hmac
 import base64
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, field
 from itertools import combinations
 
@@ -29,16 +29,19 @@ from app.database.models import (
     Device,
     DeviceRole,
     EnrolledSpeaker,
+    SpeakerRole,
     Alert as AlertModel,
     AuthCredential,
     AuthProvider,
+    HouseholdConfig,
 )
 from app.utils import config
 from app.utils.audio_preprocess import normalize_waveform
 from app.utils.feature_extractor import embed_waveform_chunks
 from app.utils.speech_gate import assess_speech_likeness
 from app.utils.vad import get_speech_segments
-from app.utils.yamnet_classifier import classify_audio_event_windowed
+from app.services.session_manager import persist_session, delete_session, save_buffer
+from app.utils.yamnet_classifier import classify_audio_event_windowed, classify_distress_event
 
 DATA_ROOT = (os.environ.get("SAFEEAR_DATA_ROOT", os.path.join("app", "data")) or "").strip() or os.path.join("app", "data")
 TENANTS_ROOT = os.path.join(DATA_ROOT, "tenants")
@@ -109,7 +112,7 @@ def _as_uuid(value: Any, field_name: str) -> uuid.UUID:
         raise HTTPException(status_code=422, detail=f"invalid_{field_name}") from exc
 
 
-def _ensure_parent_dirs(parent_id: str) -> Dict[str, str]:
+def _ensure_parent_dirs(parent_id: Union[str, uuid.UUID]) -> Dict[str, str]:
     base = os.path.join(TENANTS_ROOT, str(parent_id))
     embeddings = os.path.join(base, "embeddings")
     alerts = os.path.join(base, "alerts")
@@ -164,24 +167,18 @@ def _perf_metrics(waveform_len: int, sr: int, started_at: float) -> Dict[str, fl
 
 
 def _b64(data: bytes) -> str:
-    import base64
     return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
 
 
 def _b64d(data: str) -> bytes:
-    import base64
     pad = "=" * ((4 - len(data) % 4) % 4)
     return base64.urlsafe_b64decode(data + pad)
 
 
 def make_jwt(parent_id: str) -> str:
-    import hmac
-    import hashlib
-    import json
-
     header = {"alg": "HS256", "typ": "JWT"}
     payload = {
-        "sub": str(parent_id),
+        "sub": parent_id,
         "iat": int(time.time()),
         "exp": int(time.time()) + JWT_EXPIRE_SEC,
         "jti": secrets.token_urlsafe(8),
@@ -194,10 +191,6 @@ def make_jwt(parent_id: str) -> str:
 
 
 def parse_jwt(token: str) -> Dict[str, Any]:
-    import hmac
-    import hashlib
-    import json
-
     try:
         h, p, s = token.split(".")
     except ValueError as exc:
@@ -224,10 +217,10 @@ def upsert_parent(db: Session, google_sub: str, email: Optional[str], display_na
     else:
         parent.email = email or parent.email
         parent.display_name = display_name or parent.display_name
-        parent.updated_at = datetime.utcnow()
+        parent.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(parent)
-    _ensure_parent_dirs(parent.id)
+    _ensure_parent_dirs(str(parent.id))
     return parent
 
 
@@ -290,14 +283,14 @@ def register_parent_with_email(
     db.add(cred)
     db.commit()
     db.refresh(parent)
-    _ensure_parent_dirs(parent.id)
+    _ensure_parent_dirs(str(parent.id))
     return parent
 
 
 def login_parent_with_email(db: Session, email: str, password: str) -> Parent:
     norm_email = _normalize_email(email)
     cred = db.query(AuthCredential).filter(AuthCredential.email == norm_email).first()
-    if cred is None or not _verify_password(password, cred.password_hash):
+    if cred is None or not _verify_password(password, str(getattr(cred, "password_hash"))):
         raise HTTPException(status_code=401, detail="invalid_email_or_password")
 
     parent = db.query(Parent).filter(Parent.id == cred.parent_id).first()
@@ -316,15 +309,15 @@ def create_password_reset_token(db: Session, email: str, ttl_sec: int = 3600) ->
     raw = secrets.token_urlsafe(32)
     token_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()
     cred.reset_token_hash = token_hash
-    cred.reset_token_expires_at = datetime.utcfromtimestamp(time.time() + ttl_sec)
-    cred.updated_at = datetime.utcnow()
+    cred.reset_token_expires_at = datetime.fromtimestamp(time.time() + ttl_sec, timezone.utc)
+    cred.updated_at = datetime.now(timezone.utc)
     db.commit()
     return raw
 
 
 def reset_password_with_token(db: Session, token: str, new_password: str) -> None:
     token_hash = hashlib.sha256((token or "").encode("utf-8")).hexdigest()
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     cred = (
         db.query(AuthCredential)
         .filter(
@@ -340,7 +333,7 @@ def reset_password_with_token(db: Session, token: str, new_password: str) -> Non
     cred.password_hash = _hash_password(new_password)
     cred.reset_token_hash = None
     cred.reset_token_expires_at = None
-    cred.updated_at = datetime.utcnow()
+    cred.updated_at = datetime.now(timezone.utc)
     db.commit()
 
 
@@ -397,12 +390,10 @@ def create_device(
             token_owner = db.query(Device).filter(Device.device_token == token, Device.id != existing.id).first()
             if token_owner is not None:
                 token_owner.device_token = None
-                token_owner.updated_at = datetime.utcnow()
+                token_owner.updated_at = datetime.now(timezone.utc)
             existing.device_token = token
         elif token is not None:
             existing.device_token = token
-        if existing.monitoring_enabled is None:
-            existing.monitoring_enabled = True
         if previous_role != role and previous_role == DeviceRole.child_device and role == DeviceRole.parent_device:
             existing.monitoring_enabled = False
             try:
@@ -413,7 +404,7 @@ def create_device(
         elif previous_role != role and role == DeviceRole.child_device:
             existing.monitoring_enabled = True
             _send_monitoring_command_to_device(existing, True)
-        existing.updated_at = datetime.utcnow()
+        existing.updated_at = datetime.now(timezone.utc)
         db.commit()
         db.refresh(existing)
         return existing
@@ -430,8 +421,6 @@ def create_device(
                 existing.device_name = normalized_name
             existing.role = role
             existing.device_token = token
-            if existing.monitoring_enabled is None:
-                existing.monitoring_enabled = True
             if previous_role != role and previous_role == DeviceRole.child_device and role == DeviceRole.parent_device:
                 existing.monitoring_enabled = False
                 try:
@@ -442,7 +431,7 @@ def create_device(
             elif previous_role != role and role == DeviceRole.child_device:
                 existing.monitoring_enabled = True
                 _send_monitoring_command_to_device(existing, True)
-            existing.updated_at = datetime.utcnow()
+            existing.updated_at = datetime.now(timezone.utc)
             db.commit()
             db.refresh(existing)
             return existing
@@ -469,7 +458,7 @@ def update_device_token(db: Session, parent_id: str, device_id: str, device_toke
         return device
 
     try:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         if token is not None:
             (
                 db.query(Device)
@@ -507,7 +496,7 @@ def list_devices(db: Session, parent_id: str, since_ms: Optional[int] = None) ->
     parent_uuid = _as_uuid(parent_id, "parent_id")
     query = db.query(Device).filter(Device.parent_id == parent_uuid)
     if since_ms is not None:
-        since_dt = datetime.utcfromtimestamp(float(since_ms) / 1000.0)
+        since_dt = datetime.fromtimestamp(float(since_ms) / 1000.0, timezone.utc)
         query = query.filter(Device.updated_at >= since_dt)
     return query.order_by(Device.created_at.desc()).all()
 
@@ -564,8 +553,8 @@ def set_device_monitoring(
     monitoring_enabled: bool,
 ) -> Tuple[Device, bool]:
     device = get_device(db, parent_id, device_id)
-    device.monitoring_enabled = bool(monitoring_enabled)
-    device.updated_at = datetime.utcnow()
+    device.monitoring_enabled = monitoring_enabled
+    device.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(device)
 
@@ -577,7 +566,7 @@ def set_device_monitoring(
 
     command_sent = False
     if device.role == DeviceRole.child_device:
-        command_sent = _send_monitoring_command_to_device(device, bool(monitoring_enabled))
+        command_sent = _send_monitoring_command_to_device(device, monitoring_enabled)
     return device, command_sent
 
 
@@ -592,16 +581,16 @@ def update_device_heartbeat(
     device = get_device(db, parent_id, device_id)
 
     if battery_percent is not None:
-        battery = int(max(0, min(100, battery_percent)))
+        battery = max(0, min(100, battery_percent))
         device.battery_percent = battery
     if is_online is not None:
-        device.is_online = bool(is_online)
+        device.is_online = is_online
     if monitoring_enabled is not None:
-        device.monitoring_enabled = bool(monitoring_enabled)
+        device.monitoring_enabled = monitoring_enabled
 
-    device.last_heartbeat_at = datetime.utcnow()
-    device.last_activity_at = datetime.utcnow()  # Mark activity on heartbeat
-    device.updated_at = datetime.utcnow()
+    device.last_heartbeat_at = datetime.now(timezone.utc)
+    device.last_activity_at = datetime.now(timezone.utc)  # Mark activity on heartbeat
+    device.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(device)
     return device
@@ -618,12 +607,12 @@ def update_device_battery(
     if battery_percent is None:
         return device
 
-    battery = int(max(0, min(100, battery_percent)))
+    battery = max(0, min(100, battery_percent))
     if device.battery_percent == battery:
         return device
 
     device.battery_percent = battery
-    device.updated_at = datetime.utcnow()
+    device.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(device)
     return device
@@ -646,7 +635,9 @@ def get_effective_online(device: Device) -> bool:
     if not latest_activity:
         return False
     
-    age_sec = (datetime.utcnow() - latest_activity).total_seconds()
+    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+    latest_activity = latest_activity.replace(tzinfo=None)
+    age_sec = (now_utc - latest_activity).total_seconds()
     return age_sec <= float(DEVICE_ONLINE_TTL_SEC)
 
 
@@ -670,7 +661,7 @@ def update_device_activity(db: Session, parent_id: str, device_id: str) -> Devic
     This keeps get_effective_online() returning True during active streaming.
     """
     device = get_device(db, parent_id, device_id)
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     
     # Only update if activity timestamp is outdated (avoid excessive DB updates)
     if device.last_activity_at is None or \
@@ -688,8 +679,8 @@ def update_device_location(db: Session, parent_id: str, device_id: str, lat: Opt
         device.last_location_lat = lat
     if lon is not None:
         device.last_location_lon = lon
-    device.last_location_ts = datetime.utcnow()
-    device.last_activity_at = datetime.utcnow()  # Mark activity on location update
+    device.last_location_ts = datetime.now(timezone.utc)
+    device.last_activity_at = datetime.now(timezone.utc)  # Mark activity on location update
     db.commit()
     db.refresh(device)
     return device
@@ -718,17 +709,17 @@ def create_speaker(db: Session, parent_id: str, display_name: str) -> EnrolledSp
         primary = max(
             matches,
             key=lambda sp: (
-                _count_speaker_embedding_files(parent_id, sp.id),
-                int(sp.sample_count or 0),
+                _count_speaker_embedding_files(parent_id, str(sp.id)),
+                int(sp.sample_count or 0),  # type: ignore
                 sp.updated_at,
             ),
         )
-        primary_dir = _speaker_dir(parent_id, primary.id)
+        primary_dir = _speaker_dir(parent_id, str(primary.id))
         os.makedirs(primary_dir, exist_ok=True)
 
         # Merge duplicate rows/files into the primary row so UI shows a single entry.
         for dup in [sp for sp in matches if sp.id != primary.id]:
-            dup_dir = _speaker_dir(parent_id, dup.id)
+            dup_dir = _speaker_dir(parent_id, str(dup.id))
             moved = 0
             if os.path.isdir(dup_dir):
                 existing_files = [f for f in os.listdir(primary_dir) if f.endswith(".npy")]
@@ -749,13 +740,13 @@ def create_speaker(db: Session, parent_id: str, display_name: str) -> EnrolledSp
                 except OSError:
                     pass
 
-            primary.sample_count = int(primary.sample_count or 0) + int(max(moved, int(dup.sample_count or 0)))
+            primary.sample_count = int(primary.sample_count or 0) + int(max(moved, int(dup.sample_count or 0)))  # type: ignore
             db.delete(dup)
 
         actual_count, _ = _sync_speaker_sample_count(primary, parent_id)
         primary.sample_count = actual_count
         primary.display_name = normalized_name
-        primary.updated_at = datetime.utcnow()
+        primary.updated_at = datetime.now(timezone.utc)
         db.commit()
         db.refresh(primary)
         return primary
@@ -769,11 +760,11 @@ def create_speaker(db: Session, parent_id: str, display_name: str) -> EnrolledSp
     db.add(speaker)
     db.commit()
     db.refresh(speaker)
-    os.makedirs(_speaker_dir(parent_id, speaker.id), exist_ok=True)
+    os.makedirs(_speaker_dir(parent_id, str(speaker.id)), exist_ok=True)
     return speaker
 
 
-def _speaker_dir(parent_id: str, speaker_id: str) -> str:
+def _speaker_dir(parent_id: Union[str, uuid.UUID], speaker_id: Union[str, uuid.UUID]) -> str:
     dirs = _ensure_parent_dirs(parent_id)
     return os.path.join(dirs["embeddings"], str(speaker_id))
 
@@ -782,7 +773,7 @@ def get_speaker_embedding_dir(parent_id: str, speaker_id: str) -> str:
     return _speaker_dir(parent_id, speaker_id)
 
 
-def _count_speaker_embedding_files(parent_id: str, speaker_id: str) -> int:
+def _count_speaker_embedding_files(parent_id: Union[str, uuid.UUID], speaker_id: Union[str, uuid.UUID]) -> int:
     sdir = _speaker_dir(parent_id, speaker_id)
     if not os.path.isdir(sdir):
         return 0
@@ -790,15 +781,16 @@ def _count_speaker_embedding_files(parent_id: str, speaker_id: str) -> int:
 
 
 def _sync_speaker_sample_count(speaker: EnrolledSpeaker, parent_id: str) -> Tuple[int, bool]:
-    actual_count = _count_speaker_embedding_files(parent_id, speaker.id)
-    changed = int(speaker.sample_count or 0) != actual_count
+    actual_count = _count_speaker_embedding_files(parent_id, str(speaker.id))
+    sc = speaker.sample_count
+    changed = (int(str(sc)) if sc is not None else 0) != actual_count
     if changed:
         speaker.sample_count = actual_count
-        speaker.updated_at = datetime.utcnow()
+        speaker.updated_at = datetime.now(timezone.utc)
     return actual_count, changed
 
 
-def _speaker_avatar_candidates(parent_id: str, speaker_id: str) -> List[str]:
+def _speaker_avatar_candidates(parent_id: Union[str, uuid.UUID], speaker_id: Union[str, uuid.UUID]) -> List[str]:
     sdir = _speaker_dir(parent_id, speaker_id)
     return [
         os.path.join(sdir, "profile.jpg"),
@@ -822,7 +814,7 @@ def save_speaker_avatar(
     content_type: str,
 ) -> str:
     speaker = get_speaker(db, parent_id, speaker_id)
-    sdir = _speaker_dir(parent_id, speaker.id)
+    sdir = _speaker_dir(parent_id, str(speaker.id))
     os.makedirs(sdir, exist_ok=True)
 
     normalized_type = (content_type or "").lower().strip()
@@ -830,7 +822,7 @@ def save_speaker_avatar(
     target = os.path.join(sdir, f"profile{ext}")
 
     # Ensure only one avatar file exists for stable storage and no orphaned images.
-    for existing in _speaker_avatar_candidates(parent_id, speaker.id):
+    for existing in _speaker_avatar_candidates(parent_id, str(speaker.id)):
         if os.path.isfile(existing):
             try:
                 os.remove(existing)
@@ -840,7 +832,7 @@ def save_speaker_avatar(
     with open(target, "wb") as f:
         f.write(image_bytes)
 
-    speaker.updated_at = datetime.utcnow()
+    speaker.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(speaker)
     return target
@@ -888,14 +880,13 @@ def get_speaker(db: Session, parent_id: str, speaker_id: str) -> EnrolledSpeaker
 def rename_speaker(db: Session, parent_id: str, speaker_id: str, new_name: str) -> EnrolledSpeaker:
     speaker = get_speaker(db, parent_id, speaker_id)
     speaker.display_name = new_name
-    speaker.updated_at = datetime.utcnow()
+    speaker.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(speaker)
     return speaker
 
 
 def delete_speaker(db: Session, parent_id: str, speaker_id: str) -> None:
-    import shutil
     speaker = get_speaker(db, parent_id, speaker_id)
     db.delete(speaker)
     db.commit()
@@ -917,15 +908,32 @@ def save_speaker_embedding(db: Session, parent_id: str, speaker_id: str, emb: np
 
     speaker = get_speaker(db, parent_id, speaker_id)
     speaker.sample_count = idx
-    speaker.updated_at = datetime.utcnow()
+    speaker.updated_at = datetime.now(timezone.utc)
     db.commit()
     return fpath
 
 
-def load_parent_embeddings(db: Session, parent_id: str) -> Dict[str, List[np.ndarray]]:
-    out: Dict[str, List[np.ndarray]] = {}
+# Structured container for per-speaker gallery info used by the scoring path.
+# Keyed by speaker_id string; each value carries embeddings plus metadata
+# needed for ZT-norm and role-aware decision logic.
+_SpeakerGalleryEntry = Dict[str, Any]  # keys: embs, role, t_high_override, cohort_mean, cohort_std
+
+
+def load_parent_embeddings(
+    db: Session, parent_id: str
+) -> Dict[str, "_SpeakerGalleryEntry"]:
+    """Load all enrolled speaker embeddings for a parent.
+
+    Returns a dict keyed by speaker_id.  Each value is a dict with:
+        embs            : List[np.ndarray]  L2-normalised 192-D vectors
+        role            : str              "familiar_adult" | "child_self"
+        t_high_override : float | None     per-speaker threshold (child uses lower value)
+        cohort_mean     : float | None     ZT-norm pre-computed mean
+        cohort_std      : float | None     ZT-norm pre-computed std
+    """
+    out: Dict[str, Any] = {}
     for sp in list_speakers(db, parent_id):
-        sdir = _speaker_dir(parent_id, sp.id)
+        sdir = _speaker_dir(parent_id, str(sp.id))
         if not os.path.isdir(sdir):
             continue
         embs: List[np.ndarray] = []
@@ -943,14 +951,20 @@ def load_parent_embeddings(db: Session, parent_id: str) -> Dict[str, List[np.nda
                     "EMBEDDING_DIM_MISMATCH | file=%s | expected=%s | got=%s",
                     fpath,
                     config.EXPECTED_EMBEDDING_DIM,
-                    int(arr.shape[0]) if arr.ndim == 1 else -1,
+                    arr.shape[0] if arr.ndim == 1 else -1,
                 )
                 raise ValueError(
                     f"dim mismatch for embedding {fpath}: expected {config.EXPECTED_EMBEDDING_DIM}, got {arr.shape[0] if arr.ndim == 1 else 'non-1d'}"
                 )
             embs.append(arr)
         if embs:
-            out[str(sp.id)] = embs
+            out[str(sp.id)] = {
+                "embs": embs,
+                "role": getattr(sp, "role", "familiar_adult") or "familiar_adult",
+                "t_high_override": getattr(sp, "t_high_override", None),
+                "cohort_mean": getattr(sp, "cohort_mean", None),
+                "cohort_std": getattr(sp, "cohort_std", None),
+            }
     return out
 
 
@@ -962,19 +976,51 @@ def _cos(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / (an * bn))
 
 
-def score_against_parent(db: Session, parent_id: str, query_embs: List[np.ndarray]) -> Tuple[float, Optional[str]]:
+def score_against_parent(
+    db: Session, parent_id: str, query_embs: List[np.ndarray]
+) -> Tuple[float, Optional[str], Optional[str]]:
     candidates = load_parent_embeddings(db, parent_id)
     return _score_against_candidates(candidates, query_embs, parent_id)
 
 
 def _score_against_candidates(
-    candidates: Dict[str, List[np.ndarray]], query_embs: List[np.ndarray], parent_id: Optional[str] = None
-) -> Tuple[float, Optional[str]]:
+    candidates: Dict[str, Any],
+    query_embs: List[np.ndarray],
+    parent_id: Optional[str] = None,
+    t_high_global: float = T_HIGH,
+) -> Tuple[float, Optional[str], Optional[str]]:
+    """Score query embeddings against all enrolled speakers.
+
+    Args:
+        candidates  : dict from load_parent_embeddings() — each value is a
+                      _SpeakerGalleryEntry dict with keys: embs, role,
+                      t_high_override, cohort_mean, cohort_std.
+        query_embs  : list of L2-normalised query embeddings for this chunk.
+        parent_id   : used for logging only.
+        t_high_global : household / global T_HIGH used for ZT-norm context.
+
+    Returns:
+        (best_score, best_speaker_id, best_speaker_role)
+        best_score is ZT-normalised when cohort stats are available, otherwise raw.
+    """
     best = -1.0
     best_speaker: Optional[str] = None
-    speaker_scores = {}
-    
-    for sid, embs in candidates.items():
+    best_role: Optional[str] = None
+    speaker_scores: Dict[str, float] = {}
+
+    for sid, entry in candidates.items():
+        # Support both legacy List[np.ndarray] (no metadata) and new dict format.
+        if isinstance(entry, dict):
+            embs = entry["embs"]
+            role = entry.get("role", "familiar_adult")
+            cohort_mean = entry.get("cohort_mean")
+            cohort_std = entry.get("cohort_std")
+        else:
+            embs = entry  # backward compat
+            role = "familiar_adult"
+            cohort_mean = None
+            cohort_std = None
+
         per_chunk_best: List[float] = []
         for q in query_embs:
             chunk_best = max((_cos(q, ref) for ref in embs), default=-1.0)
@@ -983,25 +1029,44 @@ def _score_against_candidates(
         if not per_chunk_best:
             continue
 
-        # Robust against accidental one-off matches from strangers.
+        # Robust score: up-weight median, down-weight a single lucky match.
         top_chunks = sorted(per_chunk_best, reverse=True)[: min(2, len(per_chunk_best))]
-        speaker_score = float((0.7 * np.median(per_chunk_best)) + (0.3 * np.mean(top_chunks)))
+        raw_score = float((0.7 * np.median(per_chunk_best)) + (0.3 * np.mean(top_chunks)))
+
+        # ZT-norm: z-score using pre-computed cohort statistics.
+        # If cohort stats are missing (enrollment predates Change 6), use raw score.
+        if cohort_mean is not None and cohort_std is not None and cohort_std > 1e-6:
+            from app.utils.score_normaliser import zt_norm
+            speaker_score = float(np.clip(zt_norm(raw_score, cohort_mean, cohort_std), 0.0, 1.0))
+            logger.debug(
+                "ZT_NORM | speaker_id=%s | raw=%.4f | mean=%.4f | std=%.4f | normed=%.4f",
+                sid, raw_score, cohort_mean, cohort_std, speaker_score,
+            )
+        else:
+            speaker_score = raw_score
+
         speaker_scores[sid] = speaker_score
         if speaker_score > best:
             best = speaker_score
             best_speaker = sid
-    
+            best_role = role
+
     if speaker_scores:
         logger.debug(
-            f"SPEAKER_SCORING | parent_id={parent_id or 'unknown'} | scores={{{', '.join(f'{name}:{score:.4f}' for name, score in speaker_scores.items())}}}"
+            "SPEAKER_SCORING | parent_id=%s | scores={%s}",
+            parent_id or "unknown",
+            ", ".join(f"{sid}:{score:.4f}" for sid, score in speaker_scores.items()),
         )
-    
+
     if best < 0:
-        logger.info(f"NO_SPEAKER_MATCH | parent_id={parent_id or 'unknown'} | score=0.0")
-        return 0.0, None
-    
-    logger.info(f"BEST_SPEAKER_MATCHED | parent_id={parent_id or 'unknown'} | speaker_id={best_speaker} | score={best:.4f}")
-    return float(best), best_speaker
+        logger.info("NO_SPEAKER_MATCH | parent_id=%s | score=0.0", parent_id or "unknown")
+        return 0.0, None, None
+
+    logger.info(
+        "BEST_SPEAKER_MATCHED | parent_id=%s | speaker_id=%s | role=%s | score=%.4f",
+        parent_id or "unknown", best_speaker, best_role, best,
+    )
+    return float(best), best_speaker, best_role
 
 
 def create_alert(
@@ -1012,25 +1077,297 @@ def create_alert(
     confidence_score: float,
     latitude: Optional[float],
     longitude: Optional[float],
+    alert_type: str = "unenrolled_contact",
 ) -> AlertModel:
+    """Persist an alert record.
+
+    alert_type: "unenrolled_contact" (default) | "distress"
+    """
     parent_uuid = _as_uuid(parent_id, "parent_id")
     device_uuid = _as_uuid(device_id, "device_id")
     alert = AlertModel(
         id=uuid.uuid4(),
         parent_id=parent_uuid,
         device_id=device_uuid,
-        timestamp=datetime.utcnow(),
+        timestamp=datetime.now(timezone.utc),
         confidence_score=float(confidence_score),
         audio_clip_path=audio_clip_path,
         latitude=latitude,
         longitude=longitude,
         acknowledged_at=None,
+        alert_type=alert_type,
     )
     db.add(alert)
     db.commit()
     db.refresh(alert)
-    logger.info(f"ALERT_CREATED | alert_id={alert.id} | parent_id={parent_id} | device_id={device_id} | confidence_score={confidence_score:.4f} | location=({latitude}, {longitude})")
+    logger.info(
+        "ALERT_CREATED | alert_id=%s | parent_id=%s | device_id=%s | alert_type=%s | confidence_score=%.4f | location=(%s, %s)",
+        alert.id, parent_id, device_id, alert_type, confidence_score, latitude, longitude,
+    )
     return alert
+
+
+# ---------------------------------------------------------------------------
+# Change 4: Confusability detection
+# ---------------------------------------------------------------------------
+
+def check_enrollment_confusability(
+    db: Session,
+    parent_id: str,
+    new_speaker_id: str,
+    threshold: float = 0.75,
+) -> List[Tuple[str, float]]:
+    """Return list of (speaker_id, similarity) for enrolled speakers whose
+    centroid is within `threshold` cosine distance of the newly enrolled speaker.
+
+    Called after every enrollment or re-enrollment.  Conflicts at ≥ 0.75 cosine
+    indicate the enrolled pair will frequently cross-match in inference, which
+    suppresses alerts that should fire.
+
+    Returns an empty list when there are fewer than 2 speakers total.
+    """
+    all_embeddings = load_parent_embeddings(db, parent_id)
+    new_entry = all_embeddings.pop(new_speaker_id, None)
+    if not new_entry or not other_embeddings_exist(all_embeddings):
+        return []
+
+    new_embs: List[np.ndarray] = new_entry["embs"] if isinstance(new_entry, dict) else new_entry
+    new_centroid = _compute_query_centroid(new_embs)
+    if new_centroid is None:
+        return []
+
+    conflicts: List[Tuple[str, float]] = []
+    for sid, entry in all_embeddings.items():
+        embs: List[np.ndarray] = entry["embs"] if isinstance(entry, dict) else entry
+        other_centroid = _compute_query_centroid(embs)
+        if other_centroid is None:
+            continue
+        sim = _cos(new_centroid, other_centroid)
+        if sim >= threshold:
+            conflicts.append((sid, float(sim)))
+
+    conflicts.sort(key=lambda x: -x[1])
+    if conflicts:
+        logger.warning(
+            "CONFUSABILITY_DETECTED | parent_id=%s | new_speaker=%s | conflicts=%s",
+            parent_id,
+            new_speaker_id,
+            [(sid, f"{s:.3f}") for sid, s in conflicts],
+        )
+    return conflicts
+
+
+def other_embeddings_exist(gallery: Dict[str, Any]) -> bool:
+    """True if the gallery contains at least one speaker entry."""
+    return bool(gallery)
+
+
+# ---------------------------------------------------------------------------
+# Change 5: Per-household calibrated thresholds
+# ---------------------------------------------------------------------------
+
+_GLOBAL_T_HIGH = float(os.environ.get("SAFEEAR_T_HIGH", "0.47"))
+_GLOBAL_T_LOW = float(os.environ.get("SAFEEAR_T_LOW", "0.31"))
+
+
+def get_household_thresholds(db: Session, parent_id: str) -> Tuple[float, float]:
+    """Return (T_HIGH, T_LOW) for this household.
+
+    Reads from HouseholdConfig if a calibrated record exists; falls back to
+    global env-var defaults.  The calibrated values are set by
+    auto_calibrate_thresholds() when enough enrollment data is available.
+    """
+    try:
+        parent_uuid = _as_uuid(parent_id, "parent_id")
+        cfg = db.query(HouseholdConfig).filter(
+            HouseholdConfig.parent_id == parent_uuid
+        ).first()
+        if cfg is not None and cfg.t_high is not None and cfg.t_low is not None:
+            return float(getattr(cfg, "t_high")), float(getattr(cfg, "t_low"))
+    except Exception as exc:
+        logger.warning("HOUSEHOLD_THRESHOLD_LOAD_FAILED | parent_id=%s | reason=%s", parent_id, exc)
+    return _GLOBAL_T_HIGH, _GLOBAL_T_LOW
+
+
+def auto_calibrate_thresholds(db: Session, parent_id: str) -> Optional[Tuple[float, float]]:
+    """Compute EER-based T_HIGH / T_LOW from current enrollment gallery.
+
+    Called automatically at the end of compute_and_store_enrollment_quality
+    when sample_count >= 5.  Saves result to HouseholdConfig.
+
+    Returns (T_HIGH, T_LOW) or None if calibration was skipped.
+    """
+    all_embeddings = load_parent_embeddings(db, parent_id)
+    if not all_embeddings:
+        return None
+
+    # Collect target scores (leave-one-out: each embedding scored against
+    # the other embeddings of the same speaker).
+    target_scores: List[float] = []
+    for sid, entry in all_embeddings.items():
+        embs: List[np.ndarray] = entry["embs"] if isinstance(entry, dict) else entry
+        if len(embs) < 2:
+            continue
+        for i, q in enumerate(embs):
+            refs = embs[:i] + embs[i + 1:]
+            scores = [_cos(q, r) for r in refs]
+            if scores:
+                target_scores.append(float(np.mean(scores)))
+
+    if len(target_scores) < 3:
+        logger.info(
+            "AUTO_CALIBRATE_SKIPPED | parent_id=%s | reason=insufficient_target_scores | n=%d",
+            parent_id, len(target_scores),
+        )
+        return None
+
+    # Collect impostor scores by cross-scoring speakers against each other.
+    impostor_scores: List[float] = []
+    speaker_ids = list(all_embeddings.keys())
+    for i, sid_a in enumerate(speaker_ids):
+        entry_a = all_embeddings[sid_a]
+        embs_a: List[np.ndarray] = entry_a["embs"] if isinstance(entry_a, dict) else entry_a
+        for sid_b in speaker_ids[i + 1:]:
+            entry_b = all_embeddings[sid_b]
+            embs_b: List[np.ndarray] = entry_b["embs"] if isinstance(entry_b, dict) else entry_b
+            for q in embs_a[:3]:  # cap to 3 to avoid N² blowup
+                scores = [_cos(q, r) for r in embs_b[:3]]
+                impostor_scores.extend(scores)
+
+    if len(impostor_scores) < 3:
+        # Not enough cross-speaker data; need more enrolled speakers.
+        logger.info(
+            "AUTO_CALIBRATE_SKIPPED | parent_id=%s | reason=need_more_speakers | impostor_n=%d",
+            parent_id, len(impostor_scores),
+        )
+        return None
+
+    try:
+        from app.utils.calibration import find_eer_threshold
+        eer_t, eer = find_eer_threshold(target_scores, impostor_scores)
+    except Exception:
+        # Fallback: use global defaults
+        logger.warning("AUTO_CALIBRATE_FAILED | parent_id=%s", parent_id, exc_info=True)
+        return None
+
+    # Margin below EER threshold for T_LOW
+    margin = float(os.environ.get("SAFEEAR_T_MARGIN", "0.10"))
+    min_t_high = 0.45 if _IS_REDIMNET2 else 0.30
+    t_high = float(np.clip(eer_t, min_t_high, 0.90))
+    t_low = float(np.clip(eer_t - margin, min_t_high - 0.15, t_high - 0.05))
+
+    try:
+        parent_uuid = _as_uuid(parent_id, "parent_id")
+        cfg = db.query(HouseholdConfig).filter(
+            HouseholdConfig.parent_id == parent_uuid
+        ).first()
+        sample_count = sum(
+            len(e["embs"] if isinstance(e, dict) else e)
+            for e in all_embeddings.values()
+        )
+        if cfg is None:
+            cfg = HouseholdConfig(
+                id=uuid.uuid4(),
+                parent_id=parent_uuid,
+                t_high=t_high,
+                t_low=t_low,
+                calibrated_at=datetime.now(timezone.utc),
+                calibration_sample_count=sample_count,
+            )
+            db.add(cfg)
+        else:
+            cfg.t_high = t_high
+            cfg.t_low = t_low
+            cfg.calibrated_at = datetime.now(timezone.utc)
+            cfg.calibration_sample_count = sample_count
+            cfg.updated_at = datetime.now(timezone.utc)
+        db.commit()
+        logger.info(
+            "AUTO_CALIBRATE_DONE | parent_id=%s | t_high=%.4f | t_low=%.4f | eer=%.4f | samples=%d",
+            parent_id, t_high, t_low, eer, sample_count,
+        )
+    except Exception as exc:
+        logger.error("AUTO_CALIBRATE_SAVE_FAILED | parent_id=%s | reason=%s", parent_id, exc)
+
+    return t_high, t_low
+
+
+def get_household_config_dict(db: Session, parent_id: str) -> Dict[str, Any]:
+    """Change 12: Fetch context gates and thresholds."""
+    try:
+        parent_uuid = uuid.UUID(parent_id)
+        cfg = db.query(HouseholdConfig).filter(
+            HouseholdConfig.parent_id == parent_uuid
+        ).first()
+        
+        if not cfg:
+            return {}
+            
+        return {
+            "t_high": cfg.t_high,
+            "t_low": cfg.t_low,
+            "quiet_hours_start": cfg.quiet_hours_start,
+            "quiet_hours_end": cfg.quiet_hours_end,
+            "home_lat": cfg.home_lat,
+            "home_lon": cfg.home_lon,
+            "home_radius_m": cfg.home_radius_m,
+            "party_mode_until": cfg.party_mode_until.isoformat() if cfg.party_mode_until else None,
+        }
+    except Exception as e:
+        logger.error("Failed to fetch household config for parent %s: %s", parent_id, e)
+        return {}
+
+
+def flush_child_drift_scores(db: Session, parent_id: str, speaker_id: str, session_state: 'SessionState') -> Optional[bool]:
+    """Change 10: Update the drift score EMA for the child speaker.
+    Returns True if a drift warning should be emitted, False otherwise.
+    """
+    if not session_state.child_drift_scores:
+        return None
+        
+    try:
+        from app.database.models import EnrolledSpeaker
+        parent_uuid = uuid.UUID(parent_id)
+        sp_uuid = uuid.UUID(speaker_id)
+        
+        sp = db.query(EnrolledSpeaker).filter(
+            EnrolledSpeaker.parent_id == parent_uuid,
+            EnrolledSpeaker.id == sp_uuid
+        ).first()
+        
+        if not sp:
+            session_state.child_drift_scores.clear()
+            return None
+            
+        # Calculate new average of the accumulated scores
+        scores = session_state.child_drift_scores
+        batch_avg = sum(scores) / len(scores)
+        session_state.child_drift_scores.clear()
+        
+        # Exponential moving average (EMA) update
+        if getattr(sp, "drift_score_ema") is None:
+            setattr(sp, "drift_score_ema", float(batch_avg))
+        else:
+            alpha = 0.1  # Update rate
+            current_ema = float(getattr(sp, "drift_score_ema"))
+            setattr(sp, "drift_score_ema", float((alpha * batch_avg) + ((1.0 - alpha) * current_ema)))
+            
+        sp.last_drift_check_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        db.commit()
+        
+        # Check if drift is severe enough to warrant re-enrollment
+        if sp.quality_score and sp.drift_score_ema is not None and sp.drift_score_ema < (sp.quality_score * 0.80):  # type: ignore
+            # Only warn once every 7 days
+            if not sp.drift_alert_sent_at or (datetime.now(timezone.utc).replace(tzinfo=None) - sp.drift_alert_sent_at).total_seconds() > 7 * 86400:
+                sp.drift_alert_sent_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                db.commit()
+                return True
+                
+        return False
+    except Exception as e:
+        logger.error("Failed to flush child drift scores: %s", e)
+        db.rollback()
+        return None
 
 
 def list_alerts(
@@ -1043,7 +1380,7 @@ def list_alerts(
     parent_uuid = _as_uuid(parent_id, "parent_id")
     query = db.query(AlertModel).filter(AlertModel.parent_id == parent_uuid)
     if since_ms is not None:
-        since_dt = datetime.utcfromtimestamp(float(since_ms) / 1000.0)
+        since_dt = datetime.fromtimestamp(float(since_ms) / 1000.0, timezone.utc)
         query = query.filter(AlertModel.updated_at >= since_dt)
     return query.order_by(AlertModel.timestamp.desc()).offset(offset).limit(limit).all()
 
@@ -1057,8 +1394,8 @@ def ack_alert(db: Session, parent_id: str, alert_id: str) -> AlertModel:
     ).first()
     if not alert:
         raise HTTPException(status_code=404, detail="alert_not_found")
-    alert.acknowledged_at = datetime.utcnow()
-    alert.updated_at = datetime.utcnow()
+    alert.acknowledged_at = datetime.now(timezone.utc)
+    alert.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(alert)
     return alert
@@ -1103,7 +1440,7 @@ def delete_alert(db: Session, parent_id: str, alert_id: str) -> None:
     clip_path = alert.audio_clip_path
     db.delete(alert)
     db.commit()
-    _delete_clip_path(clip_path)
+    _delete_clip_path(str(clip_path) if clip_path else None)
 
 
 def delete_all_alerts(db: Session, parent_id: str) -> int:
@@ -1119,7 +1456,7 @@ def delete_all_alerts(db: Session, parent_id: str) -> int:
     db.commit()
 
     for path in clip_paths:
-        _delete_clip_path(path)
+        _delete_clip_path(str(path) if path else None)
 
     return deleted_count
 
@@ -1143,7 +1480,18 @@ class SessionState:
     familiar_recovery_streak: int = 0
     active_stranger_embedding: Optional[np.ndarray] = None
     recent_confirmed_stranger_embeddings: List[np.ndarray] = field(default_factory=list)
-
+    # Change 7: consecutive windows with distress_score >= DISTRESS_ALERT_THRESHOLD
+    distress_streak: int = 0
+    # Change 10: drift tracking
+    child_drift_scores: List[float] = field(default_factory=list)
+    # Change 11: weighted streak
+    stranger_weight_sum: float = 0.0
+    # Change 12: Cached context gate configuration
+    household_config: Optional[Dict[str, Any]] = None
+    last_config_fetch_ms: int = 0
+    # Phase 5: Device obstruction detection
+    obstruction_counter: int = 0
+    device_obstructed_alert_sent_at: int = 0
 
 def _session_key(parent_id: str, device_id: str) -> str:
     return f"{parent_id}:{device_id}"
@@ -1156,6 +1504,20 @@ def get_or_create_session(parent_id: str, device_id: str) -> SessionState:
         if row is None:
             row = SessionState(parent_id=parent_id, device_id=device_id)
             _SESSIONS[key] = row
+        # persist light-weight metadata to redis for cross-process visibility
+        try:
+            persist_session(parent_id, device_id, {
+                "parent_id": row.parent_id,
+                "device_id": row.device_id,
+                "sr": row.sr,
+                "stranger_streak": row.stranger_streak,
+                "last_alert_ms": row.last_alert_ms,
+                "lat": float(row.lat) if row.lat is not None else None,
+                "lon": float(row.lon) if row.lon is not None else None,
+                "last_familiar_ms": row.last_familiar_ms,
+            })
+        except Exception:
+            pass
         return row
 
 
@@ -1163,6 +1525,10 @@ def stop_session(parent_id: str, device_id: str) -> None:
     key = _session_key(parent_id, device_id)
     with _LOCK:
         _SESSIONS.pop(key, None)
+    try:
+        delete_session(parent_id, device_id)
+    except Exception:
+        pass
 
 
 def start_stranger_segment(
@@ -1177,8 +1543,15 @@ def start_stranger_segment(
         if pre_roll.size > 0:
             segment = np.concatenate([pre_roll, segment])
     session.stranger_segment = segment.copy()
-    session.stranger_segment_started_ms = int(started_ms)
+    session.stranger_segment_started_ms = started_ms
     session.stranger_segment_ended_ms = 0
+    try:
+        # persist stranger_segment buffer to redis for cross-process retrieval
+        from app.services.session_manager import save_buffer
+
+        save_buffer(session.parent_id, session.device_id, "stranger_segment", session.stranger_segment)
+    except Exception:
+        pass
 
 
 def append_stranger_segment(session: SessionState, waveform: np.ndarray) -> None:
@@ -1187,12 +1560,24 @@ def append_stranger_segment(session: SessionState, waveform: np.ndarray) -> None
         session.stranger_segment = segment.copy()
         return
     session.stranger_segment = np.concatenate([session.stranger_segment, segment])
+    try:
+        from app.services.session_manager import save_buffer
+
+        save_buffer(session.parent_id, session.device_id, "stranger_segment", session.stranger_segment)
+    except Exception:
+        pass
 
 
 def clear_stranger_segment(session: SessionState) -> None:
     session.stranger_segment = None
     session.stranger_segment_started_ms = 0
     session.stranger_segment_ended_ms = 0
+    try:
+        from app.services.session_manager import save_buffer
+
+        save_buffer(session.parent_id, session.device_id, "stranger_segment", None)
+    except Exception:
+        pass
 
 
 def clear_stranger_identity(session: SessionState) -> None:
@@ -1232,10 +1617,20 @@ def update_session_location(parent_id: str, device_id: str, lat: Optional[float]
 
 def clear_clip_buffer(session: SessionState) -> None:
     session.clip_buffer = None
+    try:
+        from app.services.session_manager import save_buffer
+
+        save_buffer(session.parent_id, session.device_id, "clip_buffer", None)
+    except Exception:
+        pass
 
 
 def evaluate_window(db: Session, parent_id: str, waveform: np.ndarray, sr: int = 16000) -> Dict[str, Any]:
     started_at = time.perf_counter()
+
+    # Change 5: resolve per-household thresholds, fall back to global defaults.
+    t_high, t_low = get_household_thresholds(db, parent_id)
+
     waveform = normalize_waveform(np.asarray(waveform, dtype=np.float32).reshape(-1))
     rms = float(np.sqrt(np.mean(waveform**2) + 1e-12))
     if rms < 0.003:
@@ -1248,11 +1643,12 @@ def evaluate_window(db: Session, parent_id: str, waveform: np.ndarray, sr: int =
             perf["audio_ms"],
             perf["rtf"],
         )
-        logger.info(f"TIER1_VAD_REJECTED | parent_id={parent_id} | reason=low_rms | rms={rms:.6f}")
+        logger.info("TIER1_VAD_REJECTED | parent_id=%s | reason=low_rms | rms=%.6f", parent_id, rms)
         return {
             "tier1_vad": {"passed": False, "voiced_ms": 0.0, "rms": rms},
             "tier2": {"passed": False, "confidence": 0.0, "reason": "low_rms"},
-            "tier3": {"passed": False, "score": 0.0, "closest_speaker_id": None},
+            "tier3": {"passed": False, "score": 0.0, "closest_speaker_id": None, "closest_speaker_role": None},
+            "distress": {"distress": False, "distress_score": 0.0, "distress_class": None},
             "decision": "rejected_silence",
             "perf": perf,
         }
@@ -1274,23 +1670,29 @@ def evaluate_window(db: Session, parent_id: str, waveform: np.ndarray, sr: int =
             perf["audio_ms"],
             perf["rtf"],
         )
-        logger.info(f"TIER1_VAD_REJECTED | parent_id={parent_id} | reason=insufficient_voice | voiced_ms={voiced_ms} | threshold_ms=500")
+        logger.info(
+            "TIER1_VAD_REJECTED | parent_id=%s | reason=insufficient_voice | voiced_ms=%.1f | threshold_ms=500",
+            parent_id, voiced_ms,
+        )
         return {
             "tier1_vad": {"passed": False, "voiced_ms": voiced_ms},
             "tier2": {"passed": False, "confidence": 0.0},
-            "tier3": {"passed": False, "score": 0.0, "closest_speaker_id": None},
+            "tier3": {"passed": False, "score": 0.0, "closest_speaker_id": None, "closest_speaker_role": None},
+            "distress": {"distress": False, "distress_score": 0.0, "distress_class": None},
             "decision": "rejected",
             "perf": perf,
         }
 
-    logger.info(f"TIER1_VAD_PASSED | parent_id={parent_id} | voiced_ms={voiced_ms} | rms={rms:.6f}")
+    logger.info("TIER1_VAD_PASSED | parent_id=%s | voiced_ms=%.1f | rms=%.6f", parent_id, voiced_ms, rms)
 
     longest = max(segments, key=lambda ab: ab[1] - ab[0])
     gate_audio = waveform[longest[0] : longest[1]]
     parent_candidates = load_parent_embeddings(db, parent_id)
 
-    # Run YAMNet and ReDimNet path in parallel after VAD to reduce tail latency.
+    # Change 7: submit distress detection in parallel with YAMNet + ReDimNet.
+    # classify_distress_event is non-blocking and cheap relative to ReDimNet inference.
     future_yamnet = _INFER_POOL.submit(classify_audio_event_windowed, gate_audio, sr)
+    future_distress = _INFER_POOL.submit(classify_distress_event, gate_audio, sr)
     future_embs = _INFER_POOL.submit(embed_waveform_chunks, waveform, sr, segments)
 
     speech_ok, speech_metrics = assess_speech_likeness(gate_audio, sr)
@@ -1299,7 +1701,20 @@ def evaluate_window(db: Session, parent_id: str, waveform: np.ndarray, sr: int =
     category = yamnet_result.get("category", "uncertain")
     confidence = float(yamnet_result.get("confidence", 0.0))
 
-    logger.info(f"TIER2_EVALUATION | parent_id={parent_id} | speech_ok={speech_ok} | yamnet_category={category} | yamnet_confidence={confidence:.4f} | rms={speech_metrics.get('rms', 0.0):.6f} | flatness={speech_metrics.get('spectral_flatness', 0.0):.4f} | centroid_hz={speech_metrics.get('spectral_centroid_hz', 0.0):.1f}")
+    # Collect distress result (best-effort; never block alert path on failure).
+    try:
+        distress_result = future_distress.result()
+    except Exception:
+        distress_result = {"distress": False, "distress_score": 0.0, "distress_class": None}
+
+    logger.info(
+        "TIER2_EVALUATION | parent_id=%s | speech_ok=%s | yamnet_category=%s | yamnet_confidence=%.4f"
+        " | distress=%s | distress_score=%.4f | rms=%.6f | flatness=%.4f | centroid_hz=%.1f",
+        parent_id, speech_ok, category, confidence,
+        distress_result.get("distress", False), distress_result.get("distress_score", 0.0),
+        speech_metrics.get("rms", 0.0), speech_metrics.get("spectral_flatness", 0.0),
+        speech_metrics.get("spectral_centroid_hz", 0.0),
+    )
 
     # Only hard-reject clear non-human audio. If YAMNet is uncertain,
     # continue to tier-3 so speaker scoring can still run.
@@ -1311,8 +1726,7 @@ def evaluate_window(db: Session, parent_id: str, waveform: np.ndarray, sr: int =
             speech_metrics.get("spectral_centroid_hz", 0.0) < 120.0
             or speech_metrics.get("spectral_centroid_hz", 0.0) > 7800.0
         )
-        or
-        category == "reject"
+        or category == "reject"
         or (category == "vocal_non_speech" and confidence >= 0.70)
     )
 
@@ -1326,16 +1740,20 @@ def evaluate_window(db: Session, parent_id: str, waveform: np.ndarray, sr: int =
             perf["audio_ms"],
             perf["rtf"],
         )
-        logger.info(f"TIER2_REJECTED | parent_id={parent_id} | speech_ok={speech_ok} | yamnet_category={category} | yamnet_confidence={confidence:.4f}")
+        logger.info(
+            "TIER2_REJECTED | parent_id=%s | speech_ok=%s | yamnet_category=%s | yamnet_confidence=%.4f",
+            parent_id, speech_ok, category, confidence,
+        )
         return {
             "tier1_vad": {"passed": True, "voiced_ms": voiced_ms},
             "tier2": {"passed": False, "confidence": confidence, **yamnet_result, **speech_metrics},
-            "tier3": {"passed": False, "score": 0.0, "closest_speaker_id": None},
+            "tier3": {"passed": False, "score": 0.0, "closest_speaker_id": None, "closest_speaker_role": None},
+            "distress": distress_result,
             "decision": "discard_non_human_or_low_confidence",
             "perf": perf,
         }
 
-    logger.info(f"TIER2_PASSED | parent_id={parent_id} | proceeding_to_tier3_speaker_match")
+    logger.info("TIER2_PASSED | parent_id=%s | proceeding_to_tier3_speaker_match", parent_id)
 
     try:
         query_embs = future_embs.result()
@@ -1353,16 +1771,24 @@ def evaluate_window(db: Session, parent_id: str, waveform: np.ndarray, sr: int =
                 "passed": False,
                 "score": 0.0,
                 "closest_speaker_id": None,
+                "closest_speaker_role": None,
                 "error": "tier3_unavailable",
             },
+            "distress": distress_result,
             "decision": "tier3_unavailable",
             "perf": perf,
         }
 
-    score, closest_speaker_id = _score_against_candidates(parent_candidates, query_embs, parent_id)
+    # Change 1: _score_against_candidates now returns (score, speaker_id, speaker_role).
+    score, closest_speaker_id, closest_speaker_role = _score_against_candidates(
+        parent_candidates, query_embs, parent_id, t_high_global=t_high
+    )
     query_centroid = _compute_query_centroid(query_embs)
-    
-    logger.info(f"TIER3_SCORED | parent_id={parent_id} | score={score:.4f} | closest_speaker_id={closest_speaker_id} | t_high={T_HIGH} | t_low={T_LOW}")
+
+    logger.info(
+        "TIER3_SCORED | parent_id=%s | score=%.4f | closest_speaker_id=%s | role=%s | t_high=%.4f | t_low=%.4f",
+        parent_id, score, closest_speaker_id, closest_speaker_role, t_high, t_low,
+    )
     perf = _perf_metrics(len(waveform), sr, started_at)
     logger.info(
         "WINDOW_PERF | parent_id=%s | decision=%s | processing_ms=%.1f | audio_ms=%.1f | rtf=%.4f",
@@ -1372,7 +1798,7 @@ def evaluate_window(db: Session, parent_id: str, waveform: np.ndarray, sr: int =
         perf["audio_ms"],
         perf["rtf"],
     )
-    
+
     return {
         "tier1_vad": {"passed": True, "voiced_ms": voiced_ms},
         "tier2": {"passed": True, "confidence": confidence, **yamnet_result, **speech_metrics},
@@ -1380,9 +1806,11 @@ def evaluate_window(db: Session, parent_id: str, waveform: np.ndarray, sr: int =
             "passed": True,
             "score": float(score),
             "closest_speaker_id": closest_speaker_id,
-            "t_high": T_HIGH,
-            "t_low": T_LOW,
+            "closest_speaker_role": closest_speaker_role,
+            "t_high": t_high,
+            "t_low": t_low,
         },
+        "distress": distress_result,
         "decision": "tier3_scored",
         "perf": perf,
         "_query_centroid": query_centroid,
@@ -1409,18 +1837,33 @@ def append_frame(session: SessionState, frame: np.ndarray) -> np.ndarray:
     if session.clip_buffer.shape[0] > clip_keep:
         session.clip_buffer = session.clip_buffer[-clip_keep:]
 
+    # Persist buffers to Redis (best-effort) for cross-process visibility
+    try:
+        save_buffer(session.parent_id, session.device_id, "inference_buffer", session.inference_buffer)
+        save_buffer(session.parent_id, session.device_id, "clip_buffer", session.clip_buffer)
+    except Exception:
+        pass
+
     return session.inference_buffer
 
 
 def get_clip_buffer_waveform(session: SessionState, fallback: np.ndarray) -> np.ndarray:
     if session.clip_buffer is not None and session.clip_buffer.size > 0:
         return np.asarray(session.clip_buffer, dtype=np.float32).reshape(-1)
+    try:
+        from app.services.session_manager import load_buffer
+
+        buf = load_buffer(session.parent_id, session.device_id, "clip_buffer")
+        if buf is not None and buf.size > 0:
+            return np.asarray(buf, dtype=np.float32).reshape(-1)
+    except Exception:
+        pass
     return np.asarray(fallback, dtype=np.float32).reshape(-1)
 
 
 def compute_and_store_enrollment_quality(db: Session, parent_id: str, speaker_id: str) -> Tuple[Optional[float], Optional[str]]:
     speaker = get_speaker(db, parent_id, speaker_id)
-    sdir = _speaker_dir(parent_id, speaker.id)
+    sdir = _speaker_dir(parent_id, str(speaker.id))
     embs: List[np.ndarray] = []
     if os.path.isdir(sdir):
         for fname in sorted(os.listdir(sdir)):
@@ -1436,7 +1879,7 @@ def compute_and_store_enrollment_quality(db: Session, parent_id: str, speaker_id
     if len(embs) < 2:
         speaker.quality_score = None
         speaker.quality_label = None
-        speaker.updated_at = datetime.utcnow()
+        speaker.updated_at = datetime.now(timezone.utc)
         db.commit()
         db.refresh(speaker)
         return None, None
@@ -1445,7 +1888,7 @@ def compute_and_store_enrollment_quality(db: Session, parent_id: str, speaker_id
     if not pair_scores:
         speaker.quality_score = None
         speaker.quality_label = None
-        speaker.updated_at = datetime.utcnow()
+        speaker.updated_at = datetime.now(timezone.utc)
         db.commit()
         db.refresh(speaker)
         return None, None
@@ -1474,7 +1917,7 @@ def compute_and_store_enrollment_quality(db: Session, parent_id: str, speaker_id
 
     speaker.quality_score = robust_similarity
     speaker.quality_label = label
-    speaker.updated_at = datetime.utcnow()
+    speaker.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(speaker)
     return robust_similarity, label
@@ -1493,10 +1936,10 @@ def save_alert_clip(parent_id: str, session: SessionState, waveform: np.ndarray)
     tmp_clip_path = f"{clip_path}.tmp"
     metadata_path = os.path.join(adir, "metadata.json")
     metadata = {
-        "segment_started_ms": int(session.stranger_segment_started_ms) if session.stranger_segment_started_ms else None,
-        "segment_ended_ms": int(session.stranger_segment_ended_ms) if session.stranger_segment_ended_ms else None,
-        "sample_rate": int(session.sr),
-        "samples": int(np.asarray(waveform).reshape(-1).shape[0]),
+        "segment_started_ms": session.stranger_segment_started_ms if session.stranger_segment_started_ms else None,
+        "segment_ended_ms": session.stranger_segment_ended_ms if session.stranger_segment_ended_ms else None,
+        "sample_rate": session.sr,
+        "samples": np.asarray(waveform.reshape(-1).shape[0]),
     }
     try:
         sf.write(tmp_clip_path, waveform, session.sr, format="WAV")

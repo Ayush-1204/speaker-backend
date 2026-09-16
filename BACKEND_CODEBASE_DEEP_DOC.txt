@@ -1,0 +1,572 @@
+SAFEAR BACKEND — CODEBASE DEEP DOCUMENT
+
+Purpose
+- This document explains how the project is organized, why each file exists and how they relate, the underlying theory behind the detection pipeline, the design fundamentals followed, a readable explanation of important functions (grouped by file), the main libraries used and why, and how the backend runs on cloud.
+
+NOTE: File/identifier references use repository-relative paths and code-level names for easy lookups.
+
+-------------------------------------------------------------------------------
+1) Project structure and relationships (high level)
+-------------------------------------------------------------------------------
+- `app/main.py` — API surface, request routing, orchestration of detection and session lifecycle, websocket event publishing, startup warmup.
+  - Orchestrates behavior by calling into service layer modules and ML helper modules.
+  - Responsible for HTTP auth dependency (`get_current_parent`) and for aligning incoming requests with `parent_id`-scoped operations.
+
+- `app/utils/prd_services_db.py` and `app/utils/prd_services.py` — business/service layer logic.
+  - `prd_services_db.py` implements production services backed by SQLAlchemy database models (CRUD, persistence, session state, pipeline evaluation orchestration).
+  - `prd_services.py` implements a lightweight file-backed/dev-mode variant used by tests or local runs (state saved in JSON under `app/database/app_state.json`).
+  - Both expose similar higher-level APIs: device management, speaker enrollment operations, session lifecycle management, evaluation helpers, and utilities used by `main.py`.
+
+- `app/utils/*.py` (ML & helpers)
+  - `feature_extractor.py` — embedding/extraction functions that load ReDimNet model and turn waveforms into numeric embeddings.
+  - `vad.py` — voice activity detection logic (Silero VAD wrapper + energy fallback) to locate voiced segments.
+  - `speech_gate.py` — spectral heuristics and speech-likeness checks used when YAMNet is unavailable or to complement YAMNet.
+  - `yamnet_classifier.py` — wraps YAMNet/TFLite audio class inference to provide a speech vs non-speech / event confidence score.
+  - `verification_pipeline.py` — enrollment-flow helper combining feature extraction and saving embeddings.
+  - `audio_preprocess.py` — waveform normalization and resampling helpers.
+  - `alert_store.py`, `storage.py`, `compare.py` — small helpers to save alert clips, file handling, and comparison utilities.
+
+- `app/database/` — SQLAlchemy models and session glue (`models.py`, `session.py`).
+  - `models.py` defines `Parent`, `Device`, `EnrolledSpeaker`, `Alert`, `AuthCredential`.
+  - `session.py` sets up engine, `SessionLocal`, `init_db()` and light migration/backfill helpers.
+
+- `streamlit_client/` — a minimal front-end test client for demonstrations.
+
+- `tests/` — regression and unit tests (includes `test_critical.py` ensuring detection behavior around thresholds).
+
+Relationship summary
+- `main.py` calls `prd_services_db.py` (or `prd_services.py`) for business logic and calls ML helpers (`feature_extractor`, `vad`, `yamnet_classifier`, etc.) for inference.
+- `prd_services_db.py` persists records via `app/database/session.py` and model classes in `models.py` and relies on `feature_extractor` for embedding ops when needed.
+- Event publishing in `main.py` depends on a shared in-memory websocket client registry managed there; event content references DB-built payloads.
+
+-------------------------------------------------------------------------------
+2) Design principles and fundamentals followed
+-------------------------------------------------------------------------------
+1) Separation of concerns
+   - Request routing (`main.py`) vs business logic (`prd_services_db.py`) vs ML helpers (`feature_extractor.py`) vs storage (`database/`).
+2) Tenant scoping (parent-scoped)
+   - All data operations are scoped by `parent_id` to provide strong isolation.
+3) Config-by-env
+   - Most runtime knobs exposed via environment variables (thresholds, debounce, file roots) to allow tuning without code changes.
+4) Defensive, multi-stage decisioning
+   - Multi-tier pipeline (VAD -> speech gate -> speaker verification) protects against noisy inputs.
+5) Idempotency & resilience
+   - `detect/chunk` supports `chunk_id` idempotency cache.
+6) Observability
+   - Structured logs and `/health` endpoints expose useful metrics (active websockets, published counts).
+7) Test-safety
+   - `prd_services.py` provides an easy-to-run JSON-backed mode used for tests and local experimentation.
+
+-------------------------------------------------------------------------------
+3) Theory and rationale (under the hood)
+-------------------------------------------------------------------------------
+- VAD (Voice Activity Detection)
+  - Purpose: detect regions where human speech exists to avoid analyzing silent/noisy data.
+  - Benefit: reduces false positives and wasted compute.
+
+- YAMNet / speech_gate (Tier-2)
+  - YAMNet provides event classification (human_speech vs music vs noise) with confidence.
+  - Speech_gate uses spectral heuristics (RMS, spectral centroid, flatness) as a fallback or complementary check.
+  - Benefit: prevents non-speech audio (e.g., fan hum, music) from escalating to identity scoring.
+
+- ReDimNet embeddings (Tier-3)
+  - Embeddings map variable-length speech content onto a fixed-dimensional vector that encodes speaker characteristics.
+  - Cosine similarity between normalized embeddings is used as the verification score.
+  - Two thresholds `T_HIGH` and `T_LOW` introduce a safe undecided range (hysteresis) for stability.
+
+- Streak and debounce logic
+  - Require N consecutive suspicious windows (`STRANGER_CONFIRM_COUNT`) to reduce false alerts.
+  - Debounce prevents repeated alerts during short time windows.
+
+- Pre-roll and stranger segment
+  - To include context around suspicious windows, the backend accumulates a longer clip (pre-roll + ring) so the alert contains meaningful audio evidence.
+
+-------------------------------------------------------------------------------
+4) File-by-file explanations (key files and important functions)
+Note: For very large files (e.g., `app/main.py`), we summarize major function groups and crucial helpers rather than listing every tiny internal helper.
+-------------------------------------------------------------------------------
+`app/main.py`
+- Purpose: HTTP route definitions, websocket endpoint, session orchestration, logging, startup warmups.
+- Important functions & concepts:
+  - `get_current_parent()` dependency: extracts bearer token, validates and returns `{"parent_id": ...}`. Used on protected routes.
+  - `startup_event()`: initializes DB, warms models (calls `feature_extractor._get_redimnet()` and `yamnet_classifier._get_yamnet_model()`), warms cache.
+  - `_decode_audio_chunk(raw)`: tries `soundfile`, falls back to `librosa`, then raw PCM16LE decoding; returns waveform and sample rate.
+  - `_normalized_embedding(vec)`, `_cos_sim(a,b)`: embedding normalization and cosine-similarity helpers.
+  - `_ws_register_client`, `_ws_unregister_client`, `_ws_publish_async`: websocket client registry and asynchronous publish logic, queue-based delivery.
+  - `detect_chunk` route handler: orchestrates decode -> session append -> sanity checks -> call to `svc.evaluate_window()` -> decision logic applying thresholds and recording stranger segments -> alert creation and publishing when streak/pass rules satisfied.
+  - `_remember_detect_chunk_response()` and `_get_detect_chunk_cached_response()`: idempotency cache around `chunk_id`.
+  - Device endpoints: `create_device`, `upsert_device`, `list_devices`, `patch_device_monitoring`, `post_device_heartbeat` — perform device CRUD and telemetry updates by calling service layer.
+  - Alerts endpoints: `get_alert_history`, `delete_alert`, `fire_test_alert`, `flag_alert_as_familiar`, etc.
+
+`app/utils/prd_services_db.py`
+- Purpose: production service layer backed by SQL database.
+- Important components & functions:
+  - Constants: `T_HIGH`, `T_LOW`, `STRANGER_CONFIRM_COUNT`, `_IS_REDIMNET2` used to set defaults.
+  - `now_ms()` utility for epoch ms timestamps.
+  - `track_empty_chunk(device_id)`: tracks consecutive empty chunks for diagnosing audio capture issues.
+  - Embedding helpers: `_normalized_embedding()`, `_compute_query_centroid()` for centroid over several query embeddings.
+  - Storage helpers: `_ensure_parent_dirs()` to create tenant folders.
+  - Inference orchestration (high-level): functions that compute the stage dictionary used by `main.detect_chunk` (`tier1_pass`, `tier2_confidence`, `tier3 score`), calls into `feature_extractor` and `yamnet_classifier`.
+  - Session state management: `get_or_create_session`, `append_frame`, `start_stranger_segment`, `append_stranger_segment`, `clear_stranger_segment`.
+  - Database CRUD: `create_device`, `update_device_battery`, `save_speaker_embedding`, `compute_and_store_enrollment_quality`, `create_alert`, `list_alerts`, `ack_alert`, etc.
+  - Note: precise function signatures are in file; these functions map high-level routes to DB operations and file writes.
+
+`app/utils/prd_services.py`
+- Purpose: dev/test mode service layer (JSON-backed). Many functions mirror `prd_services_db.py` but operate on JSON state file and filesystem folders under `app/data/tenants`.
+- Use: helpful for local demo/testing without a DB.
+
+`app/utils/feature_extractor.py`
+- Purpose: load ReDimNet model, chunk audio into frames, embed chunks into numeric vectors.
+- Key functions (typical):
+  - `_get_redimnet()` — lazy-loads the ReDimNet model (torch hub or local) and caches it.
+  - `embed_waveform_chunks(waveform, sr)` — breaks waveform into expected chunks, runs model inference, returns array of embeddings.
+  - Helpers to handle model input preparation (resizing, normalization) and returning numpy arrays.
+
+`app/utils/vad.py`
+- Purpose: provide voice activity detection.
+- Key functions:
+  - `_get_silero()` — lazy-loads Silero model and utils.
+  - `get_speech_segments(waveform, sr)` — returns time-span segments where speech is detected.
+
+`app/utils/yamnet_classifier.py`
+- Purpose: classify short audio windows into categories and give confidence for `human_speech` vs other classes.
+- Key functions:
+  - `_get_yamnet_model()` — initializes the TFLite or TF runtime for YAMNet.
+  - `classify_audio_event_windowed(waveform, sr)` — returns category labels/confidences for windows.
+
+`app/utils/verification_pipeline.py`
+- Purpose: orchestrates enrollment: validates audio, extracts embeddings and returns them for saving.
+- Key functions:
+  - `run_enroll_embedding(path_or_waveform)` — returns list of embeddings and enrollment-stage metadata.
+
+`app/utils/audio_preprocess.py`
+- Purpose: audio normalization utilities.
+- Key functions:
+  - `normalize_waveform(arr)` — DC offset removal and RMS normalization.
+  - Resampling helpers if needed.
+
+`app/utils/alert_store.py` and `app/utils/storage.py`
+- Purpose: saving alert clips and file metadata under `tenants/<parent_id>/alerts` and ensuring paths and filenames are correct.
+- Key functions:
+  - `save_alert_clip(parent_id, session, waveform)` — writes WAV file, returns path.
+  - `get_speaker_embedding_dir(parent_id, speaker_id)` — returns directory path for embeddings.
+
+`app/database/models.py`
+- Purpose: ORM schema. Key classes:
+  - `Parent`, `AuthCredential`, `Device`, `EnrolledSpeaker`, `Alert`.
+  - Columns store metadata and relationships used elsewhere.
+
+`app/database/session.py`
+- Purpose: database engine setup and `init_db()`.
+- Key functions:
+  - `get_db()` dependency for FastAPI.
+  - `init_db()` creates tables and runs lightweight backfill for added columns.
+
+`streamlit_client/app.py`
+- Purpose: small demo client used to upload audio and view responses; useful during demos.
+
+`tests/` (not exhaustive)
+- Contains regression tests, including `test_critical.py` which validates that borderline scores and streak logic behave as expected.
+
+-------------------------------------------------------------------------------
+5) Features implemented and libraries imported (why each library appears)
+-------------------------------------------------------------------------------
+- FastAPI / Uvicorn / Starlette
+  - Use: HTTP server and routing, dependency injection, websockets.
+- numpy, scipy, librosa, soundfile, soxr
+  - Use: audio I/O, resampling, signal processing.
+- torch, torchaudio
+  - Use: ReDimNet model inference (speaker embeddings).
+- tensorflow-cpu
+  - Use: YAMNet TFLite/TF runtime for audio event classification.
+- silero-vad
+  - Use: production-grade VAD for speech segment detection.
+- scikit-learn / joblib
+  - Use: potential post-processing, scaler or simple classifiers if used.
+- SQLAlchemy / psycopg2-binary
+  - Use: ORM and DB connectivity (Postgres in production, SQLite local default).
+- redis / celery
+  - Use: optional caching and async job processing (Redis used for cache warmup / optional queueing).
+- firebase-admin / sendgrid / twilio
+  - Use: push and notification provider integrations (FCM/Email/SMS) for alert escalation.
+
+-------------------------------------------------------------------------------
+
+6) How the backend runs on cloud (practical checklist, runbook & ops)
+-------------------------------------------------------------------------------
+This section is an actionable runbook and checklist for deploying SafeEar in a production cloud environment. It includes minimal reproducible commands to run locally, guidance for containerized deploys, environment variable recommendations, persistence and scaling notes, health checks, and monitoring recommendations.
+
+Minimal local run (venv)
+- Create and activate virtualenv, install deps, run uvicorn locally for quick testing:
+
+```bash
+python -m venv venv
+# Windows PowerShell
+. venv/Scripts/Activate.ps1
+pip install -r requirements.txt
+# Start the API on port 8000
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Docker (recommended for parity with cloud builds)
+- Minimal `Dockerfile` outline (use multi-stage build to reduce image size):
+
+```dockerfile
+FROM python:3.11-slim AS base
+WORKDIR /app
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . /app
+ENV PYTHONUNBUFFERED=1
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+Render / PaaS notes
+- This repo contains `render.yaml` and `Procfile` examples used by Render.com. The important points when targeting Render (or similar PaaS):
+  - Ensure the build command installs any platform-specific wheels (CPU TF/Wheel) as required by `requirements.txt` comments.
+  - Configure environment variables in the service dashboard (DATABASE_URL, SAFEEAR_DATA_ROOT, REDIS_URL, SAFEEAR_JWT_SECRET, provider creds).
+  - Mount a persistent disk and set `SAFEEAR_DATA_ROOT` to the mounted path so embeddings and alert clips survive restarts.
+
+Environment variable reference (suggested baseline)
+- Production-critical variables:
+
+```text
+DATABASE_URL=postgres://user:pass@host:5432/safeear
+SAFEEAR_DATA_ROOT=/data/safeear
+SAFEEAR_JWT_SECRET=<strong-rand-secret>
+REDIS_URL=redis://:password@redis-host:6379/0   # optional but recommended for cache/pubsub
+GOOGLE_CLIENT_IDS=<comma-separated-google-client-ids>
+FIREBASE_CREDENTIALS_JSON='{"type":"..."}'  # if using push notifications
+SENDGRID_API_KEY=...
+```
+
+- Tuning & safety knobs (examples):
+
+```text
+SAFEEAR_T_HIGH=0.47
+SAFEEAR_T_LOW=0.31
+SAFEEAR_CONFIRM_WINDOWS=3
+SAFEEAR_DEBOUNCE_SEC=60
+SAFEEAR_FORCE_ALERT_SCORE=0.15
+SAFEEAR_FORCE_ALERT_MIN_STREAK=2
+```
+
+Database & schema
+- By default the code calls `init_db()` at startup which will create missing tables and run small backfills. For production use:
+  - Use a managed Postgres instance and set `DATABASE_URL`.
+  - Adopt Alembic or a migration tool for deterministic schema migrations in team environments (recommended: add Alembic and generate migration scripts instead of relying only on `init_db()`).
+
+Persistent storage
+- `SAFEEAR_DATA_ROOT` stores per-tenant embeddings and alert clips under `<data_root>/tenants/<parent_id>`. This must be a persistent mount (network or block storage) for production.
+
+Model artifacts and build-time requirements
+- ReDimNet loads via `torch.hub` or a local repository. Model loading can be expensive; ensure the following:
+  - Pre-build or cache model artifacts in the container image or a shared volume during deploy.
+  - If your PaaS doesn't allow long build steps, include the model in a layer (or place `REDIMNET_LOCAL_REPO_ARCHIVE_URL` pointing to a prepared archive and set `REDIMNET_LOCAL_REPO_EXTRACT_DIR`).
+  - TensorFlow/TFLite YAMNet uses wheels that match the platform; prefer CPU-specific wheels in `requirements.txt` or platform-managed addons.
+
+Redis, caching and websocket fanout
+- Single-process deployments use in-memory websocket registries. To scale horizontally you must:
+  - Use Redis for embedding cache warmup and as a pub/sub channel for event fanout (publish `alert_created` into Redis and have each process subscribe and push to its local websocket clients).
+  - Move session state from in-process memory (`_SESSIONS` / `_SESSIONS` in `prd_services_db.py`) to Redis (or another shared store) to preserve continuity across processes.
+
+Service process model and sticky sessions
+- If you prefer not to rework session state immediately:
+  - Use a single worker process with multiple threads (low horizontal scale) or
+  - Use sticky sessions / connection affinity so that each parent/client is consistently routed to the same backend process (supported by some load balancers).
+
+Health checks and monitoring
+- Readiness/liveness endpoints to monitor:
+  - `GET /health` — general service health and websocket client counts.
+  - `GET /health/cache` — redis availability + cached parents summary.
+  - Consider a custom check that validates ReDimNet loaded and `feature_extractor._get_redimnet()` returns without error.
+
+Logging & observability
+- The app logs structured JSON when `LOG_FORMAT=json` and otherwise human logs. Configure centralized logging (Cloud Logging, ELK) and parse these fields:
+  - `WS_EVENT_PUBLISHED | delivered=%d` — websocket delivery metric.
+  - `ALERT_CREATED` / `ALERT_FIRED` events for alerting metrics.
+  - `WINDOW_PERF` logs for latency, RTF and processing_ms monitoring.
+
+Security & secrets
+- Use the cloud provider's secret manager (or platform env var store) for `SAFEEAR_JWT_SECRET`, `SENDGRID_API_KEY`, `FIREBASE_*` credentials, and DB credentials. Never commit secrets to source.
+
+Backups and maintenance
+- Backup strategy:
+  - Postgres: nightly logical backups (pg_dump) or managed snapshotting.
+  - `SAFEEAR_DATA_ROOT`: snapshot the persistent disk daily (or replicate to cold storage), ensure alert clip retention policies if needed.
+
+Operational runbook (quick steps)
+- Start with fresh environment, example commands:
+
+```bash
+# 1) Prepare env and DB
+export DATABASE_URL=postgres://user:pass@db:5432/safeear
+export SAFEEAR_DATA_ROOT=/mnt/safeear_data
+mkdir -p $SAFEEAR_DATA_ROOT
+
+# 2) Start redis (optional)
+docker run -d --name redis -p 6379:6379 redis:7
+
+# 3) Build & run service (docker)
+docker build -t safeear:latest .
+docker run -e DATABASE_URL -e SAFEEAR_DATA_ROOT -p 8000:8000 --mount type=bind,source=$SAFEEAR_DATA_ROOT,target=/data/safeear safeear:latest
+
+# 4) Smoke test health
+curl http://localhost:8000/health
+```
+
+Rollbacks & safe deploys
+- Use blue/green or canary deployments and monitor `WINDOW_PERF` and `events_published` metrics for regressions after changing thresholds or model artifacts.
+
+Checklist before production cutover
+- Verified `DATABASE_URL` and DB migrations applied.
+- Persistent disk mounted and `SAFEEAR_DATA_ROOT` writable.
+- Secrets configured and access limited.
+- ReDimNet and YAMNet artifacts available in the image or extractable at boot.
+- Health checks passing and metrics for websocket delivery present.
+
+-------------------------------------------------------------------------------
+-7) Troubleshooting checklist (common issues and where to look)
+-------------------------------------------------------------------------------
+
+-------------------------------------------------------------------------------
+7) Troubleshooting checklist (common issues and where to look)
+-------------------------------------------------------------------------------
+- If no events are delivered (`WS_EVENT_PUBLISHED | delivered=0`): check websocket client registration (`_WS_CLIENTS_BY_PARENT`), ensure clients authenticating properly and not overwhelmed by queue sizes.
+- If many `uncertain` logs: verify threshold settings (`SAFEEAR_T_HIGH / SAFEEAR_T_LOW`) and tier2 confidences (`STRANGER_MIN_TIER2_CONF`).
+- If missing clips or embeddings: check `SAFEEAR_DATA_ROOT` persistence and write permissions.
+- If models fail to warm up at startup: inspect `startup_event()` logs and ensure model artifacts are present and CPU wheels (torch/tf) compatible with deploy runtime.
+- If DB schema mismatch: run `init_db()` or use Alembic for migrations; check `app/database/session.py` backfill logic.
+
+-------------------------------------------------------------------------------
+8) Dev-stack: Docker Compose for local development
+-------------------------------------------------------------------------------
+Use the following `docker-compose.yml` to run a local stack (Postgres + Redis + app) for development and integration testing. It mounts a host `./data` directory for `SAFEEAR_DATA_ROOT` so embeddings/persistent clips survive restarts.
+
+```yaml
+version: '3.8'
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: safeear
+      POSTGRES_PASSWORD: safeear
+      POSTGRES_DB: safeear
+    volumes:
+      - ./data/db:/var/lib/postgresql/data
+    ports:
+      - '5432:5432'
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - '6379:6379'
+
+  web:
+    build: .
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    environment:
+      DATABASE_URL: postgres://safeear:safeear@postgres:5432/safeear
+      SAFEEAR_DATA_ROOT: /data/safeear
+      REDIS_URL: redis://redis:6379/0
+      SAFEEAR_JWT_SECRET: dev-secret
+    volumes:
+      - .:/app:cached
+      - ./data:/data/safeear
+    ports:
+      - '8000:8000'
+    depends_on:
+      - postgres
+      - redis
+```
+
+Run:
+
+```bash
+docker compose up --build
+```
+
+This provides a fast local environment to test `/detect/chunk`, `/enroll/speaker` and DB-backed flows.
+
+-------------------------------------------------------------------------------
+9) Alembic quickstart (recommended)
+-------------------------------------------------------------------------------
+For production schema management, add Alembic and create migrations instead of relying solely on `init_db()`.
+
+Quick steps:
+
+```bash
+pip install alembic
+alembic init alembic
+# Configure alembic.ini -> sqlalchemy.url = $DATABASE_URL (or use env var support)
+# Create revision after model changes
+alembic revision --autogenerate -m "create initial schema"
+alembic upgrade head
+```
+
+Add the Alembic `env.py` snippet to load `DATABASE_URL` from env and import `app.database.models` so `--autogenerate` sees ORM models.
+
+-------------------------------------------------------------------------------
+10) Monitoring metrics and dashboards (recommended)
+-------------------------------------------------------------------------------
+Capture these metrics for operational visibility:
+- `window.processing_ms` and `window.rtf` (reported by `WINDOW_PERF` logs) — latency and real-time factor.
+- `events_published.alert_created` (from `/health` -> `events_published`) — alert volume over time.
+- `ws_event_delivered_ratio` — delivered vs published websocket events (derive from `WS_EVENT_PUBLISHED | delivered=%d` logs and `/health` counts).
+- `model_load_failures` — track ReDimNet/YAMNet load failures logged at startup.
+
+Dashboards: plot 1m/5m aggregates for alert rate, false-alarm spikes (surge of `stranger_candidate` decisions), and average `processing_ms`.
+
+-------------------------------------------------------------------------------
+11) Threshold tuning and rollback guide
+-------------------------------------------------------------------------------
+When tuning `SAFEEAR_T_HIGH` / `SAFEEAR_T_LOW` in production:
+- Use `admin/calibrate-thresholds` with representative `familiar_scores` and `stranger_scores` collected from your environment to compute an EER suggestion.
+- Deploy changes as a canary to a small subset of devices/parents to validate real-world false alarm rate before a full rollout.
+- Keep a deployable config rollback (CI job or infra change) so you can revert `SAFEEAR_T_HIGH`/`SAFEEAR_T_LOW` quickly if alerts spike.
+
+Rollback steps (fast):
+
+```bash
+# 1) Update environment variables on the platform (set previous T_HIGH/T_LOW)
+# 2) Restart the service instances or trigger a new release
+# 3) Monitor `/health`, `WINDOW_PERF` and alert counts for 5-10 minutes
+```
+
+-------------------------------------------------------------------------------
+End of additions — operational guidance, dev stack and migration notes included.
+
+
+-------------------------------------------------------------------------------
+8) Recommendations for improvements (future work)
+-------------------------------------------------------------------------------
+- Move session state to Redis to allow multiple worker processes and safer scaling.
+- Add end-to-end evaluation dataset (representative home recordings) and automated metric reporting (FAR/FRR/EER) to tune thresholds.
+- Add Alembic migrations for production-safe schema updates.
+- Implement event delivery via Redis pub/sub for cross-process websocket fanout.
+- Add more integration tests for websocket flows and push-notification deliveries.
+
+-------------------------------------------------------------------------------
+9) Where to read code for details
+-------------------------------------------------------------------------------
+- Orchestration: `app/main.py`
+- Production service layer: `app/utils/prd_services_db.py`
+- Dev/test service layer: `app/utils/prd_services.py`
+- ML/embedding: `app/utils/feature_extractor.py`
+- VAD: `app/utils/vad.py`
+- Tier-2: `app/utils/yamnet_classifier.py` and `app/utils/speech_gate.py`
+- Enrollment helper: `app/utils/verification_pipeline.py`
+- File and clip handling: `app/utils/alert_store.py` and `app/utils/storage.py`
+- DB models: `app/database/models.py`
+- DB session and init: `app/database/session.py`
+
+-------------------------------------------------------------------------------
+Appendix: Quick glossary and env var cheat-sheet
+-------------------------------------------------------------------------------
+- `T_HIGH`, `T_LOW` — high/low thresholds for similarity score.
+- `STRANGER_CONFIRM_COUNT` — consecutive windows needed to trigger alert.
+- `DEBOUNCE_SEC` — cooldown between alerts.
+- `SAFEEAR_DATA_ROOT` — path where embeddings and clips live.
+- `DATABASE_URL` — production DB connection string.
+- `REDIS_URL` — optional redis for caching/background tasks.
+- `SAFEEAR_JWT_SECRET` — JWT secret for signing tokens.
+
+--------------------------------------------------------------------------------
+End of document
+--------------------------------------------------------------------------------
+
+-------------------------------------------------------------------------------
+10) Exhaustive per-function reference (additional files)
+-------------------------------------------------------------------------------
+The following expands per-file, function-level behavior for the remaining core modules used by the backend. Use these descriptions when writing slides, demo notes or deep-dive docs.
+
+`app/utils/feature_extractor.py`
+- `_bootstrap_local_repo_if_needed(configured_dir: str) -> str`: ensures a local ReDimNet repo exists; downloads and extracts an archive when configured; returns path to repo or the original configured_dir. Handles zip/tar extraction and writes a ".ready" marker.
+- `_get_redimnet() -> torch.nn.Module`: lazy singleton loader using `torch.hub.load`. Tries local repo first, falls back to configured hub repos and legacy sources. Implements exponential backoff via `_redimnet_retry_after_ts` and `_redimnet_load_failures`. Moves model to `config.DEVICE` and sets eval(). Raises RuntimeError on unrecoverable failures.
+- `_load_audio(path: str, target_sr: int = 16000) -> (np.ndarray, int)`: read file via `soundfile`, average channels, resample to `target_sr` using `librosa`, normalize waveform.
+- `_embed_waveform_array(waveform: np.ndarray, sr: int = 16000) -> np.ndarray`: normalizes and pads waveform, converts to a torch tensor on device, runs model inference, validates dimension equals `config.EMBEDDING_DIM`, L2-normalizes and returns numpy float32 vector.
+- `get_speaker_embedding_from_file(path: str) -> np.ndarray`: enrollment helper: load file, VAD trim (attempt Silero, fallback to energy-based), pad if too short and return single embedding.
+- `embed_waveform_chunks(waveform: np.ndarray, sr: int = 16000, segments: Optional[List[Tuple[int,int]]] = None) -> List[np.ndarray]`: chop waveform into bounded chunks (respecting `config.MIN_CHUNK_SAMPLES` and `config.MAX_CHUNK_SAMPLES`), cap to `config.MAX_VERIFY_CHUNKS`, embed each chunk and return list of normalized embeddings.
+
+`app/utils/vad.py`
+- `_get_silero() -> (model, utils) or (None, None)`: lazy loads Silero VAD via `torch.hub.load`. Returns `(None,None)` on failure but records that an attempt occurred to avoid repeated loads.
+- `_energy_segments(audio, sr, frame_ms=30, threshold_ratio=0.5) -> List[dict]`: energy-based segmentation that splits audio into fixed frames, computes frame energy, thresholds by a ratio of mean energy, and returns start/end sample ranges for segments.
+- `_energy_vad_trim(audio, sr, frame_ms=30, threshold_ratio=0.5) -> np.ndarray`: returns a trimmed waveform using contiguous high-energy frames (simple VAD fallback); used when Silero is unavailable or fails.
+- `get_speech_segments(audio, sr=16000, use_silero=True) -> List[Tuple[int,int]]`: returns voiced segments [(start, end), ...] in samples. Attempts Silero first (if enabled) and falls back to `_energy_segments`.
+- `apply_vad(audio, sr=16000, use_silero=True) -> np.ndarray`: convenience to return a trimmed waveform covering joined speech timestamps. Uses Silero when available; otherwise energy trim. Ensures return is a float32 numpy array.
+
+`app/utils/yamnet_classifier.py`
+- `_get_yamnet_model() -> tflite.Interpreter or None`: lazy loads `app/models/yamnet.tflite` into a TFLite Interpreter. Returns `None` if model file absent or load fails (caller falls back to heuristics).
+- `classify_audio_event(waveform, sr=16000) -> Dict[str,Any]`: run YAMNet inference on a single window. Pads/center-crops to model input length, invokes the tflite interpreter, averages scores across frames and maps to SafeEar categories `human_speech`, `vocal_non_speech`, `reject` or `uncertain`. If YAMNet unavailable or inference fails, calls `_fallback_classify`.
+- `classify_audio_event_windowed(waveform, sr=16000, frame_sec=0.96, hop_sec=0.48) -> Dict[str,Any]`: splits waveform into overlapping frames, calls `classify_audio_event` per frame, aggregates votes and confidences to pick the best category and median confidence. Returns method metadata and per-frame counts.
+- `_fallback_classify(waveform) -> Dict[str,Any]`: fallback using `speech_gate.assess_speech_likeness()`; returns low-confidence decisions that bias toward `reject` when non-speech.
+- `_score_to_decision(scores: np.ndarray) -> Dict[str,Any]`: maps raw YAMNet output vector into SafeEar categories by summing class subsets (human/vocal/reject) and applying thresholds to produce category + confidence + top_class.
+
+`app/utils/verification_pipeline.py`
+- `_load_mono_16k(path: str) -> np.ndarray`: read audio file with `soundfile`, mono mix, resample to 16k with `librosa`, and normalize via `normalize_waveform`.
+- `_voiced_duration_ms(segments, sr) -> float`: compute total voiced duration in ms from (start,end) segments.
+- `run_verify_stages(audio_path: str) -> Dict[str,Any]`: runs the 3-stage verify flow used by the verification endpoint: VAD→speech-gate→embedding-match. Steps:
+  - Load waveform and compute speech segments via `get_speech_segments`.
+  - Tier1: compute voiced_ms and gate pass/fail.
+  - Tier2: take the longest voiced region and call `assess_speech_likeness`.
+  - Tier3: embed waveform into chunks (`embed_waveform_chunks`), load stored embeddings (`load_all_embeddings`) and compute best match with `match_embedding` to find `best_score` and `best_match`.
+  - Returns detailed `stages` and final `result` of `familiar`/`stranger`/`rejected` plus `similarity` and `closest_speaker`.
+- `run_enroll_embedding(audio_path: str) -> (List[np.ndarray], Dict[str,Any])`: used for enrollment — runs VAD, checks voiced_ms, speech-likeness, then extracts chunk embeddings. Returns list of embeddings and a stage `info` object. Raises `ValueError` for rejection reasons used by the enroll endpoint.
+
+`app/utils/audio_preprocess.py`
+- `normalize_waveform(waveform: np.ndarray) -> np.ndarray`: DC-offset removal and conservative RMS-targeted gain normalization. Uses config knobs: `ENABLE_VOLUME_NORMALIZATION`, `VOLUME_MIN_RMS`, `VOLUME_TARGET_RMS`, `VOLUME_MAX_GAIN_DB`, `VOLUME_PEAK_LIMIT`. Ensures outputs are clipped to peak limits to avoid saturation and returns float32 waveform.
+
+`app/utils/alert_store.py`
+- `ensure_alert_audio_dir() -> str`: create and return a static alerts directory under `app/data/alert_audio`.
+- `set_parent_mode_armed(armed: bool)`, `set_child_mode_armed(armed: bool)`: set simple in-memory armed flags controlling whether stranger alerts are queued for parent polling.
+- `get_mode_flags() -> Dict[str,bool]`: return current mode flags.
+- `append_stranger_alert_from_wav(temp_audio_path: str) -> None`: copy a temp WAV into the static alerts dir, create a ServerAlert entry (timestamp, location via `maps_url_from_last_location`) and queue it for poll-based clients when parent mode armed. Keeps a bounded queue (_MAX=500).
+- `get_server_alerts_since(since_ms: int) -> List[Dict[str,Any]]`: returns list of queued alerts with timestamps greater than `since_ms` for legacy SpeakerApp polling clients.
+
+`app/utils/storage.py`
+- `ensure_dir()`: ensure `app/data/familiar_embeddings` exists.
+- `save_embedding(name: str, emb: np.ndarray)`: save a 1-D numpy embedding under `BASE_DIR/<name>/<name>_<n>.npy`. Enforces 1-D input and uses float32.
+- `load_user_embeddings(name: str) -> List[np.ndarray]`: load and validate `.npy` files for a user, dropping files with incorrect dims or load errors.
+- `load_all_embeddings() -> Dict[str,List[np.ndarray]]`: iterate `BASE_DIR` directories, load embeddings per user and return dict user->list(embs).
+
+`app/utils/compare.py`
+- `cosine_similarity(a,b) -> float`: compute cosine similarity robustly (guards zero norms).
+- `THRESHOLD`: default matching threshold (0.75) used in lightweight compare flows.
+- `match_embedding(query_emb, user_embeddings) -> float`: compute max cosine similarity of `query_emb` against a list of `user_embeddings` (returns 0.0 on empty set).
+
+`app/utils/prd_services.py` (dev-mode JSON-backed service)
+- `_ensure_parent_dirs(parent_id)`: create per-tenant `tenants/<parent_id>/embeddings` and `alerts` directories.
+- `_load_state() / _save_state(state)`: read/write `app/database/app_state.json` which holds parents, devices, speakers, alerts and refresh_tokens.
+- `now_ms()`, `_b64`, `_b64d`, `make_jwt`, `parse_jwt`: lightweight JWT + time helpers (consistent with `prd_services_db`'s JWT approach but using simple JSON store instead of DB).
+- CRUD & Embedding helpers mirroring production: `create_speaker`, `list_speakers`, `get_speaker`, `rename_speaker`, `delete_speaker`, `save_speaker_embedding`, `load_parent_embeddings`, `create_alert`, `list_alerts`, `ack_alert`, `get_alert`, `delete_alert`, `delete_all_alerts`.
+- Session management: `SessionState` dataclass and helpers `get_or_create_session`, `stop_session`, `start_stranger_segment`, `append_stranger_segment`, `clear_stranger_segment`, `append_frame`, `get_clip_buffer_waveform`, `compute_and_store_enrollment_quality`, `should_hop`, `save_alert_clip`.
+- `evaluate_window(parent_id, waveform, sr)`: lightweight pipeline implementing VAD→speech_gate→ReDimNet scoring; returns the same `tier1/tier2/tier3` structure used by `main.detect_chunk` so the rest of orchestration is identical between dev and prod modes.
+
+-------------------------------------------------------------------------------
+11) How this maps to `app/main.py` (quick reference)
+-------------------------------------------------------------------------------
+- `main.detect_chunk` calls `svc.append_frame(session, arr)` then `svc.evaluate_window(db,parent_id,window,session.sr)`; the returned `stage` dictionary contains the fields the route inspects: `tier1_vad.passed`, `tier2.confidence`, `tier3.score`, and `tier3.closest_speaker_id`. Based on `T_HIGH/T_LOW` and `STRANGER_CONFIRM_COUNT` the route updates `session.stranger_streak`, records `recent_confirmed_stranger_windows`, starts/extends `stranger_segment` and may call `svc.save_alert_clip` + `svc.create_alert` and `publish_parent_event`.
+
+-------------------------------------------------------------------------------
+12) Minimal cross-file call graph (most important paths)
+-------------------------------------------------------------------------------
+- Detect flow: `app/main.detect_chunk` → `prd_services_db.get_or_create_session` → `prd_services_db.append_frame` → `prd_services_db.evaluate_window` → (`vad.get_speech_segments`, `yamnet_classifier.classify_audio_event_windowed`, `feature_extractor.embed_waveform_chunks`) → `prd_services_db._score_against_candidates` → main's decisioning + `prd_services_db.save_alert_clip` + DB `create_alert`.
+- Enroll flow: `main.enroll_speaker` → `verification_pipeline.run_enroll_embedding` → `feature_extractor.embed_waveform_chunks` → `prd_services_db.save_speaker_embedding` → `prd_services_db.compute_and_store_enrollment_quality`.
+
+-------------------------------------------------------------------------------
+13) Quick links to file locations in this repo (for reviewers)
+-------------------------------------------------------------------------------
+- Orchestration: [app/main.py](app/main.py#L1-L1)
+- Production services: [app/utils/prd_services_db.py](app/utils/prd_services_db.py#L1-L1)
+- Dev services: [app/utils/prd_services.py](app/utils/prd_services.py#L1-L1)
+- Embeddings: [app/utils/feature_extractor.py](app/utils/feature_extractor.py#L1-L1)
+- VAD: [app/utils/vad.py](app/utils/vad.py#L1-L1)
+- Tier-2 classifier: [app/utils/yamnet_classifier.py](app/utils/yamnet_classifier.py#L1-L1)
+- Enrollment pipeline: [app/utils/verification_pipeline.py](app/utils/verification_pipeline.py#L1-L1)
+- Audio normalization: [app/utils/audio_preprocess.py](app/utils/audio_preprocess.py#L1-L1)
+- Alert queue (legacy): [app/utils/alert_store.py](app/utils/alert_store.py#L1-L1)
+- On-disk embedding storage (dev): [app/utils/storage.py](app/utils/storage.py#L1-L1)
+- Embedding compare helper: [app/utils/compare.py](app/utils/compare.py#L1-L1)
+
+--------------------------------------------------------------------------------
+Done. The above sections extend the existing deep doc with function-level details for all core modules.

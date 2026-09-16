@@ -5,3 +5,30 @@ __pycache__/
 .env
 *.log
 .vscode/
+
+# Runtime databases & state
+*.db
+*.sqlite
+*.sqlite3
+app/database/app_state.json
+
+# Tenant audio/embedding data (large binary)
+app/data/tenants/
+
+# ML model files (downloaded at runtime)
+app/models/yamnet.tflite
+
+# Vendored packages (installed via requirements.txt)
+soundfile/
+
+# Test/build artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# Firebase secrets
+firebase-adminsdk.json
