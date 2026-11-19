@@ -1,5 +1,11 @@
-from dotenv import load_dotenv
-load_dotenv()
+# A local .env file is optional: on Render the variables are set in the
+# dashboard, and python-dotenv is only a dev dependency.
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    pass
+else:
+    load_dotenv()
 
 import asyncio
 import contextlib
