@@ -253,7 +253,7 @@ def test_alert_clip_atomic_write(tmp_path):
         svc.stop_session(parent_id, device_id)
 
 
-def test_embedding_dimension_guard(tmp_path):
+def test_embedding_dimension_guard_skips_bad_files(tmp_path):
     db = SessionLocal()
     parent = None
     try:
@@ -264,9 +264,15 @@ def test_embedding_dimension_guard(tmp_path):
         speaker_dir = svc.get_speaker_embedding_dir(str(parent.id), str(speaker.id))
         os.makedirs(speaker_dir, exist_ok=True)
         np.save(os.path.join(speaker_dir, "emb_1.npy"), np.zeros(128, dtype=np.float32))
+        good = np.ones(192, dtype=np.float32) / np.sqrt(192)
+        np.save(os.path.join(speaker_dir, "emb_2.npy"), good)
+        with open(os.path.join(speaker_dir, "emb_3.npy"), "wb") as fh:
+            fh.write(b"not a numpy file")
 
-        with pytest.raises(ValueError, match="dim mismatch"):
-            svc.load_parent_embeddings(db, str(parent.id))
+        # Bad files are skipped; the valid reference is still used, so one corrupt
+        # file cannot disable detection for the whole family.
+        gallery = svc.load_parent_embeddings(db, str(parent.id))
+        assert len(gallery[str(speaker.id)]["embs"]) == 1
     finally:
         if parent is not None:
             try:

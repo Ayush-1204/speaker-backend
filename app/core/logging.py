@@ -13,7 +13,11 @@ class _JsonLogFormatter(logging.Formatter):
 
 
 def configure_logging(json_format: bool = False) -> None:
+    """Send app logs (INFO+) to stdout once; safe to call more than once."""
     root = logging.getLogger()
+    if getattr(root, "_safeear_configured", False):
+        return
+    root._safeear_configured = True  # type: ignore[attr-defined]
     if not root.handlers:
         root.addHandler(logging.StreamHandler())
     handler = root.handlers[0]

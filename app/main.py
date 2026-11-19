@@ -3,6 +3,7 @@ load_dotenv()
 
 import asyncio
 import contextlib
+import dataclasses
 import logging
 import os
 import shutil
@@ -28,10 +29,11 @@ from app.database.session import SessionLocal, get_db, init_db
 from app.utils import prd_services_db as svc
 from app.utils.audio_preprocess import normalize_waveform
 from app.utils.audio_decoder import decode_audio_chunk
-from app.utils.verification_pipeline import run_enroll_embedding
+from app.utils.verification_pipeline import enrollment_rejection_message, run_enroll_embedding
 from app.utils import feature_extractor as feature_extractor_module
 from app.utils import yamnet_classifier as yamnet_classifier_module
 from app.utils import vad as vad_module
+from app.utils import eval_capture
 from app.services.detection_service import DetectionService
 from app.utils.notification_worker import send_fcm_push
 from app.services.websocket_manager import (
@@ -46,13 +48,25 @@ from app.services.websocket_manager import (
     _WS_LAST_QUEUE_LAG_MS,
 )
 import app.services.websocket_manager as _ws_manager_module
-from app.services.decision_engine import _has_speaker_changed
+from app.services.decision_engine import DecisionParams, decide
+from app.services.alert_service import create_and_escalate_alert
 from app.services.cache_service import (
     warmup_embeddings_to_redis as _warmup_embeddings_to_redis_fn,
     get_redis_client as _get_redis_client,
     _CACHE_WARMUP_SUMMARY,
 )
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.concurrency import run_in_threadpool
+from app.core import security
+from app.core.security import auth_rate_limit, enforce_rate_limit
+from app.services import auth_tokens
+from app.services import health_monitor
+from app.services import child_safety
+
+# Configure logging once, before anything logs (LOG_FORMAT=json for JSON lines).
+from app.core.logging import configure_logging
+
+configure_logging(json_format=(os.environ.get("LOG_FORMAT") or "").strip().lower() == "json")
 
 # Module logger — must be defined before _lifespan which uses it.
 logger = logging.getLogger(__name__)
@@ -61,7 +75,13 @@ logger = logging.getLogger(__name__)
 @contextlib.asynccontextmanager
 async def _lifespan(app_instance):
     """FastAPI lifespan: runs startup logic then yields control to the app."""
+    security.validate_security_config()
     init_db()
+    try:
+        with SessionLocal() as _db:
+            auth_tokens.import_legacy_refresh_tokens(_db)
+    except Exception as exc:
+        logger.warning("LEGACY_REFRESH_IMPORT_FAILED | reason=%s", exc)
     # Eagerly warm model singletons so first detect request does not pay load latency.
     try:
         feature_extractor_module._get_redimnet()
@@ -88,42 +108,124 @@ async def _lifespan(app_instance):
         logger.warning("MODEL_WARMUP_FAILED | model=silero_vad | reason=%s", str(exc))
 
     _warmup_embeddings_to_redis()
-    yield  # App handles requests here
+    # Importing silero_vad lowers torch to 1 thread; restore it after all models load.
+    vad_module.restore_torch_threads()
+    await asyncio.to_thread(_warmup_inference)
+    watchdog = asyncio.create_task(_device_watchdog_loop())
+    try:
+        yield  # App handles requests here
+    finally:
+        watchdog.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await watchdog
+
+
+def _warmup_inference() -> None:
+    """Run each model once so the first real chunk does not pay one-time costs
+    (graph setup, memory allocation, kernel selection)."""
+    started = time.perf_counter()
+    rng = np.random.default_rng(0)
+    probe = (0.01 * rng.standard_normal(24000)).astype(np.float32)
+    for name, fn in (
+        ("vad", lambda: vad_module.get_speech_segments(probe)),
+        ("yamnet", lambda: yamnet_classifier_module.classify_audio_event_windowed(probe)),
+        ("redimnet", lambda: feature_extractor_module.embed_waveform_chunks(probe, 16000)),
+    ):
+        try:
+            fn()
+        except Exception as exc:
+            logger.warning("WARMUP_INFERENCE_FAILED | model=%s | reason=%s", name, exc)
+    logger.info("WARMUP_INFERENCE_DONE | ms=%.0f", (time.perf_counter() - started) * 1000)
+
+
+async def _device_watchdog_loop() -> None:
+    """Every minute, tell parents about monitored devices that went silent."""
+    interval = int(os.environ.get("SAFEEAR_WATCHDOG_INTERVAL_SEC", "60"))
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await asyncio.to_thread(_run_device_watchdog_once)
+        except Exception as exc:
+            logger.warning("DEVICE_WATCHDOG_FAILED | reason=%s", exc)
+
+
+_LAST_CLIP_PURGE = 0.0
+
+
+def _run_device_watchdog_once() -> int:
+    global _LAST_CLIP_PURGE
+    evicted = svc.evict_idle_sessions()
+    if evicted:
+        logger.info("SESSIONS_EVICTED | count=%d", evicted)
+    with SessionLocal() as db:
+        # Hourly: delete alert recordings past the retention period.
+        if time.monotonic() - _LAST_CLIP_PURGE > 3600:
+            _LAST_CLIP_PURGE = time.monotonic()
+            purged = svc.purge_old_alert_clips(db)
+            if purged:
+                logger.info("ALERT_CLIPS_PURGED | count=%d | retention_days=%d", purged, svc.CLIP_RETENTION_DAYS)
+        return health_monitor.report_silent_devices(db)
 
 
 app = FastAPI(lifespan=_lifespan)
 
-# Allow CORS for local development
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# CORS only matters for browser clients (the mobile app does not need it).
+# Production allows only explicitly configured origins; development allows any
+# origin but never with credentials.
+_cors_origins = [o.strip() for o in (os.environ.get("SAFEEAR_CORS_ORIGINS") or "").split(",") if o.strip()]
+if not _cors_origins and not security.is_production():
+    _cors_origins = ["*"]
+if _cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_credentials=_cors_origins != ["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+MAX_CHUNK_BYTES = int(os.environ.get("SAFEEAR_MAX_CHUNK_BYTES", str(512 * 1024)))
+MAX_ENROLL_BYTES = int(os.environ.get("SAFEEAR_MAX_ENROLL_BYTES", str(10 * 1024 * 1024)))
+DETECT_RATE_LIMIT_PER_SEC = int(os.environ.get("SAFEEAR_DETECT_RATE_LIMIT_PER_SEC", "10"))
+
+
+async def _read_upload_limited(upload: UploadFile, max_bytes: int) -> bytes:
+    data = await upload.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise HTTPException(status_code=413, detail="upload_too_large")
+    return data
 
 now_ms = svc.now_ms
 
 # Route-level threshold aliases kept for compatibility with existing tests and logs.
 T_HIGH = svc.T_HIGH
 T_LOW = svc.T_LOW
-STRANGER_MIN_TIER2_CONF = float(os.environ.get("SAFEEAR_STRANGER_MIN_TIER2_CONF", "0.55"))
-STRANGER_UNCERTAIN_CONF_FLOOR = float(os.environ.get("SAFEEAR_STRANGER_UNCERTAIN_CONF_FLOOR", "0.25"))
-FAMILIAR_GRACE_SEC = int(os.environ.get("SAFEEAR_FAMILIAR_GRACE_SEC", "5"))
-FAMILIAR_HOLD_FLOOR = float(os.environ.get("SAFEEAR_FAMILIAR_HOLD_FLOOR", str(T_LOW)))
-FAMILIAR_GRACE_MARGIN = float(os.environ.get("SAFEEAR_FAMILIAR_GRACE_MARGIN", "0.05"))
-FAMILIAR_GRACE_MIN_CONF = float(os.environ.get("SAFEEAR_FAMILIAR_GRACE_MIN_CONF", "0.75"))
-FAMILIAR_RESET_MIN_STREAK = int(os.environ.get("SAFEEAR_FAMILIAR_RESET_MIN_STREAK", "2"))
-SOFT_STRANGER_MARGIN = float(os.environ.get("SAFEEAR_SOFT_STRANGER_MARGIN", "0.04"))
-SOFT_STRANGER_MIN_CONF = float(os.environ.get("SAFEEAR_SOFT_STRANGER_MIN_CONF", "0.55"))
-FORCE_ALERT_SCORE = float(os.environ.get("SAFEEAR_FORCE_ALERT_SCORE", "0.15"))
-FORCE_ALERT_MIN_STREAK = int(os.environ.get("SAFEEAR_FORCE_ALERT_MIN_STREAK", "2"))
-ALERT_TRIGGER_STREAK = int(os.environ.get("SAFEEAR_ALERT_TRIGGER_STREAK", "3"))
-DEBOUNCE_SEC = int(os.environ.get("SAFEEAR_DEBOUNCE_SEC", "60"))
-SPEAKER_CHANGE_THRESHOLD = float(os.environ.get("SAFEEAR_SPEAKER_CHANGE_THRESHOLD", "0.85"))
+# Decision rules and their field-tuned defaults live in app/services/decision_engine.py
+# (DecisionParams).  Change them only with evidence from scripts/eval/replay.py.
+DECISION_PARAMS = DecisionParams.from_env()
+STRANGER_MIN_TIER2_CONF = DECISION_PARAMS.stranger_min_tier2_conf
+STRANGER_UNCERTAIN_CONF_FLOOR = DECISION_PARAMS.stranger_uncertain_conf_floor
+FAMILIAR_GRACE_SEC = DECISION_PARAMS.familiar_grace_sec
+FAMILIAR_HOLD_FLOOR = DECISION_PARAMS.familiar_hold_floor
+FAMILIAR_GRACE_MARGIN = DECISION_PARAMS.familiar_grace_margin
+FAMILIAR_GRACE_MIN_CONF = DECISION_PARAMS.familiar_grace_min_conf
+FAMILIAR_RESET_MIN_STREAK = DECISION_PARAMS.familiar_reset_min_streak
+SOFT_STRANGER_MARGIN = DECISION_PARAMS.soft_stranger_margin
+SOFT_STRANGER_MIN_CONF = DECISION_PARAMS.soft_stranger_min_conf
+FORCE_ALERT_SCORE = DECISION_PARAMS.force_alert_score
+FORCE_ALERT_MIN_STREAK = DECISION_PARAMS.force_alert_min_streak
+ALERT_TRIGGER_STREAK = DECISION_PARAMS.alert_trigger_streak
+DEBOUNCE_SEC = DECISION_PARAMS.debounce_sec
+SPEAKER_CHANGE_THRESHOLD = DECISION_PARAMS.speaker_change_threshold
 STRANGER_PREROLL_SEC = float(os.environ.get("SAFEEAR_STRANGER_PREROLL_SEC", "5.0"))
+# Opt-in experimental alert paths (off = April behaviour).
+ENABLE_DISTRESS_ALERTS = svc.ENABLE_DISTRESS_DETECTION
+DISTRESS_ALERT_THRESHOLD = float(os.environ.get("SAFEEAR_DISTRESS_ALERT_THRESHOLD", "0.65"))
+DISTRESS_CONFIRM_WINDOWS = int(os.environ.get("SAFEEAR_DISTRESS_CONFIRM_WINDOWS", "2"))
+DISTRESS_DEBOUNCE_SEC = int(os.environ.get("SAFEEAR_DISTRESS_DEBOUNCE_SEC", "60"))
+CHILD_DRIFT_FLUSH_EVERY = int(os.environ.get("SAFEEAR_CHILD_DRIFT_FLUSH_EVERY", "20"))
 # Idempotency cache for recently processed detect chunks (in-memory)
-DETECT_CHUNK_IDEMPOTENCY_WINDOW_MS = int(os.environ.get("SAFEEAR_DETECT_CHUNK_IDEMPOTENCY_WINDOW_MS", "2000"))
+DETECT_CHUNK_IDEMPOTENCY_WINDOW_MS = int(os.environ.get("SAFEEAR_DETECT_CHUNK_IDEMPOTENCY_WINDOW_MS", "120000"))
 _RECENT_DETECT_CHUNK_RESULTS: Dict[str, tuple] = {}
 _RECENT_DETECT_CHUNK_RESULTS_LOCK = threading.Lock()
 
@@ -293,8 +395,12 @@ class ResetPasswordRequest(BaseModel):
     new_password: str
 
 
+SPEAKER_ROLES = {"familiar_adult", "child_self"}
+
+
 class RenameSpeakerRequest(BaseModel):
-    display_name: str
+    display_name: Optional[str] = None
+    role: Optional[str] = None
 
 
 class FlagFamiliarRequest(BaseModel):
@@ -338,6 +444,8 @@ class DetectLocationRequest(BaseModel):
     lng: Optional[float] = None
     battery_percent: Optional[int] = None
     battery: Optional[int] = None
+    accuracy_m: Optional[float] = None
+    location_ts_ms: Optional[int] = None
 
 
 def _extract_bearer(auth_header: Optional[str]) -> str:
@@ -352,38 +460,77 @@ def _decode_audio_chunk(raw: bytes) -> Tuple[np.ndarray, int, str]:
     return decode_audio_chunk(raw)
 
 
-def get_current_parent(
+def get_principal(
     authorization: Optional[str] = Header(None), db: Session = Depends(get_db)
 ) -> Dict[str, Any]:
-    from app.utils.prd_services import parse_jwt
-    token = _extract_bearer(authorization)
-    payload = parse_jwt(token)
-    parent_id = payload.get("sub")
+    """Authenticate a parent session token or a device token.
+
+    Returns {"parent_id", "device_id", "kind"}; device_id is set only for device tokens.
+    """
+    claims = security.parse_token(_extract_bearer(authorization))
+    parent_id = claims.get("sub")
     if not parent_id:
         raise HTTPException(status_code=401, detail="invalid_token_subject")
+    kind = claims.get("typ", "access")
+    if kind == "device":
+        device_id = str(claims.get("did") or "")
+        try:
+            device = svc.get_device(db, str(parent_id), device_id)
+        except HTTPException as exc:
+            raise HTTPException(status_code=401, detail="device_not_found") from exc
+        if device.role != DeviceRole.child_device or int(device.access_token_version or 0) != int(claims.get("ver", -1)):
+            raise HTTPException(status_code=401, detail="device_token_revoked")
+        return {"parent_id": str(parent_id), "device_id": device_id, "kind": "device"}
+    if kind != "access":
+        raise HTTPException(status_code=401, detail="invalid_token_type")
     try:
         svc.get_parent(db, parent_id)
     except HTTPException as exc:
         raise HTTPException(status_code=401, detail="parent_not_found") from exc
-    return {"parent_id": parent_id}
+    return {"parent_id": str(parent_id), "device_id": None, "kind": "parent"}
+
+
+def get_current_parent(principal: Dict[str, Any] = Depends(get_principal)) -> Dict[str, Any]:
+    """Parent-only routes: alerts, speakers, monitoring control, device management."""
+    if principal["kind"] != "parent":
+        raise HTTPException(status_code=403, detail="parent_session_required")
+    return principal
+
+
+def _require_device_access(principal: Dict[str, Any], device_id: str) -> None:
+    """A device token may only act on its own device."""
+    if principal["kind"] == "device" and str(device_id) != str(principal["device_id"]):
+        raise HTTPException(status_code=403, detail="device_mismatch")
 
 
 def _parent_id_from_access_token(token: str) -> str:
-    from app.utils.prd_services import parse_jwt
-
-    payload = parse_jwt(token)
-    parent_id = payload.get("sub")
+    claims = security.parse_token(token)
+    parent_id = claims.get("sub")
     if not parent_id:
         raise HTTPException(status_code=401, detail="invalid_token_subject")
+    if claims.get("typ", "access") != "access":
+        raise HTTPException(status_code=403, detail="parent_session_required")
     return str(parent_id)
 
 
-def _verify_google_like_token(id_token: str) -> Dict[str, Any]:
-    allow_dev = os.environ.get("SAFEEAR_ALLOW_DEV_GOOGLE_TOKEN", "true").lower() == "true"
+def _token_response(parent, refresh_token: str) -> Dict[str, Any]:
+    return {
+        "access_token": security.make_access_token(str(parent.id)),
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "expires_in": security.ACCESS_TOKEN_TTL_SEC,
+        "parent": {
+            "id": str(parent.id),
+            "email": parent.email,
+            "display_name": parent.display_name,
+        },
+    }
 
-    # Dev token bypass (for testing/development).
+
+def _verify_google_like_token(id_token: str) -> Dict[str, Any]:
+    # Dev token bypass: local testing only, off by default and never in production.
     if id_token.startswith("dev:"):
-        if not allow_dev:
+        if not security.dev_tokens_allowed():
             raise HTTPException(status_code=401, detail="dev_token_disabled")
         dev_sub = id_token.split(":", 1)[1].strip()
         if not dev_sub:
@@ -428,9 +575,8 @@ def _verify_google_like_token(id_token: str) -> Dict[str, Any]:
         aud = str(info.get("aud", "")).strip()
         if aud not in allowed_client_ids:
             logger.warning(
-                "GOOGLE_AUTH_AUDIENCE_MISMATCH | aud=%s | allowed=%s",
-                aud,
-                ",".join(allowed_client_ids),
+                "GOOGLE_AUTH_AUDIENCE_MISMATCH | allowed_count=%d",
+                len(allowed_client_ids),
             )
             raise HTTPException(status_code=401, detail="invalid_google_audience")
         return {"sub": info.get("sub"), "email": info.get("email"), "name": info.get("name")}
@@ -445,7 +591,7 @@ def _send_password_reset_email(to_email: str, reset_link: str) -> None:
     sendgrid_api_key = os.environ.get("SENDGRID_API_KEY")
     from_email = os.environ.get("SENDGRID_FROM_EMAIL", "alerts@safeear.app")
     if not sendgrid_api_key:
-        logger.info("PASSWORD_RESET_EMAIL_SKIPPED | email=%s | reason=sendgrid_not_configured", to_email)
+        logger.info("PASSWORD_RESET_EMAIL_SKIPPED | reason=sendgrid_not_configured")
         return
     try:
         from sendgrid import SendGridAPIClient
@@ -463,7 +609,7 @@ def _send_password_reset_email(to_email: str, reset_link: str) -> None:
         )
         SendGridAPIClient(sendgrid_api_key).send(message)
     except Exception as exc:
-        logger.warning("PASSWORD_RESET_EMAIL_FAILED | email=%s | reason=%s", to_email, str(exc))
+        logger.warning("PASSWORD_RESET_EMAIL_FAILED | reason=%s", str(exc))
 
 
 def _dt_to_epoch_ms(value: Optional[datetime]) -> Optional[int]:
@@ -487,6 +633,7 @@ def _alert_response_payload(row: Any) -> Dict[str, Any]:
         "longitude": row.longitude,
         "lat": row.latitude,
         "lng": row.longitude,
+        "alert_type": getattr(row, "alert_type", None) or "unenrolled_contact",
         "acknowledged_at": row.acknowledged_at.isoformat() if row.acknowledged_at else None,
         "acknowledged_at_ms": _dt_to_epoch_ms(row.acknowledged_at),
         "created_at": row.created_at.isoformat() if row.created_at else None,
@@ -525,72 +672,33 @@ def _device_payload(row: Device) -> Dict[str, Any]:
     }
 
 
-@app.post("/auth/google")
+@app.post("/auth/google", dependencies=[Depends(auth_rate_limit)])
 def auth_google(body: GoogleAuthRequest, db: Session = Depends(get_db)):
-    from app.utils.prd_services import make_jwt, save_refresh_token
     info = _verify_google_like_token(body.id_token)
     sub = info.get("sub")
     if not sub:
         raise HTTPException(status_code=401, detail="google_sub_missing")
 
     parent = svc.upsert_parent(db, str(sub), info.get("email"), info.get("name"))
-    access_token = make_jwt(str(parent.id))
-    refresh_token = save_refresh_token(str(parent.id))
-    return {
-        "access_token": access_token,
-        "refresh_token": refresh_token,
-        "token_type": "bearer",
-        "expires_in": 604800,
-        "parent": {
-            "id": str(parent.id),
-            "email": parent.email,
-            "display_name": parent.display_name
-        },
-    }
+    return _token_response(parent, auth_tokens.issue_refresh_token(db, str(parent.id)))
 
 
-@app.post("/auth/register-email")
+@app.post("/auth/register-email", dependencies=[Depends(auth_rate_limit)])
 def auth_register_email(body: EmailRegisterRequest, db: Session = Depends(get_db)):
-    from app.utils.prd_services import make_jwt, save_refresh_token
-
     parent = svc.register_parent_with_email(db, body.email, body.password, body.display_name)
-    access_token = make_jwt(str(parent.id))
-    refresh_token = save_refresh_token(str(parent.id))
-    return {
-        "access_token": access_token,
-        "refresh_token": refresh_token,
-        "token_type": "bearer",
-        "expires_in": 604800,
-        "parent": {
-            "id": str(parent.id),
-            "email": parent.email,
-            "display_name": parent.display_name,
-        },
-    }
+    return _token_response(parent, auth_tokens.issue_refresh_token(db, str(parent.id)))
 
 
-@app.post("/auth/login-email")
+@app.post("/auth/login-email", dependencies=[Depends(auth_rate_limit)])
 def auth_login_email(body: EmailLoginRequest, db: Session = Depends(get_db)):
-    from app.utils.prd_services import make_jwt, save_refresh_token
-
     parent = svc.login_parent_with_email(db, body.email, body.password)
-    access_token = make_jwt(str(parent.id))
-    refresh_token = save_refresh_token(str(parent.id))
-    return {
-        "access_token": access_token,
-        "refresh_token": refresh_token,
-        "token_type": "bearer",
-        "expires_in": 604800,
-        "parent": {
-            "id": str(parent.id),
-            "email": parent.email,
-            "display_name": parent.display_name,
-        },
-    }
+    return _token_response(parent, auth_tokens.issue_refresh_token(db, str(parent.id)))
 
 
-@app.post("/auth/forgot-password")
+@app.post("/auth/forgot-password", dependencies=[Depends(auth_rate_limit)])
 def auth_forgot_password(body: ForgotPasswordRequest, db: Session = Depends(get_db)):
+    # Per-address limit so the endpoint cannot be used to flood someone's inbox.
+    enforce_rate_limit(f"forgot:{(body.email or '').strip().lower()}", 5, 3600.0)
     reset_token = svc.create_password_reset_token(db, body.email, ttl_sec=3600)
 
     reset_base_url = os.environ.get("SAFEEAR_PASSWORD_RESET_URL")
@@ -598,34 +706,33 @@ def auth_forgot_password(body: ForgotPasswordRequest, db: Session = Depends(get_
         reset_link = f"{reset_base_url}?token={reset_token}"
         _send_password_reset_email(body.email, reset_link)
 
+    # Identical response whether or not the address is registered.
     response: Dict[str, Any] = {
         "status": "ok",
         "message": "If this email is registered, a reset link has been issued.",
     }
-    if reset_token and os.environ.get("SAFEEAR_DEBUG_RETURN_RESET_TOKEN", "false").lower() == "true":
+    if reset_token and not security.is_production() and os.environ.get("SAFEEAR_DEBUG_RETURN_RESET_TOKEN", "false").lower() == "true":
         response["reset_token"] = reset_token
-    if reset_token and not reset_base_url:
-        response["note"] = "Set SAFEEAR_PASSWORD_RESET_URL to enable email reset links."
     return response
 
 
-@app.post("/auth/reset-password")
+@app.post("/auth/reset-password", dependencies=[Depends(auth_rate_limit)])
 def auth_reset_password(body: ResetPasswordRequest, db: Session = Depends(get_db)):
-    svc.reset_password_with_token(db, body.token, body.new_password)
+    parent_id = svc.reset_password_with_token(db, body.token, body.new_password)
+    if parent_id:
+        # A password reset ends every existing session.
+        auth_tokens.revoke_all_for_parent(db, str(parent_id))
     return {"status": "ok", "message": "password_updated"}
 
 
-@app.post("/auth/refresh")
+@app.post("/auth/refresh", dependencies=[Depends(auth_rate_limit)])
 def auth_refresh(body: RefreshRequest, db: Session = Depends(get_db)):
-    from app.utils.prd_services import consume_refresh_token, make_jwt, save_refresh_token
-    parent_id = consume_refresh_token(body.refresh_token)
-    access_token = make_jwt(parent_id)
-    refresh_token = save_refresh_token(parent_id)
+    parent_id, refresh_token = auth_tokens.rotate_refresh_token(db, body.refresh_token)
     return {
-        "access_token": access_token,
+        "access_token": security.make_access_token(parent_id),
         "refresh_token": refresh_token,
         "token_type": "bearer",
-        "expires_in": 604800,
+        "expires_in": security.ACCESS_TOKEN_TTL_SEC,
     }
 
 
@@ -635,15 +742,27 @@ def auth_logout(
     refresh_token: Optional[str] = None,
     db: Session = Depends(get_db),
 ):
-    from app.utils.prd_services import revoke_refresh_token
-
     # Some mobile clients cannot reliably send a JSON body with DELETE.
     token = (body.refresh_token if body else None) or refresh_token
     if not token:
         raise HTTPException(status_code=422, detail="refresh_token_required")
 
-    revoke_refresh_token(token)
+    auth_tokens.revoke_refresh_token(db, token)
     return {"status": "ok"}
+
+
+class DeleteAccountRequest(BaseModel):
+    confirm: str
+
+
+@app.delete("/auth/account")
+def delete_account(body: DeleteAccountRequest, current=Depends(get_current_parent), db: Session = Depends(get_db)):
+    """Permanently delete the account and every recording, voiceprint and device."""
+    if body.confirm != "DELETE":
+        raise HTTPException(status_code=422, detail='confirm must be "DELETE"')
+    svc.delete_parent_account(db, current["parent_id"])
+    logger.info("ACCOUNT_DELETED | parent_id=%s", current["parent_id"])
+    return {"status": "deleted"}
 
 
 @app.post("/enroll/speaker")
@@ -652,7 +771,9 @@ async def enroll_speaker(
     display_name: str = Form(...),
     speaker_id: Optional[str] = Form(None),
     # Change 1: accept speaker role for 3-category decision logic
-    role: str = Form("familiar_adult"),
+    # familiar_adult | child_self.  Omitted = keep the speaker's current role
+    # (new speakers default to familiar_adult), so adding a sample never resets it.
+    role: Optional[str] = Form(None),
     file: Optional[UploadFile] = File(None),
     audio: Optional[UploadFile] = File(None),
     current=Depends(get_current_parent),
@@ -663,24 +784,27 @@ async def enroll_speaker(
         raise HTTPException(status_code=422, detail="missing_audio_file")
 
     # Validate role
-    allowed_roles = {"familiar_adult", "child_self"}
-    if role not in allowed_roles:
-        raise HTTPException(status_code=422, detail=f"invalid_role: must be one of {sorted(allowed_roles)}")
+    if role is not None and role not in SPEAKER_ROLES:
+        raise HTTPException(status_code=422, detail=f"invalid_role: must be one of {sorted(SPEAKER_ROLES)}")
 
     parent_id = current["parent_id"]
     # For updates, ensure the target speaker exists before processing audio.
     speaker = svc.get_speaker(db, parent_id, speaker_id) if speaker_id else None
 
+    data = await _read_upload_limited(upload, MAX_ENROLL_BYTES)
     os.makedirs(TEMP_DIR, exist_ok=True)
     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav", dir=TEMP_DIR) as tmp:
-        shutil.copyfileobj(upload.file, tmp)
+        tmp.write(data)
         temp_path = tmp.name
 
     try:
-        embs, stage_info = run_enroll_embedding(temp_path)
+        embs, stage_info = await run_in_threadpool(run_enroll_embedding, temp_path)
     except ValueError as exc:
         logger.warning(f"ENROLL_SPEAKER_FAILED | parent_id={parent_id} | reason={str(exc)}")
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=400,
+            detail={"code": str(exc), "message": enrollment_rejection_message(str(exc))},
+        ) from exc
     finally:
         try:
             os.remove(temp_path)
@@ -691,11 +815,11 @@ async def enroll_speaker(
     if speaker is None:
         speaker = svc.create_speaker(db, parent_id, display_name)
 
-    # Persist speaker role (Change 1)
-    if hasattr(speaker, "role"):
+    if role is not None and speaker.role != role:
         speaker.role = role
         db.commit()
         db.refresh(speaker)
+        svc.invalidate_gallery(parent_id)
 
     for idx, emb in enumerate(embs):
         emb_arr = np.asarray(emb, dtype=np.float32).reshape(-1)
@@ -717,7 +841,7 @@ async def enroll_speaker(
         svc.save_speaker_embedding(db, parent_id, str(speaker.id), emb)
 
     # Compute and store speaker quality metrics
-    _, quality_label = svc.compute_and_store_enrollment_quality(db, parent_id, str(speaker.id))
+    quality_score, quality_label = svc.compute_and_store_enrollment_quality(db, parent_id, str(speaker.id))
 
     # Trigger auto-calibration when enough samples are available (Change 5)
     try:
@@ -764,6 +888,8 @@ async def enroll_speaker(
         "enrollment_complete": enrollment_complete,
         "items": refreshed_items,
         "stages": stage_info,
+        "quality_score": quality_score,
+        "quality_label": quality_label,
     }
     if quality_label == "poor":
         response["warning"] = "Low enrollment quality. Try recording in a quieter space, speaking naturally, or adding more samples."
@@ -788,7 +914,16 @@ def patch_speaker(
     current=Depends(get_current_parent),
     db: Session = Depends(get_db),
 ):
-    row = svc.rename_speaker(db, current["parent_id"], speaker_id, body.display_name)
+    if body.role is not None and body.role not in SPEAKER_ROLES:
+        raise HTTPException(status_code=422, detail=f"invalid_role: must be one of {sorted(SPEAKER_ROLES)}")
+    row = svc.get_speaker(db, current["parent_id"], speaker_id)
+    if body.display_name and body.display_name.strip():
+        row = svc.rename_speaker(db, current["parent_id"], speaker_id, body.display_name.strip())
+    if body.role is not None and row.role != body.role:
+        row.role = body.role
+        db.commit()
+        db.refresh(row)
+        svc.invalidate_gallery(current["parent_id"])
     speaker_payload = _speaker_payload(row, request, current["parent_id"])
     return {
         "status": "ok",
@@ -809,7 +944,7 @@ async def upload_speaker_avatar(
     if content_type not in ALLOWED_AVATAR_CONTENT_TYPES:
         raise HTTPException(status_code=415, detail="unsupported_profile_image_type")
 
-    raw = await profile_image.read()
+    raw = await profile_image.read(AVATAR_MAX_SIZE_BYTES + 1)
     if not raw:
         raise HTTPException(status_code=422, detail="empty_profile_image")
     if len(raw) > AVATAR_MAX_SIZE_BYTES:
@@ -843,11 +978,14 @@ def remove_speaker(speaker_id: str, current=Depends(get_current_parent), db: Ses
 
 
 @app.post("/detect/location")
-def detect_location(body: DetectLocationRequest, current=Depends(get_current_parent), db: Session = Depends(get_db)):
+def detect_location(body: DetectLocationRequest, current=Depends(get_principal), db: Session = Depends(get_db)):
+    _require_device_access(current, body.device_id)
     lat = body.latitude if body.latitude is not None else body.lat
     lon = body.longitude if body.longitude is not None else body.lng
     battery_percent = body.battery_percent if body.battery_percent is not None else body.battery
     row = svc.update_device_location(db, current["parent_id"], body.device_id, lat, lon)
+    if lat is not None and lon is not None:
+        row = child_safety.store_fix(db, row, lat, lon, body.accuracy_m, body.location_ts_ms)
     if battery_percent is not None:
         row = svc.update_device_battery(db, current["parent_id"], body.device_id, battery_percent)
     else:
@@ -862,6 +1000,92 @@ def detect_location(body: DetectLocationRequest, current=Depends(get_current_par
     return {"status": "ok", "device_id": body.device_id, "latitude": lat, "longitude": lon}
 
 
+STREAM_GAP_MS = int(os.environ.get("SAFEEAR_STREAM_GAP_MS", "3000"))
+STALE_CHUNK_MS = int(os.environ.get("SAFEEAR_STALE_CHUNK_MS", "30000"))
+
+
+def _apply_stream_order(
+    parent_id: str,
+    device_id: str,
+    seq: Optional[int],
+    t_start_ms: Optional[int],
+    sent_at_ms: Optional[int],
+    n_samples: int,
+    sr: int,
+    stream_id: Optional[str] = None,
+    silent_skipped: int = 0,
+) -> Optional[Dict[str, Any]]:
+    """Enforce chunk ordering for clients that send seq / t_start_ms.
+
+    Returns a response to send instead of processing (dropped chunk), or None to
+    continue.  A gap in the stream resets the analysis context so a stranger
+    streak never spans audio that was not heard back-to-back.  Clients that send
+    neither field keep the previous behaviour.
+    """
+    if seq is None and t_start_ms is None:
+        return None
+    # Both times come from the device clock, so their difference is reliable even
+    # when the device and server clocks disagree.
+    if t_start_ms is not None and sent_at_ms is not None and sent_at_ms - t_start_ms > STALE_CHUNK_MS:
+        logger.info("STREAM_STALE_CHUNK_DROPPED | device_id=%s | seq=%s | age_ms=%s", device_id, seq, sent_at_ms - t_start_ms)
+        return {"status": "stale_dropped", "seq": seq}
+
+    session = svc.get_or_create_session(parent_id, device_id)
+    # A new stream id means the device restarted capture (app restart, new
+    # recording session): its seq starts over, so begin from a clean context.
+    if stream_id and stream_id != session.stream_id:
+        if session.stream_id is not None:
+            logger.info("STREAM_RESTART | device_id=%s | stream_id=%s", device_id, stream_id)
+            svc.reset_stream(session)
+        session.stream_id = stream_id
+        session.last_seq = None
+        session.last_chunk_end_ms = None
+
+    if seq is not None and session.last_seq is not None and seq <= session.last_seq:
+        logger.info("STREAM_OUT_OF_ORDER_DROPPED | device_id=%s | seq=%s | last_seq=%s", device_id, seq, session.last_seq)
+        return {"status": "out_of_order_dropped", "seq": seq, "last_seq": session.last_seq}
+
+    # The device may skip uploading chunks it measured as silent (the server would
+    # reject them anyway).  Silence was still heard, so it is not a gap; only
+    # audio that was lost (dropped, stale, not captured) resets the context.
+    silent_skipped = max(0, int(silent_skipped or 0))
+    silent_ms = silent_skipped * (n_samples * 1000) // max(1, sr)
+    gap = False
+    if seq is not None and session.last_seq is not None and seq != session.last_seq + 1:
+        gap = True
+    if (
+        t_start_ms is not None
+        and session.last_chunk_end_ms is not None
+        and t_start_ms - session.last_chunk_end_ms - silent_ms > STREAM_GAP_MS
+    ):
+        gap = True
+    if gap:
+        logger.info(
+            "STREAM_GAP_RESET | device_id=%s | seq=%s | last_seq=%s | t_start_ms=%s | last_end_ms=%s",
+            device_id, seq, session.last_seq, t_start_ms, session.last_chunk_end_ms,
+        )
+        svc.reset_stream(session)
+    elif t_start_ms is not None and session.last_chunk_end_ms is not None:
+        # Silence the device heard but did not upload: keep it in the alert clip.
+        pad_ms = int(t_start_ms) - int(session.last_chunk_end_ms)
+        if pad_ms > 100:
+            svc.pad_clip_silence(session, pad_ms * sr // 1000)
+
+    if seq is not None:
+        session.last_seq = seq
+    if t_start_ms is not None:
+        session.last_chunk_end_ms = int(t_start_ms + (n_samples * 1000) // max(1, sr))
+    return None
+
+
+def _report_scoring_unavailable(parent_id: str) -> None:
+    try:
+        with SessionLocal() as db:
+            health_monitor.report_scoring_unavailable(db, parent_id)
+    except Exception as exc:
+        logger.warning("SCORING_UNAVAILABLE_REPORT_FAILED | parent_id=%s | reason=%s", parent_id, exc)
+
+
 @app.post("/detect/chunk")
 async def detect_chunk(
     device_id: str = Form(...),
@@ -872,13 +1096,39 @@ async def detect_chunk(
     longitude: Optional[float] = Form(None),
     battery_percent: Optional[int] = Form(None),
     battery: Optional[int] = Form(None),
-    current=Depends(get_current_parent),
+    seq: Optional[int] = Form(None),
+    t_start_ms: Optional[int] = Form(None),
+    sent_at_ms: Optional[int] = Form(None),
+    stream_id: Optional[str] = Form(None),
+    silent_skipped: int = Form(0),
+    current=Depends(get_principal),
     db: Session = Depends(get_db),
 ):
     upload = file or audio
     if upload is None:
         raise HTTPException(status_code=422, detail="missing_audio_chunk")
 
+    _require_device_access(current, device_id)
+    enforce_rate_limit(f"detect:{device_id}", DETECT_RATE_LIMIT_PER_SEC, 1.0)
+    raw = await _read_upload_limited(upload, MAX_CHUNK_BYTES)
+    # Decoding and model inference run on a worker thread so the event loop keeps
+    # serving other devices, websockets and heartbeats meanwhile.
+    return await run_in_threadpool(
+        _detect_chunk_sync, raw, upload, device_id, chunk_id, latitude, longitude,
+        battery_percent, battery, seq, t_start_ms, sent_at_ms, stream_id, current, db, silent_skipped,
+    )
+
+
+def _detect_chunk_sync(raw, upload, device_id, chunk_id, latitude, longitude, battery_percent, battery,
+                       seq, t_start_ms, sent_at_ms, stream_id, current, db, silent_skipped=0) -> Dict[str, Any]:
+    # Chunks from one device are processed one at a time (they share session state).
+    with svc.device_lock(current["parent_id"], device_id):
+        return _detect_chunk_locked(raw, upload, device_id, chunk_id, latitude, longitude, battery_percent,
+                                    battery, seq, t_start_ms, sent_at_ms, stream_id, current, db, silent_skipped)
+
+
+def _detect_chunk_locked(raw, upload, device_id, chunk_id, latitude, longitude, battery_percent, battery,
+                         seq, t_start_ms, sent_at_ms, stream_id, current, db, silent_skipped=0) -> Dict[str, Any]:
     parent_id = current["parent_id"]
     normalized_chunk_id = (chunk_id or "").strip() or None
     if normalized_chunk_id:
@@ -887,7 +1137,25 @@ async def detect_chunk(
             cached["idempotent_replay"] = True
             return cached
 
-    raw = await upload.read()
+    # Ownership is checked before any audio is decoded.
+    device = svc.get_device(db, parent_id, device_id)
+    if device.role != DeviceRole.child_device:
+        raise HTTPException(status_code=403, detail="only_child_devices_can_stream_audio")
+    if not device.monitoring_enabled:
+        # Monitoring switched off by the parent: drop the audio unprocessed.
+        return {"status": "monitoring_disabled", "monitoring_enabled": False}
+    if child_safety.check_parent_nearby_cached(db, parent_id, device):
+        # Parent-nearby rule: no detection while a parent phone is close by.
+        svc.update_device_activity(db, parent_id, device_id, device=device)
+        reported = battery_percent if battery_percent is not None else battery
+        if reported is not None:
+            svc.update_device_battery(db, parent_id, device_id, reported, device=device)
+        return {
+            "status": "paused_parent_nearby",
+            "monitoring_enabled": True,
+            "retry_after_ms": child_safety.PROXIMITY_CACHE_MS,
+        }
+
     if not raw:
         try:
             svc.update_device_activity(db, parent_id, device_id)
@@ -970,19 +1238,15 @@ async def detect_chunk(
             )
             raise HTTPException(status_code=400, detail="audio_chunk_must_be_16khz") from exc
 
-    arr = normalize_waveform(arr)
-
-    # Validate device role: only child_device can stream detection chunks
-    device = svc.get_device(db, parent_id, device_id)
-    if device.role != DeviceRole.child_device:
-        raise HTTPException(status_code=403, detail="only_child_devices_can_stream_audio")
+    # Loudness is normalized once per 1.5 s analysis window (evaluate_window), not per
+    # chunk: per-chunk gain made the level jump inside a window.
 
     # Mark device as active (for telemetry: is_online, last_seen_at)
-    device = svc.update_device_activity(db, parent_id, device_id)
+    device = svc.update_device_activity(db, parent_id, device_id, device=device)
 
     reported_battery = battery_percent if battery_percent is not None else battery
     if reported_battery is not None:
-        device = svc.update_device_battery(db, parent_id, device_id, reported_battery)
+        device = svc.update_device_battery(db, parent_id, device_id, reported_battery, device=device)
     else:
         logger.warning(
             "DEVICE_BATTERY_MISSING | endpoint=/detect/chunk | parent_id=%s | device_id=%s",
@@ -1002,6 +1266,12 @@ async def detect_chunk(
         decode_method,
     )
 
+    stream_status = _apply_stream_order(
+        parent_id, device_id, seq, t_start_ms, sent_at_ms, len(arr), sr, stream_id, silent_skipped,
+    )
+    if stream_status is not None:
+        return stream_status
+
     svc_result = DetectionService.process_audio_chunk(
         db=db,
         parent_id=parent_id,
@@ -1013,8 +1283,8 @@ async def detect_chunk(
     )
 
     if svc_result.get("status") != "ok":
-        _remember_detect_chunk_response(parent_id, device_id, normalized_chunk_id, svc_result)
         svc_result.pop("session", None)
+        _remember_detect_chunk_response(parent_id, device_id, normalized_chunk_id, svc_result)
         return svc_result
 
     session = svc_result["session"]
@@ -1032,6 +1302,24 @@ async def detect_chunk(
     T_LOW_eff = float(_tier3.get("t_low", T_LOW))
     now = now_ms()
 
+    def _capture(decision_value: str, fired: bool) -> None:
+        if not eval_capture.is_enabled():
+            return
+        buf = svc_result.get("inference_buffer")
+        n = int(svc_result.get("window_samples") or 0)
+        eval_capture.capture_window(
+            parent_id=parent_id,
+            device_id=device_id,
+            now_ms=now,
+            stage=stage,
+            decision=decision_value,
+            alert_fired=fired,
+            stranger_streak=session.stranger_streak,
+            centroid=current_stranger_centroid,
+            window=buf[-n:] if buf is not None and n > 0 else None,
+            sr=session.sr,
+        )
+
     # Change 12: Fetch/cache household config for context gates
     if session.last_config_fetch_ms == 0 or (now - session.last_config_fetch_ms) > 300000:
         session.household_config = svc.get_household_config_dict(db, parent_id)
@@ -1048,10 +1336,6 @@ async def detect_chunk(
     tier3_pass = stage.get("tier3", {}).get("passed", False)
     tier2_category = str(stage.get("tier2", {}).get("category", "uncertain"))
     tier2_confidence = float(stage.get("tier2", {}).get("confidence", 0.0))
-    allow_stranger_increment = (
-        (tier2_category == "human_speech" and tier2_confidence >= STRANGER_MIN_TIER2_CONF)
-        or (tier2_category == "uncertain" and tier2_confidence >= STRANGER_UNCERTAIN_CONF_FLOOR)
-    )
     perf_latency_ms = float(stage.get("perf", {}).get("processing_ms", 0.0))
     logger.info(f"STAGE_RESULT | score={score:.4f} | tier1_vad={tier1_pass} | tier2={tier2_pass} | tier3={tier3_pass} | stage_decision={stage.get('decision', 'unknown')}")
     _log_pipeline_decision(
@@ -1089,145 +1373,66 @@ async def detect_chunk(
         if session.obstruction_counter >= 4800:
             if (now - session.device_obstructed_alert_sent_at) > 3600000:  # throttle 1 hour
                 logger.warning(f"DEVICE_OBSTRUCTION_DETECTED | parent_id={parent_id} | device_id={device_id}")
-                from app.services.alert_service import create_and_escalate_alert
                 create_and_escalate_alert(db, parent_id, device_id, session, score=0.0, alert_type="device_obstructed")
                 session.device_obstructed_alert_sent_at = now
     elif tier2_pass:
         session.obstruction_counter = 0
 
     if not tier3_pass:
-        logger.warning(
-            "DETECT_CHUNK_TIER3_UNAVAILABLE | parent_id=%s | device_id=%s | stage_decision=%s",
-            parent_id,
-            device_id,
-            stage.get("decision", "unknown"),
+        if stage.get("decision") == "tier3_unavailable":
+            # The speaker model failed: tell the parent (throttled) instead of
+            # silently holding every window.
+            logger.error("DETECT_CHUNK_TIER3_UNAVAILABLE | parent_id=%s | device_id=%s", parent_id, device_id)
+            threading.Thread(target=_report_scoring_unavailable, args=(parent_id,), daemon=True).start()
+        # Rejected windows (silence, music, too little speech) report the stage's
+        # reason; "hold_tier3_unavailable" is reserved for a speaker-model failure.
+        not_scored_decision = (
+            "hold_tier3_unavailable" if stage.get("decision") == "tier3_unavailable"
+            else str(stage.get("decision") or "rejected")
         )
         response_payload = {
             "status": "ok",
-            "decision": "hold_tier3_unavailable",
+            "decision": not_scored_decision,
             "stranger_streak": session.stranger_streak,
             "score": score,
+            "voiced_ms": (stage.get("tier1_vad") or {}).get("voiced_ms"),
             "thresholds": {"t_high": T_HIGH, "t_low": T_LOW},
             "stage": stage,
             "alert_fired": False,
             "alert_id": None,
         }
+        _capture(not_scored_decision, False)
         _remember_detect_chunk_response(parent_id, device_id, normalized_chunk_id, response_payload)
         return response_payload
 
-    if score >= T_HIGH_eff:
-        session.familiar_recovery_streak += 1
-        if session.stranger_streak > 0 and session.familiar_recovery_streak < FAMILIAR_RESET_MIN_STREAK:
-            decision = "uncertain_recovery"
-            logger.info(
-                "SCORE_DECISION | score=%.4f >= t_high=%.4f but pending_familiar_recovery "
-                "| decision=uncertain_recovery | recovery_streak=%s/%s | stranger_streak=%s",
-                score, T_HIGH_eff,
-                session.familiar_recovery_streak, FAMILIAR_RESET_MIN_STREAK, session.stranger_streak,
-            )
-        else:
-            session.stranger_streak = 0
-            session.stranger_weight_sum = 0.0
-            session.familiar_recovery_streak = 0
-            if closest_speaker_role == "child_self":
-                # Change 1: child match — suppress streak, do NOT update grace window
-                decision = "child_self_match"
-                
-                # Change 10: drift tracking
-                session.child_drift_scores.append(score)
-                # Flush if we have enough scores or it's been a while (handled at end of function or periodically)
-                assert closest_speaker_id is not None
-                drift_warning = svc.flush_child_drift_scores(db, parent_id, closest_speaker_id, session)
-                if drift_warning:
-                    # In a real system, you might emit a WS event or push notification here
-                    logger.warning("DRIFT_WARNING | parent_id=%s | child_id=%s | drift threshold breached", parent_id, closest_speaker_id)
-                
-                logger.info(
-                    "SCORE_DECISION | score=%.4f >= t_high_eff=%.4f | decision=child_self_match | streak_reset",
-                    score, T_HIGH_eff,
-                )
-            else:
-                session.last_familiar_ms = now
-                session.last_familiar_speaker_id = str(closest_speaker_id) if closest_speaker_id else None
-                svc.clear_stranger_identity(session)
-                decision = "familiar"
-                logger.info(
-                    "SCORE_DECISION | score=%.4f >= t_high=%.4f | decision=familiar | streak_reset",
-                    score, T_HIGH_eff,
-                )
+    params = dataclasses.replace(DECISION_PARAMS, t_high=T_HIGH_eff, t_low=T_LOW_eff)
+    result = decide(
+        session,
+        score=score,
+        closest_speaker_id=closest_speaker_id,
+        closest_speaker_role=closest_speaker_role,
+        tier2_category=tier2_category,
+        tier2_confidence=tier2_confidence,
+        current_stranger_centroid=current_stranger_centroid,
+        now_ms=now,
+        params=params,
+    )
+    decision = result.decision
+    alert_block_reason = result.block_reason
+    logger.info(
+        "SCORE_DECISION | score=%.4f | t_high=%.4f | t_low=%.4f | decision=%s | streak=%s | weight=%.2f "
+        "| tier2_category=%s | tier2_confidence=%.4f | speaker_id=%s | role=%s",
+        score, T_HIGH_eff, T_LOW_eff, decision, session.stranger_streak, session.stranger_weight_sum,
+        tier2_category, tier2_confidence, closest_speaker_id, closest_speaker_role,
+    )
 
-    elif score <= T_LOW_eff:
-        session.familiar_recovery_streak = 0
-        within_familiar_grace = (
-            session.last_familiar_ms > 0
-            and (now - session.last_familiar_ms) <= FAMILIAR_GRACE_SEC * 1000
-        )
-        same_recent_speaker = (
-            bool(closest_speaker_id)
-            and bool(session.last_familiar_speaker_id)
-            and str(closest_speaker_id) == str(session.last_familiar_speaker_id)
-        )
-        mild_post_familiar_dip = score >= max(FAMILIAR_HOLD_FLOOR, T_LOW - FAMILIAR_GRACE_MARGIN)
-        strong_human_signal = tier2_category == "human_speech" and tier2_confidence >= FAMILIAR_GRACE_MIN_CONF
-
-        if within_familiar_grace and same_recent_speaker and session.stranger_streak == 0 and mild_post_familiar_dip and strong_human_signal:
-            session.stranger_streak = 0
-            session.stranger_weight_sum = 0.0
-            decision = "uncertain_post_familiar"
-            logger.info(
-                f"SCORE_DECISION | score={score:.4f} <= t_low={T_LOW} but held_by_familiar_grace "
-                f"| decision=uncertain_post_familiar | grace_sec={FAMILIAR_GRACE_SEC} | floor={FAMILIAR_HOLD_FLOOR}"
-            )
-        elif not allow_stranger_increment:
-            decision = "uncertain_noise"
-            logger.info(
-                "SCORE_DECISION | score=%.4f <= t_low=%.2f but blocked_by_tier2_guard "
-                "| decision=uncertain_noise | tier2_category=%s | tier2_confidence=%.4f",
-                score,
-                T_LOW,
-                tier2_category,
-                tier2_confidence,
-            )
-        else:
-            session.stranger_streak += 1
-            from app.services.decision_engine import _streak_weight
-            session.stranger_weight_sum += _streak_weight(score, T_LOW_eff, T_HIGH_eff, tier2_confidence)
-            decision = "stranger_candidate"
-            svc.record_confirmed_stranger_window(session, current_stranger_centroid)
-            logger.info(f"SCORE_DECISION | score={score:.4f} <= t_low={T_LOW} | decision=stranger_candidate | streak_incremented={session.stranger_streak} weight={session.stranger_weight_sum:.2f}")
-    else:
-        session.familiar_recovery_streak = 0
-        soft_limit = T_LOW + SOFT_STRANGER_MARGIN
-        likely_human_speech = tier2_category == "human_speech" and tier2_confidence >= SOFT_STRANGER_MIN_CONF
-
-        if score <= soft_limit and likely_human_speech:
-            session.stranger_streak += 1
-            from app.services.decision_engine import _streak_weight
-            session.stranger_weight_sum += _streak_weight(score, soft_limit, T_HIGH_eff, tier2_confidence)
-            decision = "stranger_candidate_soft"
-            svc.record_confirmed_stranger_window(session, current_stranger_centroid)
-            logger.info(
-                "SCORE_DECISION | soft_stranger_window | score=%.4f | soft_limit=%.4f | "
-                "tier2_category=%s | tier2_confidence=%.4f | streak_incremented=%s weight=%.2f",
-                score,
-                soft_limit,
-                tier2_category,
-                tier2_confidence,
-                session.stranger_streak,
-                session.stranger_weight_sum,
-            )
-        else:
-            decision = "uncertain"
-            logger.info(f"SCORE_DECISION | t_low < score={score:.4f} < t_high | decision=uncertain")
-
-    # For clearly low scores, fast-track only after at least N consecutive stranger windows.
-    if score <= FORCE_ALERT_SCORE and session.stranger_streak >= FORCE_ALERT_MIN_STREAK:
-        old_streak = session.stranger_streak
-        session.stranger_weight_sum = max(session.stranger_weight_sum, 2.5)  # fast track weight
-        logger.info(
-            f"FAST_TRACK_ALERT | score={score:.4f} <= force_alert_score={FORCE_ALERT_SCORE} | "
-            f"min_streak={FORCE_ALERT_MIN_STREAK} | weight_updated_to={session.stranger_weight_sum:.2f}"
-        )
+    # Child voice drift tracking, flushed to the DB in batches rather than per window.
+    if result.child_self_match and closest_speaker_id:
+        session.child_drift_scores.append(score)
+        if len(session.child_drift_scores) >= CHILD_DRIFT_FLUSH_EVERY:
+            drift_warning = svc.flush_child_drift_scores(db, parent_id, closest_speaker_id, session)
+            if drift_warning:
+                logger.warning("DRIFT_WARNING | parent_id=%s | child_id=%s | drift threshold breached", parent_id, closest_speaker_id)
 
     # Capture the full stranger episode instead of only the last rolling window.
     if session.stranger_streak > 0:
@@ -1252,95 +1457,62 @@ async def detect_chunk(
     else:
         svc.clear_stranger_segment(session)
 
-    # ------------------------------------------------------------------ #
-    # Change 7: Distress alert path (parallel to identity streak)         #
-    # Fires independently, bypassing the identity streak and debounce.    #
-    # ------------------------------------------------------------------ #
-    DISTRESS_ALERT_THRESHOLD = float(os.environ.get("SAFEEAR_DISTRESS_ALERT_THRESHOLD", "0.65"))
-    DISTRESS_CONFIRM_WINDOWS = int(os.environ.get("SAFEEAR_DISTRESS_CONFIRM_WINDOWS", "2"))
+    # Identity (unenrolled contact) alert.
+    if result.should_alert:
+        if result.debounce_reset_similarity is not None:
+            logger.info(
+                "DEBOUNCE_RESET_SPEAKER_CHANGE | parent_id=%s | device_id=%s | similarity=%.4f | threshold=%.2f",
+                parent_id, device_id, result.debounce_reset_similarity, params.speaker_change_threshold,
+            )
+        session.stranger_segment_ended_ms = now
+        aid = create_and_escalate_alert(
+            db, parent_id, device_id, session, score,
+            current_stranger_centroid=current_stranger_centroid,
+        )
+        if aid:
+            alert_fired = True
+            alert_id = aid
+            logger.info("IDENTITY_ALERT_FIRED | parent_id=%s | device_id=%s | score=%.4f | alert_id=%s", parent_id, device_id, score, aid)
+        else:
+            alert_block_reason = "alert_creation_failed"
+    elif alert_block_reason:
+        logger.info(
+            "ALERT_BLOCKED | reason=%s | streak=%s/%s | weight=%.2f | last_alert_ms=%s",
+            alert_block_reason, session.stranger_streak, params.alert_trigger_streak,
+            session.stranger_weight_sum, session.last_alert_ms,
+        )
 
+    # Distress alert path (opt-in, independent of the identity streak and debounce).
     distress_score = float(distress_info.get("distress_score", 0.0))
     distress_class = distress_info.get("distress_class")
-    if distress_score >= DISTRESS_ALERT_THRESHOLD:
-        session.distress_streak = getattr(session, "distress_streak", 0) + 1
-    else:
-        session.distress_streak = 0
-
-    if session.distress_streak >= DISTRESS_CONFIRM_WINDOWS and not alert_fired:
-        distress_debounce_elapsed = (now - session.last_alert_ms) >= 10_000  # 10 s distress debounce
-        if distress_debounce_elapsed:
-            try:
-                from app.services.alert_service import create_and_escalate_alert
-                distress_alert_id = create_and_escalate_alert(
-                    db, parent_id, device_id, session, distress_score,
-                    alert_type="distress",
-                )
-                if distress_alert_id:
-                    alert_fired = True
-                    alert_id = distress_alert_id
-                    decision = "distress_alert"
-                    session.distress_streak = 0
-                    logger.info(
-                        "DISTRESS_ALERT_FIRED | parent_id=%s | device_id=%s | score=%.4f | class=%s | alert_id=%s",
-                        parent_id, device_id, distress_score, distress_class, distress_alert_id,
-                    )
-            except Exception as _da_exc:
-                logger.error("DISTRESS_ALERT_ERROR | parent_id=%s | reason=%s", parent_id, _da_exc)
-    # ------------------------------------------------------------------ #
-    # Identity Alert Triggering (Change 11 & Change 12)                  #
-    # ------------------------------------------------------------------ #
-    alert_weight_threshold = session.household_config.get("alert_weight_threshold", 2.5) if session.household_config else 2.5
-    
-    from app.services.decision_engine import _should_alert
-    can_alert, block_reason = _should_alert(session, now)
-    
-    if not can_alert:
-        alert_block_reason = block_reason
-        session.stranger_streak = 0
-        session.stranger_weight_sum = 0.0
-        svc.clear_stranger_segment(session)
-        svc.clear_stranger_identity(session)
-        logger.info("ALERT_SUPPRESSED | block_reason=%s", block_reason)
-    elif session.stranger_weight_sum >= alert_weight_threshold:
-        debounce_elapsed = (now - session.last_alert_ms) >= DEBOUNCE_SEC * 1000
-        if not debounce_elapsed:
-            from app.services.decision_engine import _has_speaker_changed
-            speaker_changed, similarity = _has_speaker_changed(
-                session, current_stranger_centroid, float(os.environ.get("SAFEEAR_SPEAKER_CHANGE_THRESHOLD", "0.45"))
-            )
-            if speaker_changed:
-                session.last_alert_ms = 0
-                debounce_elapsed = True
-                logger.info(
-                    f"DEBOUNCE_RESET_ON_SPEAKER_CHANGE | old_speaker_reset | "
-                    f"similarity={similarity:.4f} < {os.environ.get('SAFEEAR_SPEAKER_CHANGE_THRESHOLD', '0.45')}"
-                )
-        if debounce_elapsed:
-            session.stranger_segment_ended_ms = now
-            try:
-                from app.services.alert_service import create_and_escalate_alert
-                aid = create_and_escalate_alert(db, parent_id, device_id, session, score)
-                if aid:
-                    alert_fired = True
-                    alert_id = aid
-                    logger.info(f"IDENTITY_ALERT_FIRED | parent_id={parent_id} | device_id={device_id} | score={score:.4f} | alert_id={aid}")
-            except Exception as e:
-                logger.error(f"ALERT_ESCALATION_FAILED | parent_id={parent_id} | device_id={device_id} | exc={e}")
+    if ENABLE_DISTRESS_ALERTS:
+        if distress_score >= DISTRESS_ALERT_THRESHOLD:
+            session.distress_streak += 1
         else:
-            alert_block_reason = "debounced"
-            logger.info(
-                "ALERT_BLOCKED | alert_id=None | reason=debounced | last_alert_ms=%s | now=%s | debounce_sec=%s",
-                session.last_alert_ms, now, DEBOUNCE_SEC,
+            session.distress_streak = 0
+        distress_debounce_elapsed = (now - session.last_distress_alert_ms) >= DISTRESS_DEBOUNCE_SEC * 1000
+        if session.distress_streak >= DISTRESS_CONFIRM_WINDOWS and not alert_fired and distress_debounce_elapsed:
+            distress_alert_id = create_and_escalate_alert(
+                db, parent_id, device_id, session, distress_score,
+                alert_type="distress",
             )
-    else:
-        alert_block_reason = "insufficient_stranger_streak"
-        logger.info(f"ALERT_BLOCKED | alert_id=None | reason=insufficient_stranger_streak | weight={session.stranger_weight_sum:.2f} | required={alert_weight_threshold}")
+            if distress_alert_id:
+                alert_fired = True
+                alert_id = distress_alert_id
+                decision = "distress_alert"
+                session.distress_streak = 0
+                logger.info(
+                    "DISTRESS_ALERT_FIRED | parent_id=%s | device_id=%s | score=%.4f | class=%s | alert_id=%s",
+                    parent_id, device_id, distress_score, distress_class, distress_alert_id,
+                )
 
     response_payload = {
         "status": "ok",
         "decision": decision,
         "stranger_streak": session.stranger_streak,
         "score": score,
+        # Speech found in the window (debug view on the watch; no speaker identity).
+        "voiced_ms": (stage.get("tier1_vad") or {}).get("voiced_ms"),
         "thresholds": {"t_high": T_HIGH_eff, "t_low": T_LOW_eff},
         "distress": {
             "distress": distress_info.get("distress", False),
@@ -1369,12 +1541,18 @@ async def detect_chunk(
         "alert_fired": alert_fired,
         "alert_id": alert_id,
     }
+    _capture(decision, alert_fired)
+    svc.persist_session_state(session)
+    if current["kind"] == "device":
+        # The monitored device never needs per-speaker scores or thresholds.
+        response_payload = {k: v for k, v in response_payload.items() if k not in {"stage", "trigger", "distress"}}
     _remember_detect_chunk_response(parent_id, device_id, normalized_chunk_id, response_payload)
     return response_payload
 
 
 @app.delete("/detect/session")
-def stop_detect_session(device_id: str, current=Depends(get_current_parent), db: Session = Depends(get_db)):
+def stop_detect_session(device_id: str, current=Depends(get_principal), db: Session = Depends(get_db)):
+    _require_device_access(current, device_id)
     svc.stop_session(current["parent_id"], device_id)
     return {"status": "stopped", "device_id": device_id}
 
@@ -1387,7 +1565,7 @@ def get_alert_history(
     current=Depends(get_current_parent),
     db: Session = Depends(get_db),
 ):
-    rows = svc.list_alerts(db, current["parent_id"], limit=limit, offset=offset, since_ms=since_ms)
+    rows = svc.list_alerts(db, current["parent_id"], limit=max(1, min(limit, 200)), offset=max(0, offset), since_ms=since_ms)
     return {
         "items": [
             _alert_response_payload(row)
@@ -1423,7 +1601,7 @@ def acknowledge_alert(alert_id: str, current=Depends(get_current_parent), db: Se
 
 @app.post("/alerts/test-fire")
 def fire_test_alert(body: TestFireAlertRequest, current=Depends(get_current_parent), db: Session = Depends(get_db)):
-    if os.environ.get("SAFEEAR_ENABLE_TEST_ALERT_ENDPOINT", "true").lower() != "true":
+    if not security.test_endpoints_allowed():
         raise HTTPException(status_code=404, detail="endpoint_not_found")
 
     parent_id = current["parent_id"]
@@ -1523,7 +1701,10 @@ def flag_alert_as_familiar(
             "ALERT_CLIP_ENROLL_REJECTED | parent_id=%s | alert_id=%s | reason=%s",
             parent_id, alert_id, str(exc),
         )
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=400,
+            detail={"code": str(exc), "message": enrollment_rejection_message(str(exc))},
+        ) from exc
 
     for emb in embs:
         svc.save_speaker_embedding(db, parent_id, str(speaker.id), emb)
@@ -1595,11 +1776,11 @@ def create_device(
         raise HTTPException(status_code=422, detail="invalid_device_role")
     
     logger.info(
-        "DEVICE_REGISTRATION_START | parent_id=%s | role=%s | device_name=%s | device_token=%s",
+        "DEVICE_REGISTRATION_START | parent_id=%s | role=%s | device_name=%s | has_fcm_token=%s",
         parent_id,
         role,
         device_name,
-        device_token[:15] + "..." if device_token else None,
+        bool(device_token),
     )
     
     device = svc.create_device(db, parent_id, device_name, device_role, installation_id=installation_id, device_token=device_token)
@@ -1612,7 +1793,7 @@ def create_device(
         device.device_name,
     )
 
-    return {
+    payload: Dict[str, Any] = {
         "status": "created",
         "device": {
             "id": str(device.id),
@@ -1623,6 +1804,14 @@ def create_device(
             "device_token": device.device_token
         }
     }
+    if device.role == DeviceRole.child_device:
+        # The monitored device should keep only this restricted token, not the
+        # parent's session: it can stream audio but cannot read alerts, change
+        # enrolled voices or switch monitoring off.
+        payload["device"]["device_access_token"] = security.make_device_token(
+            str(device.parent_id), str(device.id), int(device.access_token_version or 0)
+        )
+    return payload
 
 
 @app.post("/devices/upsert")
@@ -1646,10 +1835,16 @@ def upsert_device(
 @app.get("/devices")
 def list_devices(
     since_ms: Optional[int] = None,
-    current=Depends(get_current_parent),
+    current=Depends(get_principal),
     db: Session = Depends(get_db),
 ):
     parent_id = current["parent_id"]
+    if current["kind"] == "device":
+        # A device only sees itself (it polls its own monitoring state).
+        item = _device_payload(svc.get_device(db, parent_id, current["device_id"]))
+        # The child device switches to precise GPS only while the parent-nearby rule is on.
+        item["precise_location"] = child_safety.read_config(db, parent_id)["parent_proximity_enabled"]
+        return {"items": [item]}
     logger.info("DEVICE_LIST_REQUEST | parent_id=%s", parent_id)
     
     rows = svc.list_devices(db, parent_id, since_ms=since_ms)
@@ -1677,10 +1872,21 @@ def list_devices(
 def patch_device_monitoring(
     device_id: str,
     body: DeviceMonitoringPatchRequest,
-    current=Depends(get_current_parent),
+    current=Depends(get_principal),
     db: Session = Depends(get_db),
 ):
     started_at = time.perf_counter()
+    if current["kind"] == "device":
+        # A child device may switch its own monitoring on, never off.
+        _require_device_access(current, device_id)
+        if not body.monitoring_enabled:
+            raise HTTPException(status_code=403, detail="only_parent_can_stop_monitoring")
+    if body.monitoring_enabled and not svc.list_speakers(db, current["parent_id"]):
+        # Without an enrolled voice every speaker would be reported as a stranger.
+        raise HTTPException(
+            status_code=409,
+            detail="Enroll at least one family voice before turning monitoring on.",
+        )
     row, command_sent = svc.set_device_monitoring(
         db,
         current["parent_id"],
@@ -1707,9 +1913,10 @@ class DeviceTokenPatchRequest(BaseModel):
 def patch_device_token(
     device_id: str,
     body: DeviceTokenPatchRequest,
-    current=Depends(get_current_parent),
+    current=Depends(get_principal),
     db: Session = Depends(get_db),
 ):
+    _require_device_access(current, device_id)
     row = svc.update_device_token(db, current["parent_id"], device_id, body.device_token)
     return {"status": "ok", "device": _device_payload(row)}
 
@@ -1717,9 +1924,10 @@ def patch_device_token(
 def post_device_heartbeat(
     device_id: str,
     body: DeviceHeartbeatRequest,
-    current=Depends(get_current_parent),
+    current=Depends(get_principal),
     db: Session = Depends(get_db),
 ):
+    _require_device_access(current, device_id)
     if body.battery_percent is None:
         logger.warning(
             "DEVICE_BATTERY_MISSING | endpoint=/devices/{id}/heartbeat | parent_id=%s | device_id=%s",
@@ -1732,7 +1940,8 @@ def post_device_heartbeat(
         device_id,
         body.battery_percent,
         body.is_online,
-        body.monitoring_enabled,
+        # Only the parent decides whether monitoring is on.
+        body.monitoring_enabled if current["kind"] == "parent" else None,
     )
     if _should_publish_device_status(current["parent_id"], device_id):
         publish_parent_event(current["parent_id"], "device_status_changed", _device_payload(row))
@@ -1743,9 +1952,10 @@ def post_device_heartbeat(
 def post_monitoring_ack(
     device_id: str,
     body: DeviceMonitoringAckRequest,
-    current=Depends(get_current_parent),
+    current=Depends(get_principal),
     db: Session = Depends(get_db),
 ):
+    _require_device_access(current, device_id)
     if body.battery_percent is None:
         logger.warning(
             "DEVICE_BATTERY_MISSING | endpoint=/devices/{id}/monitoring/ack | parent_id=%s | device_id=%s",
@@ -1758,11 +1968,226 @@ def post_monitoring_ack(
         device_id,
         battery_percent=body.battery_percent,
         is_online=body.is_online,
-        monitoring_enabled=body.monitoring_enabled,
+        monitoring_enabled=body.monitoring_enabled if current["kind"] == "parent" else None,
     )
     if _should_publish_device_status(current["parent_id"], device_id):
         publish_parent_event(current["parent_id"], "device_status_changed", _device_payload(row))
     return {"status": "acknowledged", "device": _device_payload(row)}
+
+
+# --------------------------------------------------------------------------- #
+# Child-device pairing (watch shows a code, the parent enters it on the phone)
+# --------------------------------------------------------------------------- #
+
+class PairStartRequest(BaseModel):
+    installation_id: str
+    device_name: Optional[str] = None
+
+
+class PairClaimRequest(BaseModel):
+    code: str
+
+
+class PairStatusRequest(BaseModel):
+    pair_id: str
+    pair_secret: str
+
+
+@app.post("/pair/start", dependencies=[Depends(auth_rate_limit)])
+def pair_start(body: PairStartRequest, db: Session = Depends(get_db)):
+    return child_safety.start_pairing(db, body.installation_id, body.device_name)
+
+
+@app.post("/pair/claim")
+def pair_claim(body: PairClaimRequest, current=Depends(get_current_parent), db: Session = Depends(get_db)):
+    # Codes are 6 digits: limit guesses per parent account.
+    enforce_rate_limit(f"pairclaim:{current['parent_id']}", 10, 60.0)
+    device = child_safety.claim_pairing(db, current["parent_id"], body.code)
+    payload = _device_payload(device)
+    publish_parent_event(current["parent_id"], "device_status_changed", payload)
+    return {"status": "paired", "device": payload}
+
+
+@app.post("/pair/status")
+def pair_status(body: PairStatusRequest, request: Request, db: Session = Depends(get_db)):
+    enforce_rate_limit(f"pairstatus:{security.client_ip(request)}", 120, 60.0)
+    status, device = child_safety.pairing_status(db, body.pair_id, body.pair_secret)
+    if status == "pending":
+        return {"status": "pending"}
+    return {
+        "status": "paired",
+        "device_id": str(device.id),
+        "parent_id": str(device.parent_id),
+        "device_name": device.device_name,
+        "device_access_token": security.make_device_token(
+            str(device.parent_id), str(device.id), int(device.access_token_version or 0)
+        ),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Household settings (parent-nearby rule) and parent location
+# --------------------------------------------------------------------------- #
+
+class HouseholdConfigPatchRequest(BaseModel):
+    parent_proximity_enabled: Optional[bool] = None
+    parent_proximity_radius_m: Optional[float] = None
+
+
+class ParentLocationRequest(BaseModel):
+    device_id: str
+    latitude: float
+    longitude: float
+    accuracy_m: Optional[float] = None
+    location_ts_ms: Optional[int] = None
+
+
+@app.get("/household/config")
+def get_household_config(current=Depends(get_current_parent), db: Session = Depends(get_db)):
+    return child_safety.read_config(db, current["parent_id"])
+
+
+@app.patch("/household/config")
+def patch_household_config(
+    body: HouseholdConfigPatchRequest, current=Depends(get_current_parent), db: Session = Depends(get_db)
+):
+    return child_safety.update_config(
+        db, current["parent_id"], body.parent_proximity_enabled, body.parent_proximity_radius_m
+    )
+
+
+@app.post("/parent/location")
+def post_parent_location(body: ParentLocationRequest, current=Depends(get_current_parent), db: Session = Depends(get_db)):
+    device = svc.get_device(db, current["parent_id"], body.device_id)
+    if device.role != DeviceRole.parent_device:
+        raise HTTPException(status_code=403, detail="parent_device_required")
+    child_safety.store_fix(db, device, body.latitude, body.longitude, body.accuracy_m, body.location_ts_ms)
+    return {"status": "ok"}
+
+
+# --------------------------------------------------------------------------- #
+# SOS from the child device
+# --------------------------------------------------------------------------- #
+
+class SosRequest(BaseModel):
+    device_id: str
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    accuracy_m: Optional[float] = None
+    battery_percent: Optional[int] = None
+
+
+MAX_SOS_CLIP_BYTES = int(os.environ.get("SAFEEAR_MAX_SOS_CLIP_BYTES", str(2 * 1024 * 1024)))
+
+
+def _push_sos(parent_id: str, alert_id: str, device_id: str, device_name: Optional[str],
+              ts_ms: int, lat: Optional[float], lon: Optional[float]) -> None:
+    """FCM -> SMS -> email chain for an SOS; runs on a background thread."""
+    from app.utils.notification_worker import escalate_alert
+
+    thread_db = SessionLocal()
+    try:
+        parent = svc.get_parent(thread_db, parent_id)
+        token = child_safety.parent_push_token(thread_db, parent.id)
+        escalate_alert(
+            str(parent.email) if parent.email else None,
+            str(parent.phone_number) if parent.phone_number else None,
+            token,
+            alert_id,
+            device_id,
+            ts_ms,
+            lat,
+            lon,
+            f"/alerts/{alert_id}/clip",
+            1.0,
+            recipient_role="parent_device",
+            alert_type="sos",
+            device_name=device_name,
+        )
+    except Exception:
+        logger.exception("SOS_ESCALATION_FAILED | alert_id=%s", alert_id)
+    finally:
+        thread_db.close()
+
+
+@app.post("/sos")
+def post_sos(body: SosRequest, current=Depends(get_principal), db: Session = Depends(get_db)):
+    """Manual SOS: always delivered, whatever the monitoring state, context gates or
+    parent-nearby rule.  A repeat within SOS_DEDUPE_SEC returns the same alert."""
+    _require_device_access(current, body.device_id)
+    parent_id = current["parent_id"]
+    device = svc.get_device(db, parent_id, body.device_id)
+    if device.role != DeviceRole.child_device:
+        raise HTTPException(status_code=403, detail="sos_requires_child_device")
+    if body.latitude is not None and body.longitude is not None:
+        device = child_safety.store_fix(db, device, body.latitude, body.longitude, body.accuracy_m)
+        svc.update_session_location(parent_id, body.device_id, body.latitude, body.longitude)
+    if body.battery_percent is not None:
+        device = svc.update_device_battery(db, parent_id, body.device_id, body.battery_percent, device=device)
+    existing = child_safety.recent_sos(db, device)
+    if existing is not None:
+        return {"status": "sent", "deduplicated": True, "alert": _alert_response_payload(existing)}
+    lat = body.latitude if body.latitude is not None else device.last_location_lat
+    lon = body.longitude if body.longitude is not None else device.last_location_lon
+    row = svc.create_alert(db, parent_id, body.device_id, None, 1.0, lat, lon, alert_type="sos")
+    payload = _alert_response_payload(row)
+    payload["device_name"] = device.device_name
+    publish_parent_event(parent_id, "alert_created", payload)
+    child_safety.run_in_background(
+        _push_sos, parent_id, str(row.id), body.device_id, device.device_name,
+        payload["timestamp_ms"] or now_ms(), lat, lon,
+    )
+    logger.info("SOS_RAISED | parent_id=%s | device_id=%s | alert_id=%s", parent_id, body.device_id, row.id)
+    return {"status": "sent", "deduplicated": False, "alert": payload}
+
+
+@app.post("/sos/{alert_id}/clip")
+async def post_sos_clip(
+    alert_id: str,
+    file: Optional[UploadFile] = File(None),
+    audio: Optional[UploadFile] = File(None),
+    current=Depends(get_principal),
+    db: Session = Depends(get_db),
+):
+    upload = file or audio
+    if upload is None:
+        raise HTTPException(status_code=422, detail="missing_audio")
+    row = svc.get_alert(db, current["parent_id"], alert_id)
+    if row.alert_type != "sos":
+        raise HTTPException(status_code=409, detail="not_an_sos_alert")
+    _require_device_access(current, str(row.device_id))
+    raw = await _read_upload_limited(upload, MAX_SOS_CLIP_BYTES)
+    try:
+        arr, sr, _ = _decode_audio_chunk(raw)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="invalid_audio") from exc
+    arr = np.asarray(arr, dtype=np.float32)
+    if arr.ndim == 2:
+        arr = arr.mean(axis=1)
+    if arr.size == 0:
+        raise HTTPException(status_code=400, detail="empty_audio")
+    row.audio_clip_path = child_safety.save_sos_clip(current["parent_id"], alert_id, arr.reshape(-1), int(sr))
+    db.commit()
+    db.refresh(row)
+    payload = _alert_response_payload(row)
+    publish_parent_event(current["parent_id"], "alert_updated", payload)
+
+    def _notify_clip() -> None:
+        from app.utils.notification_worker import send_status_push
+
+        thread_db = SessionLocal()
+        try:
+            token = child_safety.parent_push_token(thread_db, row.parent_id)
+            if token:
+                send_status_push(
+                    token, "SOS audio ready", "Tap to listen to what is happening around your child.",
+                    {"type": "sos_audio", "alert_id": alert_id, "alert_type": "sos"},
+                )
+        finally:
+            thread_db.close()
+
+    child_safety.run_in_background(_notify_clip)
+    return {"status": "ok", "alert": payload}
 
 
 @app.websocket("/ws/events")
@@ -1775,7 +2200,8 @@ async def ws_events(websocket: WebSocket):
             await websocket.close(code=1008, reason="invalid_authorization_header")
             return
         token = auth_header.split(" ", 1)[1].strip()
-    elif query_token:
+    elif query_token and not security.is_production():
+        # Query-string tokens end up in proxy/access logs; development only.
         token = query_token
     else:
         await websocket.close(code=1008, reason="missing_authorization")
@@ -1873,8 +2299,17 @@ def health():
         active_clients = sum(len(v) for v in _WS_CLIENTS_BY_PARENT.values())
         published_counts = dict(_WS_PUBLISHED_COUNTS)
         queue_lag_ms = int(_ws_manager_module._WS_LAST_QUEUE_LAG_MS)
+    vad_status = vad_module.status()
+    yamnet_status = yamnet_classifier_module.status()
+    speaker_model_ok = feature_extractor_module._redimnet is not None
+    degraded = vad_status["backend"] != "silero" or yamnet_status["backend"] != "yamnet" or not speaker_model_ok
     return {
-        "status": "ok",
+        "status": "degraded" if degraded else "ok",
+        "models": {
+            "vad": vad_status["backend"],
+            "audio_events": yamnet_status["backend"],
+            "speaker_embedding": "redimnet" if speaker_model_ok else "unavailable",
+        },
         "metrics": {
             "active_ws_clients": active_clients,
             "event_queue_lag_ms": queue_lag_ms,
@@ -1885,6 +2320,10 @@ def health():
 
 @app.post("/admin/calibrate-thresholds")
 def calibrate_thresholds(body: CalibrateThresholdsRequest, current=Depends(get_current_parent)):
+    if not security.test_endpoints_allowed():
+        raise HTTPException(status_code=404, detail="endpoint_not_found")
+    if len(body.familiar_scores or []) + len(body.stranger_scores or []) > 20000:
+        raise HTTPException(status_code=413, detail="too_many_scores")
     if not body.familiar_scores or not body.stranger_scores:
         raise HTTPException(status_code=422, detail="familiar_scores_and_stranger_scores_required")
 

@@ -55,5 +55,11 @@ def test_create_and_escalate_alert_monkeypatched(monkeypatch):
     # Monkeypatch escalate_alert to be a no-op
     monkeypatch.setattr("app.services.alert_service.escalate_alert", lambda *a, **k: True)
 
+    session.stranger_streak = 3
+    session.stranger_weight_sum = 2.7
     alert_id = alert_service.create_and_escalate_alert(db, parent_id, device_id, session, score)
     assert alert_id == "123"
+    # An identity alert must clear both counters, or the next window re-alerts after the debounce.
+    assert session.stranger_streak == 0
+    assert session.stranger_weight_sum == 0.0
+    assert session.last_alert_ms > 0

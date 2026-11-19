@@ -1,6 +1,7 @@
 import logging
 import numpy as np
 import os
+import time
 from typing import List
 
 from app.utils import feature_extractor as feature_extractor_module
@@ -103,6 +104,9 @@ def warmup_embeddings_to_redis(redis_client) -> None:
     logger.info("cache_warmup_complete: %s", _CACHE_WARMUP_SUMMARY)
 
 
+_UNAVAILABLE_UNTIL = 0.0
+
+
 def get_redis_client():
     try:
         import redis as _redis
@@ -114,10 +118,15 @@ def get_redis_client():
         or (os.environ.get("SAFEEAR_REDIS_URL") or "").strip()
         or "redis://localhost:6379/0"
     )
+    global _UNAVAILABLE_UNTIL
+    if time.monotonic() < _UNAVAILABLE_UNTIL:
+        return None
     try:
         client = _redis.Redis.from_url(redis_url, decode_responses=False, socket_connect_timeout=2, socket_timeout=2)
         client.ping()
         return client
     except Exception as exc:
+        # Skip Redis for a while instead of paying the connect timeout on every call.
+        _UNAVAILABLE_UNTIL = time.monotonic() + float(os.environ.get("SAFEEAR_REDIS_RETRY_SEC", "60"))
         logger.warning("CACHE_WARMUP_SKIPPED | reason=redis_unavailable | error=%s", str(exc))
         return None

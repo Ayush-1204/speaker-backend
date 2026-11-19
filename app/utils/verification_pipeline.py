@@ -11,10 +11,8 @@ except Exception:
 
 from . import config
 from .audio_preprocess import normalize_waveform
-from .compare import THRESHOLD, match_embedding
 from .feature_extractor import embed_waveform_chunks
 from .speech_gate import assess_speech_likeness
-from .storage import load_all_embeddings
 from .vad import get_speech_segments
 
 # Change 2: stricter voiced-duration floor for enrollment only.
@@ -22,11 +20,27 @@ from .vad import get_speech_segments
 MIN_VOICED_MS_ENROLL = int(config.__dict__.get("MIN_VOICED_MS_ENROLL",
     __import__("os").environ.get("MIN_VOICED_MS_ENROLL", "3000")))
 MIN_SNR_DB_ENROLL = float(__import__("os").environ.get("SAFEEAR_MIN_SNR_DB_ENROLL", "8.0"))
-# Fraction of total voiced duration that the longest segment must cover
-# (proxy for single-speaker presence).
+# Fraction of total voiced duration that the longest segment must cover.
+# Disabled by default (0.0): it measures pause structure, not speaker count, so a
+# single speaker who pauses naturally between phrases fails it in a quiet room.
 MIN_DOMINANT_SEGMENT_FRACTION = float(
-    __import__("os").environ.get("SAFEEAR_MIN_DOMINANT_SEGMENT_FRACTION", "0.15")
+    __import__("os").environ.get("SAFEEAR_MIN_DOMINANT_SEGMENT_FRACTION", "0.0")
 )
+
+# Plain-language guidance for each enrollment rejection code, shown in the app.
+ENROLL_REJECTION_MESSAGES: Dict[str, str] = {
+    "enroll_rejected_voiced_too_short": "Not enough speech was heard. Speak continuously for the whole recording, holding the phone about 20-30 cm from your mouth.",
+    "enroll_rejected_not_speech_like": "That did not sound like clear speech. Speak normally in your usual voice rather than whispering, humming or shouting.",
+    "enroll_rejected_possible_overlap": "It sounded like more than one person was talking. Record with only one person speaking.",
+    "enroll_rejected_snr_too_low": "There is too much background noise. Move somewhere quieter (turn off the TV or fan) and try again.",
+    "enroll_rejected_no_chunks": "The recording could not be processed. Please record again.",
+    "enroll_rejected_no_voice_activity": "No speech was detected. Check that the microphone is not covered and try again.",
+}
+
+
+def enrollment_rejection_message(code: str) -> str:
+    key = str(code).split("|", 1)[0].strip()
+    return ENROLL_REJECTION_MESSAGES.get(key, "The recording could not be used. Please try again in a quiet room.")
 
 
 
@@ -43,91 +57,6 @@ def _load_mono_16k(path: str) -> np.ndarray:
 
 def _voiced_duration_ms(segments: List[Tuple[int, int]], sr: int) -> float:
     return sum(max(0, e - s) for s, e in segments) * 1000.0 / float(sr)
-
-
-def run_verify_stages(audio_path: str) -> Dict[str, Any]:
-    waveform = _load_mono_16k(audio_path)
-    sr = 16000
-    stages: Dict[str, Any] = {}
-
-    try:
-        segments = get_speech_segments(waveform, sr=sr, use_silero=True)
-    except Exception:
-        segments = get_speech_segments(waveform, sr=sr, use_silero=False)
-
-    voiced_ms = _voiced_duration_ms(segments, sr)
-    vad_ok = voiced_ms >= config.MIN_VOICED_MS and len(segments) > 0
-    stages["vad"] = {
-        "passed": vad_ok,
-        "voiced_ms": round(voiced_ms, 1),
-        "num_segments": len(segments),
-    }
-
-    if not vad_ok:
-        return {
-            "stages": stages,
-            "result": "rejected",
-            "reject_reason": "no_voice_activity",
-            "similarity": 0.0,
-            "name": None,
-            "closest_speaker": None,
-            "alert": True,
-        }
-
-    longest = max(segments, key=lambda ab: ab[1] - ab[0])
-    gate_audio = waveform[longest[0] : longest[1]]
-    speech_ok, speech_metrics = assess_speech_likeness(gate_audio, sr)
-    stages["speech_quality"] = {"passed": speech_ok, **speech_metrics}
-
-    if not speech_ok:
-        return {
-            "stages": stages,
-            "result": "rejected",
-            "reject_reason": "not_speech_like",
-            "similarity": 0.0,
-            "name": None,
-            "closest_speaker": None,
-            "alert": True,
-        }
-
-    query_embs = embed_waveform_chunks(waveform, sr=sr, segments=segments)
-    users = load_all_embeddings()
-
-    best_match = None
-    best_score = 0.0
-    for user, stored_emb in users.items():
-        chunk_scores = [match_embedding(q, stored_emb) for q in query_embs]
-        user_score = max(chunk_scores) if chunk_scores else 0.0
-        if user_score > best_score:
-            best_score = user_score
-            best_match = user
-
-    familiar = best_score >= THRESHOLD
-    stages["speaker"] = {
-        "passed": familiar,
-        "similarity": float(best_score),
-        "chunks_used": len(query_embs),
-        "threshold": float(THRESHOLD),
-    }
-
-    if familiar:
-        return {
-            "stages": stages,
-            "result": "familiar",
-            "name": best_match,
-            "closest_speaker": best_match,
-            "similarity": float(best_score),
-            "alert": False,
-        }
-
-    return {
-        "stages": stages,
-        "result": "stranger",
-        "name": None,
-        "closest_speaker": best_match,
-        "similarity": float(best_score),
-        "alert": True,
-    }
 
 
 def _estimate_snr_db(waveform: np.ndarray, vad_segments: List[Tuple[int, int]]) -> float:
@@ -229,7 +158,7 @@ def run_enroll_embedding(audio_path: str) -> Tuple[List[np.ndarray], Dict[str, A
             f"enroll_rejected_snr_too_low | snr_db={snr_db:.1f} | min={MIN_SNR_DB_ENROLL:.1f}"
         )
 
-    embs = embed_waveform_chunks(waveform, sr=sr, segments=segments)
+    embs = embed_waveform_chunks(waveform, sr=sr, segments=segments, drop_short_tails=True, concat_segments=True)
     if not embs:
         raise ValueError("enroll_rejected_no_chunks")
     return embs, info

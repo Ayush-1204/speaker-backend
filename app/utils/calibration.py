@@ -43,15 +43,9 @@ def find_eer_threshold(
     target_arr = np.asarray(target_scores, dtype=np.float32)
     impostor_arr = np.asarray(impostor_scores, dtype=np.float32)
 
-    best_threshold = float(np.mean(thresholds))
-    best_eer = 1.0
-
-    for t in thresholds:
-        far = float(np.mean(impostor_arr >= t))
-        frr = float(np.mean(target_arr < t))
-        # EER is where FAR == FRR; minimise |FAR - FRR|
-        if abs(far - frr) < abs(best_eer - 0.5) + 0.5:  # track the crossover
-            best_threshold = float(t)
-            best_eer = (far + frr) / 2.0
-
-    return best_threshold, best_eer
+    # FAR falls and FRR rises monotonically with the threshold; the EER point is
+    # where the two curves cross, i.e. where |FAR - FRR| is smallest.
+    far = np.array([np.mean(impostor_arr >= t) for t in thresholds], dtype=np.float64)
+    frr = np.array([np.mean(target_arr < t) for t in thresholds], dtype=np.float64)
+    idx = int(np.argmin(np.abs(far - frr)))
+    return float(thresholds[idx]), float((far[idx] + frr[idx]) / 2.0)

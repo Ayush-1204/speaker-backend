@@ -1,0 +1,4 @@
+# Development and test tools (not installed in production).
+-r requirements.txt
+pytest==8.3.3
+pyflakes

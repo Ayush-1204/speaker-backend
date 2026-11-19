@@ -3,6 +3,7 @@
 from typing import List, Optional, Tuple
 import logging
 import os
+import threading
 import time
 import tempfile
 import tarfile
@@ -154,16 +155,8 @@ def _get_redimnet():
                         },
                         None,
                     ),
-                    (
-                        "IDRnD/ReDimNet",
-                        "ReDimNet",
-                        {
-                            "model_name": config.REDIMNET_MODEL_NAME,
-                            "train_type": v1_train_type,
-                            "dataset": config.REDIMNET_DATASET,
-                        },
-                        None,
-                    ),
+                    # No fallback to ReDimNet v1: its embeddings are not comparable with
+                    # voiceprints enrolled under v2, so "working" would mean wrong matches.
                 ]
             )
 
@@ -230,6 +223,9 @@ def _load_audio(path: str, target_sr: int = 16000) -> Tuple[np.ndarray, int]:
     return normalize_waveform(data.astype(np.float32)), target_sr
 
 
+_EMBED_SLOTS = threading.BoundedSemaphore(max(1, int(os.environ.get("SAFEEAR_MAX_PARALLEL_EMBEDS", "1"))))
+
+
 def _embed_waveform_array(waveform: np.ndarray, sr: int = 16000) -> np.ndarray:
     w = normalize_waveform(np.asarray(waveform, dtype=np.float32).reshape(-1))
     min_s = max(16000, config.MIN_CHUNK_SAMPLES)
@@ -243,7 +239,9 @@ def _embed_waveform_array(waveform: np.ndarray, sr: int = 16000) -> np.ndarray:
         raise ImportError("torch is not available")
     t = torch.tensor(w, dtype=torch.float32, device=config.DEVICE).unsqueeze(0)
     model = _get_redimnet()
-    with torch.no_grad():
+    # One forward pass already uses every torch thread; running several at once
+    # only makes them compete, so passes are limited (default: one at a time).
+    with _EMBED_SLOTS, torch.inference_mode():
         emb_t = model(t)  # type: ignore
     emb = emb_t.squeeze().detach().cpu().numpy().astype(np.float32).reshape(-1)
     if emb.shape[0] != config.EMBEDDING_DIM:
@@ -270,31 +268,46 @@ def embed_waveform_chunks(
     waveform: np.ndarray,
     sr: int = 16000,
     segments: Optional[List[Tuple[int, int]]] = None,
+    drop_short_tails: bool = False,
+    concat_segments: bool = False,
 ) -> List[np.ndarray]:
-    """Bounded chunks from VAD segments; each chunk → one embedding (verify path)."""
+    """Bounded chunks from VAD segments; each chunk → one embedding (verify path).
+
+    concat_segments: join all voiced segments (silence removed) into one stream
+    before chunking.  Natural speech splits into many sub-second phrases, and
+    embedding each phrase separately gives references that barely agree with
+    each other.  Used for enrollment.
+    drop_short_tails: skip pieces shorter than MIN_CHUNK_SAMPLES whenever at least
+    one full-length piece exists.  Short pieces are reflect-padded, which repeats
+    the same fraction of a second and gives a weak, unrepresentative embedding.
+    Used for enrollment, where every stored embedding becomes a reference.
+    """
     w = np.asarray(waveform, dtype=np.float32).reshape(-1)
     min_s = config.MIN_CHUNK_SAMPLES
     max_s = config.MAX_CHUNK_SAMPLES
-    chunks: List[np.ndarray] = []
 
     seg_list = [(0, len(w))] if not segments else [(max(0, a), min(len(w), b)) for a, b in segments if b > a]
+    if concat_segments and len(seg_list) > 1:
+        w = np.concatenate([w[a:b] for a, b in seg_list]).astype(np.float32, copy=False)
+        seg_list = [(0, len(w))]
 
+    pieces: List[np.ndarray] = []
     for s, e in seg_list:
         piece = w[s:e]
-        if len(piece) == 0:
-            continue
         pos = 0
         while pos < len(piece):
             end = min(pos + max_s, len(piece))
-            chunk = piece[pos:end]
-            if len(chunk) < min_s:
-                chunk = np.pad(chunk, (0, min_s - len(chunk)), mode="reflect")
-            chunks.append(chunk.astype(np.float32, copy=False))
+            pieces.append(piece[pos:end])
             pos = end
-            if len(chunks) >= config.MAX_VERIFY_CHUNKS:
-                break
-        if len(chunks) >= config.MAX_VERIFY_CHUNKS:
-            break
+
+    if drop_short_tails and any(len(p) >= min_s for p in pieces):
+        pieces = [p for p in pieces if len(p) >= min_s]
+
+    chunks: List[np.ndarray] = []
+    for chunk in pieces[: config.MAX_VERIFY_CHUNKS]:
+        if len(chunk) < min_s:
+            chunk = np.pad(chunk, (0, min_s - len(chunk)), mode="reflect")
+        chunks.append(chunk.astype(np.float32, copy=False))
 
     if not chunks:
         chunk = w

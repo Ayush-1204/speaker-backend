@@ -8,17 +8,17 @@ services:
       POSTGRES_DB: safeear
     volumes:
       - ./data/db:/var/lib/postgresql/data
+    # Published for local inspection only; remove on any shared machine.
     ports:
-      - '5432:5432'
+      - '127.0.0.1:5432:5432'
 
   redis:
     image: redis:7-alpine
-    ports:
-      - '6379:6379'
+    # Not published on the host: only the web container needs it.
 
   web:
     build: .
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
     environment:
       DATABASE_URL: postgres://safeear:safeear@postgres:5432/safeear
       SAFEEAR_DATA_ROOT: /data/safeear

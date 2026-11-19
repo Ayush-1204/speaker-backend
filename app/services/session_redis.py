@@ -1,5 +1,7 @@
 import os
 import json
+import threading
+import time
 import logging
 from typing import Optional, Dict, Any
 import base64
@@ -21,17 +23,41 @@ def _resolve_redis_url() -> str:
     )
 
 
+_UNAVAILABLE_UNTIL = 0.0
+_RETRY_AFTER_SEC = float(os.environ.get("SAFEEAR_REDIS_RETRY_SEC", "60"))
+_CLIENT = None
+_CLIENT_LOCK = threading.Lock()
+
+
 def get_redis_client():
-    if redis is None:
+    """Shared Redis client (redis-py pools connections and is thread-safe), or None.
+
+    Created and pinged once; after a failure Redis is skipped for
+    SAFEEAR_REDIS_RETRY_SEC instead of paying the connect timeout on every call."""
+    global _CLIENT
+    if redis is None or time.monotonic() < _UNAVAILABLE_UNTIL:
         return None
-    try:
-        url = _resolve_redis_url()
-        client = redis.Redis.from_url(url, decode_responses=True, socket_connect_timeout=2, socket_timeout=2)
-        client.ping()
-        return client
-    except Exception as exc:
-        logger.warning("SESSION_REDIS_UNAVAILABLE: %s", str(exc))
-        return None
+    if _CLIENT is not None:
+        return _CLIENT
+    with _CLIENT_LOCK:
+        if _CLIENT is not None:
+            return _CLIENT
+        try:
+            url = _resolve_redis_url()
+            client = redis.Redis.from_url(url, decode_responses=True, socket_connect_timeout=2, socket_timeout=2)
+            client.ping()
+            _CLIENT = client
+            return client
+        except Exception as exc:
+            mark_redis_unavailable(exc)
+            return None
+
+
+def mark_redis_unavailable(exc: Exception) -> None:
+    global _UNAVAILABLE_UNTIL, _CLIENT
+    _CLIENT = None
+    _UNAVAILABLE_UNTIL = time.monotonic() + _RETRY_AFTER_SEC
+    logger.warning("SESSION_REDIS_UNAVAILABLE | retry_in=%ss | reason=%s", int(_RETRY_AFTER_SEC), str(exc))
 
 
 def _key(parent_id: str, device_id: str) -> str:
@@ -43,12 +69,11 @@ def save_session_metadata(parent_id: str, device_id: str, payload: Dict[str, Any
     if client is None:
         return
     try:
-        k = _key(parent_id, device_id)
-        client.set(k, json.dumps(payload))
-        # set a TTL to avoid stale entries
-        client.expire(k, int(os.environ.get("SAFEEAR_SESSION_TTL_SEC", "300")))
+        # One round trip: value and expiry together.
+        client.set(_key(parent_id, device_id), json.dumps(payload),
+                   ex=int(os.environ.get("SAFEEAR_SESSION_TTL_SEC", "900")))
     except Exception as exc:
-        logger.debug("SESSION_REDIS_SAVE_FAILED: %s", str(exc))
+        mark_redis_unavailable(exc)
 
 
 def load_session_metadata(parent_id: str, device_id: str) -> Optional[Dict[str, Any]]:

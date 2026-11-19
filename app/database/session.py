@@ -11,6 +11,10 @@ DATABASE_URL = os.environ.get(
     "DATABASE_URL",
     "sqlite:///./safeear.db"
 )
+# Hosts (Render, Heroku, docker-compose) often hand out postgres:// URLs, which
+# SQLAlchemy 2.x no longer accepts.
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = "postgresql://" + DATABASE_URL[len("postgres://"):]
 
 engine = create_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -48,13 +52,17 @@ def _ensure_device_columns() -> None:
     if "installation_id" not in existing:
         statements.append("ALTER TABLE devices ADD COLUMN installation_id VARCHAR")
     if "is_online" not in existing:
-        statements.append("ALTER TABLE devices ADD COLUMN is_online BOOLEAN NOT NULL DEFAULT 0")
+        statements.append("ALTER TABLE devices ADD COLUMN is_online BOOLEAN NOT NULL DEFAULT FALSE")
     if "monitoring_enabled" not in existing:
-        statements.append("ALTER TABLE devices ADD COLUMN monitoring_enabled BOOLEAN NOT NULL DEFAULT 1")
+        statements.append("ALTER TABLE devices ADD COLUMN monitoring_enabled BOOLEAN NOT NULL DEFAULT TRUE")
     if "last_heartbeat_at" not in existing:
-        statements.append("ALTER TABLE devices ADD COLUMN last_heartbeat_at DATETIME")
+        statements.append("ALTER TABLE devices ADD COLUMN last_heartbeat_at TIMESTAMP")
     if "last_activity_at" not in existing:
-        statements.append("ALTER TABLE devices ADD COLUMN last_activity_at DATETIME")
+        statements.append("ALTER TABLE devices ADD COLUMN last_activity_at TIMESTAMP")
+    if "access_token_version" not in existing:
+        statements.append("ALTER TABLE devices ADD COLUMN access_token_version INTEGER NOT NULL DEFAULT 0")
+    if "last_location_accuracy_m" not in existing:
+        statements.append("ALTER TABLE devices ADD COLUMN last_location_accuracy_m FLOAT")
 
     if not statements:
         return
@@ -101,9 +109,9 @@ def _ensure_speaker_columns() -> None:
     if "drift_score_ema" not in existing:
         statements.append("ALTER TABLE enrolled_speakers ADD COLUMN drift_score_ema FLOAT")
     if "last_drift_check_at" not in existing:
-        statements.append("ALTER TABLE enrolled_speakers ADD COLUMN last_drift_check_at DATETIME")
+        statements.append("ALTER TABLE enrolled_speakers ADD COLUMN last_drift_check_at TIMESTAMP")
     if "drift_alert_sent_at" not in existing:
-        statements.append("ALTER TABLE enrolled_speakers ADD COLUMN drift_alert_sent_at DATETIME")
+        statements.append("ALTER TABLE enrolled_speakers ADD COLUMN drift_alert_sent_at TIMESTAMP")
 
     if not statements:
         return
@@ -145,3 +153,18 @@ def _ensure_household_config_table() -> None:
         # create_all already ran above; if the table is still missing the model
         # import failed, which is a fatal error — let it surface naturally.
         return
+
+    existing = {col["name"] for col in inspector.get_columns("household_configs")}
+    statements = []
+    if "parent_proximity_enabled" not in existing:
+        statements.append(
+            "ALTER TABLE household_configs ADD COLUMN parent_proximity_enabled BOOLEAN NOT NULL DEFAULT FALSE"
+        )
+    if "parent_proximity_radius_m" not in existing:
+        statements.append(
+            "ALTER TABLE household_configs ADD COLUMN parent_proximity_radius_m FLOAT NOT NULL DEFAULT 10.0"
+        )
+    if statements:
+        with engine.begin() as conn:
+            for stmt in statements:
+                conn.execute(text(stmt))

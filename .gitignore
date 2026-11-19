@@ -32,3 +32,13 @@ Thumbs.db
 
 # Firebase secrets
 firebase-adminsdk.json
+
+# Evaluation captures contain recordings of real people
+eval_capture/
+eval_data/
+
+# Personal data: voiceprints, recordings, local databases (never commit)
+app/data/familiar_embeddings/
+app/data/stale_dim_quarantine/
+app/database/familiar_db.json
+app/database/app_state.json*

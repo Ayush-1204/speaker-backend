@@ -4,6 +4,7 @@ from typing import Optional
 import numpy as np
 from app.utils import prd_services_db as svc
 from app.services import websocket_manager as ws_manager
+from app.services.decision_engine import mark_identity_alert_fired
 from app.utils.notification_worker import escalate_alert
 from app.database.models import Device, DeviceRole
 from app.database.session import SessionLocal
@@ -14,6 +15,7 @@ logger = logging.getLogger(__name__)
 def create_and_escalate_alert(
     db, parent_id: str, device_id: str, session, score: float,
     alert_type: str = "unenrolled_contact",
+    current_stranger_centroid: Optional[np.ndarray] = None,
 ) -> Optional[str]:
     try:
         session.stranger_segment_ended_ms = svc.now_ms()
@@ -22,6 +24,8 @@ def create_and_escalate_alert(
             buffer_src = getattr(session, "clip_buffer", np.zeros(0, dtype=np.float32))
         clip_waveform = svc.get_clip_buffer_waveform(session, buffer_src)
         clip_path = svc.save_alert_clip(parent_id, session, clip_waveform)
+        # Keep recording a few seconds after the alert and extend the same clip file.
+        svc.start_post_roll(session, clip_path, clip_waveform)
         row = svc.create_alert(
             db, parent_id, device_id, clip_path, score, session.lat, session.lon,
             alert_type=alert_type,
@@ -50,11 +54,12 @@ def create_and_escalate_alert(
         )
 
         alert_id = str(row.id)
-        session.last_alert_ms = svc.now_ms()
-        session.stranger_streak = 0
-        if not session.recent_confirmed_stranger_embeddings:
-            svc.record_confirmed_stranger_window(session, None)
-        svc.set_active_stranger_embedding(session)
+        # Only identity alerts consume the identity debounce and reset the
+        # stranger streak; distress/obstruction alerts keep their own clocks.
+        if alert_type == "unenrolled_contact":
+            mark_identity_alert_fired(session, svc.now_ms(), current_stranger_centroid)
+        elif alert_type == "distress":
+            session.last_distress_alert_ms = svc.now_ms()
 
         # Escalation background thread — opens its own session (SQLAlchemy sessions
         # are not thread-safe and must not be shared across threads).

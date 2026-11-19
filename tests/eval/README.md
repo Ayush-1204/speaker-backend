@@ -1,5 +1,42 @@
 # Evaluation Harness — SafeEar (Change 9)
 
+> **Start here:** if you have no dataset, follow [RECORDING_PROTOCOL.md](RECORDING_PROTOCOL.md).
+> It captures labelled sessions from your own device (`SAFEEAR_EVAL_CAPTURE_DIR`) and
+> scores them with `scripts/eval/replay.py`. `scripts/eval/public_benchmark.py` measures
+> EER on public corpora across languages and accents (below).
+
+## Public multi-language / multi-accent benchmark
+
+Build one manifest from any mix of corpora, then score it.  Results are reported
+per group (language or accent), with impostors drawn from the same group.
+
+| Corpus | Covers | Where | Adapter |
+|---|---|---|---|
+| Kathbath (clean + noisy test) | 12 Indian languages | `objectstore.e2enetworks.net/indic-superb/` (CC0, no login) | `kathbath` |
+| LibriSpeech test-clean | US English | openslr.org/12 | `librispeech` |
+| OpenSLR 83 / 70 | UK + Irish dialects, Nigerian English | openslr.org/83, /70 | `crowdsourced` |
+| Common Voice | 100+ languages, accent tags | commonvoice.mozilla.org (accept terms) | `commonvoice` |
+| VoxCeleb1 test | many nationalities, in-the-wild | Hugging Face mirror (accept terms) | `voxceleb1 --meta vox1_meta.csv` |
+| VCTK 0.92 | English accents | datashare.ed.ac.uk | `vctk` |
+| NISP, your own recordings | anything | `<root>/<speaker>/[<language>/]*.wav` | `folder` |
+
+```bash
+python -m scripts.eval.build_manifest kathbath <dir>/kb_data_clean_m4a --out m.csv
+python -m scripts.eval.build_manifest kathbath <dir>/kb_data_noisy_m4a --out m.csv --append
+python -m scripts.eval.build_manifest librispeech <dir>/LibriSpeech/test-clean --out m.csv --append
+python -m scripts.eval.public_benchmark --manifest m.csv --kathbath-meta <dir>/meta_data \
+    --noise-dir <ESC-50 audio> --out results/
+# Parallel runs (--groups Hindi Tamil ...) can be merged afterwards:
+python -m scripts.eval.public_benchmark --from-scores results_*/scores.csv --out results_all/
+```
+
+Two protocols: `pairs` is the standard utterance-vs-utterance EER (Kathbath uses the
+official IndicSUPERB trial lists), comparable with published numbers.  `safeear`
+enrolls each speaker from 3 utterances and scores 1.5 s windows, clean, with an
+overlapping talker and with background noise, which is what the product does.
+Speakers recorded in two languages also get a cross-language group.  None of these
+corpora contain children, so confirm thresholds on your own recordings.
+
 ## Purpose
 This directory contains the evaluation harness for measuring system reliability.
 Without quantitative evaluation, every change to the pipeline is a guess.

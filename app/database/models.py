@@ -65,6 +65,18 @@ class AuthCredential(Base):
     parent: Mapped["Parent"] = relationship("Parent", back_populates="credentials")
 
 
+class RefreshToken(Base):
+    """Parent refresh tokens.  Only the SHA-256 of the token is stored."""
+    __tablename__ = "refresh_tokens"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    parent_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("parents.id"), nullable=False, index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
+
 class DeviceRole(str, enum.Enum):
     child_device = "child_device"
     parent_device = "parent_device"
@@ -82,11 +94,16 @@ class Device(Base):
     battery_percent: Mapped[Optional[int]] = mapped_column(Integer)
     is_online: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     monitoring_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # Bumped whenever the device is (re-)registered or its role changes; device
+    # tokens carrying an older version are rejected, which revokes them.
+    access_token_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     last_heartbeat_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
     last_activity_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
     last_location_lat: Mapped[Optional[float]] = mapped_column(Float)
     last_location_lon: Mapped[Optional[float]] = mapped_column(Float)
     last_location_ts: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    # Reported horizontal accuracy (metres) of the last fix; used by the parent-nearby rule.
+    last_location_accuracy_m: Mapped[Optional[float]] = mapped_column(Float)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc), nullable=False)
 
@@ -168,7 +185,30 @@ class HouseholdConfig(Base):
     home_radius_m: Mapped[Optional[float]] = mapped_column(Float, nullable=True, default=100.0)
     party_mode_until: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
+    # Parent-nearby rule: no detection while the child device is within
+    # parent_proximity_radius_m of a parent phone (both fixes fresh and accurate).
+    parent_proximity_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    parent_proximity_radius_m: Mapped[float] = mapped_column(Float, nullable=False, default=10.0)
+
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc), nullable=False)
 
     parent: Mapped["Parent"] = relationship("Parent", foreign_keys=[parent_id])
+
+
+class PairingRequest(Base):
+    """Short-lived code shown on a new child device (e.g. a watch) and entered by the
+    parent on their phone.  The device polls with pair_id + secret and receives its
+    device token exactly once after the parent has claimed the code."""
+    __tablename__ = "pairing_requests"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    code: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    secret_hash: Mapped[str] = mapped_column(String, nullable=False)
+    installation_id: Mapped[str] = mapped_column(String, nullable=False)
+    device_name: Mapped[Optional[str]] = mapped_column(String)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    claimed_parent_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("parents.id"), nullable=True)
+    device_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
+    consumed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)

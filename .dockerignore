@@ -1,0 +1,13 @@
+.git
+venv
+**/__pycache__
+*.db
+.env
+firebase-adminsdk.json
+eval_capture
+eval_data
+app/data/tenants
+app/data/familiar_embeddings
+app/data/stale_dim_quarantine
+app/database/app_state.json*
+tests

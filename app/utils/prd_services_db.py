@@ -12,7 +12,7 @@ import hashlib
 import hmac
 import base64
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, field
 from itertools import combinations
@@ -40,8 +40,8 @@ from app.utils.audio_preprocess import normalize_waveform
 from app.utils.feature_extractor import embed_waveform_chunks
 from app.utils.speech_gate import assess_speech_likeness
 from app.utils.vad import get_speech_segments
-from app.services.session_manager import persist_session, delete_session, save_buffer
-from app.utils.yamnet_classifier import classify_audio_event_windowed, classify_distress_event
+from app.services.session_manager import persist_session, delete_session, load_session
+from app.utils.yamnet_classifier import classify_audio_event_windowed, distress_from_result
 
 DATA_ROOT = (os.environ.get("SAFEEAR_DATA_ROOT", os.path.join("app", "data")) or "").strip() or os.path.join("app", "data")
 TENANTS_ROOT = os.path.join(DATA_ROOT, "tenants")
@@ -53,18 +53,26 @@ WINDOW_SEC = float(os.environ.get("SAFEEAR_WINDOW_SEC", "1.5"))
 HOP_SEC = float(os.environ.get("SAFEEAR_HOP_SEC", "0.25"))
 ALERT_RING_SEC = float(os.environ.get("SAFEEAR_ALERT_RING_SEC", "10.0"))
 STRANGER_PREROLL_SEC = float(os.environ.get("SAFEEAR_STRANGER_PREROLL_SEC", "5.0"))
+# Audio kept recording after an alert fires and appended to its clip, so the parent
+# hears the stranger keep talking, not only the seconds that triggered the alert.
+ALERT_POST_ROLL_SEC = float(os.environ.get("SAFEEAR_ALERT_POST_ROLL_SEC", "5.0"))
 _REDIMNET_HUB_REPO = os.environ.get("REDIMNET_HUB_REPO", "PalabraAI/redimnet2")
 _REDIMNET_HUB_ENTRY = os.environ.get("REDIMNET_HUB_ENTRY", "redimnet2")
 _IS_REDIMNET2 = ("redimnet2" in _REDIMNET_HUB_REPO.lower()) or ("redimnet2" in _REDIMNET_HUB_ENTRY.lower())
 
 _DEFAULT_T_HIGH = "0.47" if _IS_REDIMNET2 else "0.72"
-_DEFAULT_T_LOW = "0.31" if _IS_REDIMNET2 else "0.60"
+# 0.33 (was 0.31): slightly stricter after on-device watch testing, 2026-11-18.
+_DEFAULT_T_LOW = "0.33" if _IS_REDIMNET2 else "0.60"
 _DEFAULT_CONFIRM_WINDOWS = "3"
 
 T_HIGH = float(os.environ.get("SAFEEAR_T_HIGH", _DEFAULT_T_HIGH))
 T_LOW = float(os.environ.get("SAFEEAR_T_LOW", _DEFAULT_T_LOW))
 STRANGER_CONFIRM_COUNT = int(os.environ.get("SAFEEAR_CONFIRM_WINDOWS", _DEFAULT_CONFIRM_WINDOWS))
 DEBOUNCE_SEC = int(os.environ.get("SAFEEAR_DEBOUNCE_SEC", "60"))
+ENABLE_DISTRESS_DETECTION = os.environ.get("SAFEEAR_ENABLE_DISTRESS_ALERTS", "false").strip().lower() in {"1", "true", "yes", "on"}
+# "concat" (default): one embedding of the window's voiced speech, matching enrollment.
+# "segments": legacy per-VAD-segment embeddings, kept only for A/B comparison.
+INFERENCE_EMBED_MODE = os.environ.get("SAFEEAR_INFERENCE_EMBED", "concat").strip().lower()
 
 logger = logging.getLogger(__name__)
 DEVICE_ONLINE_TTL_SEC = int(os.environ.get("SAFEEAR_DEVICE_ONLINE_TTL_SEC", "120"))
@@ -178,7 +186,7 @@ def _b64d(data: str) -> bytes:
 def make_jwt(parent_id: str) -> str:
     header = {"alg": "HS256", "typ": "JWT"}
     payload = {
-        "sub": parent_id,
+        "sub": str(parent_id),
         "iat": int(time.time()),
         "exp": int(time.time()) + JWT_EXPIRE_SEC,
         "jti": secrets.token_urlsafe(8),
@@ -287,10 +295,21 @@ def register_parent_with_email(
     return parent
 
 
+_DUMMY_PASSWORD_HASH: Optional[str] = None
+
+
 def login_parent_with_email(db: Session, email: str, password: str) -> Parent:
+    global _DUMMY_PASSWORD_HASH
     norm_email = _normalize_email(email)
     cred = db.query(AuthCredential).filter(AuthCredential.email == norm_email).first()
-    if cred is None or not _verify_password(password, str(getattr(cred, "password_hash"))):
+    if cred is None:
+        # Spend the same hashing time as a real check so response timing does
+        # not reveal which addresses are registered.
+        if _DUMMY_PASSWORD_HASH is None:
+            _DUMMY_PASSWORD_HASH = _hash_password(secrets.token_urlsafe(16))
+        _verify_password(password, _DUMMY_PASSWORD_HASH)
+        raise HTTPException(status_code=401, detail="invalid_email_or_password")
+    if not _verify_password(password, str(getattr(cred, "password_hash"))):
         raise HTTPException(status_code=401, detail="invalid_email_or_password")
 
     parent = db.query(Parent).filter(Parent.id == cred.parent_id).first()
@@ -315,7 +334,8 @@ def create_password_reset_token(db: Session, email: str, ttl_sec: int = 3600) ->
     return raw
 
 
-def reset_password_with_token(db: Session, token: str, new_password: str) -> None:
+def reset_password_with_token(db: Session, token: str, new_password: str) -> str:
+    """Set a new password; returns the parent id so callers can end old sessions."""
     token_hash = hashlib.sha256((token or "").encode("utf-8")).hexdigest()
     now = datetime.now(timezone.utc)
     cred = (
@@ -335,6 +355,7 @@ def reset_password_with_token(db: Session, token: str, new_password: str) -> Non
     cred.reset_token_expires_at = None
     cred.updated_at = datetime.now(timezone.utc)
     db.commit()
+    return str(cred.parent_id)
 
 
 def get_parent(db: Session, parent_id: str) -> Parent:
@@ -345,6 +366,32 @@ def get_parent(db: Session, parent_id: str) -> Parent:
     return parent
 
 
+def _release_fcm_token_elsewhere(db: Session, token: str, keep_device_id: Optional[uuid.UUID]) -> None:
+    """FCM tokens identify one app install.  If another row (in any family) still
+    holds this token, clear it there so pushes for that row stop reaching this
+    phone.  The other row itself is never moved or modified otherwise."""
+    q = db.query(Device).filter(Device.device_token == token)
+    if keep_device_id is not None:
+        q = q.filter(Device.id != keep_device_id)
+    for other in q.all():
+        other.device_token = None
+        other.updated_at = datetime.now(timezone.utc)
+    db.flush()
+
+
+def _apply_role_change(existing: Device, parent_uuid: uuid.UUID, previous_role: DeviceRole, role: DeviceRole) -> None:
+    if previous_role != role and previous_role == DeviceRole.child_device and role == DeviceRole.parent_device:
+        existing.monitoring_enabled = False
+        try:
+            stop_session(str(parent_uuid), str(existing.id))
+        except Exception:
+            logger.warning("DEVICE_ROLE_SWITCH_SESSION_STOP_FAILED | device_id=%s", str(existing.id))
+        _send_monitoring_command_to_device(existing, False)
+    elif previous_role != role and role == DeviceRole.child_device:
+        existing.monitoring_enabled = True
+        _send_monitoring_command_to_device(existing, True)
+
+
 def create_device(
     db: Session,
     parent_id: str,
@@ -353,6 +400,11 @@ def create_device(
     installation_id: Optional[str] = None,
     device_token: Optional[str] = None,
 ) -> Device:
+    """Register or re-register a device for this parent (upsert by stable identifier).
+
+    Only rows belonging to this parent are ever matched.  Every registration bumps
+    access_token_version, which revokes device tokens issued earlier.
+    """
     parent_uuid = _as_uuid(parent_id, "parent_id")
     normalized_name = (device_name or "").strip()
     normalized_installation_id = (installation_id or "").strip()
@@ -377,64 +429,32 @@ def create_device(
             )
             .first()
         )
+    if existing is None and token is not None:
+        existing = (
+            db.query(Device)
+            .filter(Device.parent_id == parent_uuid, Device.device_token == token)
+            .first()
+        )
+
     if existing is not None:
         previous_role = existing.role
-        # Canonical upsert by stable device identifier.
-        existing.parent_id = parent_uuid
         if normalized_installation_id:
             existing.installation_id = normalized_installation_id
         if normalized_name:
             existing.device_name = normalized_name
         existing.role = role
         if token is not None and existing.device_token != token:
-            token_owner = db.query(Device).filter(Device.device_token == token, Device.id != existing.id).first()
-            if token_owner is not None:
-                token_owner.device_token = None
-                token_owner.updated_at = datetime.now(timezone.utc)
+            _release_fcm_token_elsewhere(db, token, existing.id)
             existing.device_token = token
-        elif token is not None:
-            existing.device_token = token
-        if previous_role != role and previous_role == DeviceRole.child_device and role == DeviceRole.parent_device:
-            existing.monitoring_enabled = False
-            try:
-                stop_session(str(parent_uuid), str(existing.id))
-            except Exception:
-                logger.warning("DEVICE_ROLE_SWITCH_SESSION_STOP_FAILED | device_id=%s", str(existing.id))
-            _send_monitoring_command_to_device(existing, False)
-        elif previous_role != role and role == DeviceRole.child_device:
-            existing.monitoring_enabled = True
-            _send_monitoring_command_to_device(existing, True)
+        _apply_role_change(existing, parent_uuid, previous_role, role)
+        existing.access_token_version = int(existing.access_token_version or 0) + 1
         existing.updated_at = datetime.now(timezone.utc)
         db.commit()
         db.refresh(existing)
         return existing
 
     if token is not None:
-        existing = db.query(Device).filter(Device.device_token == token).first()
-        if existing is not None:
-            # Reuse the existing row for this installation token and refresh its binding.
-            previous_role = existing.role
-            existing.parent_id = parent_uuid
-            if normalized_installation_id:
-                existing.installation_id = normalized_installation_id
-            if normalized_name:
-                existing.device_name = normalized_name
-            existing.role = role
-            existing.device_token = token
-            if previous_role != role and previous_role == DeviceRole.child_device and role == DeviceRole.parent_device:
-                existing.monitoring_enabled = False
-                try:
-                    stop_session(str(parent_uuid), str(existing.id))
-                except Exception:
-                    logger.warning("DEVICE_ROLE_SWITCH_SESSION_STOP_FAILED | device_id=%s", str(existing.id))
-                _send_monitoring_command_to_device(existing, False)
-            elif previous_role != role and role == DeviceRole.child_device:
-                existing.monitoring_enabled = True
-                _send_monitoring_command_to_device(existing, True)
-            existing.updated_at = datetime.now(timezone.utc)
-            db.commit()
-            db.refresh(existing)
-            return existing
+        _release_fcm_token_elsewhere(db, token, None)
 
     device = Device(
         id=uuid.uuid4(),
@@ -442,7 +462,8 @@ def create_device(
         installation_id=normalized_installation_id or None,
         device_name=normalized_name or normalized_installation_id,
         role=role,
-        device_token=token
+        device_token=token,
+        access_token_version=1,
     )
     db.add(device)
     db.commit()
@@ -507,23 +528,13 @@ def _send_monitoring_command_to_device(device: Device, monitoring_enabled: bool)
         return False
 
     try:
-        import firebase_admin
-        from firebase_admin import credentials, messaging
+        # Same Firebase initialisation as alert pushes (including the local
+        # credentials-file fallback), so whichever runs first works for both.
+        from app.utils.notification_worker import _init_firebase
 
-        project_id = os.environ.get("FIREBASE_PROJECT_ID") or os.environ.get("GOOGLE_CLOUD_PROJECT")
-        init_options = {"projectId": project_id} if project_id else None
-
-        if not firebase_admin._apps:
-            creds_path = os.environ.get("FIREBASE_CREDENTIALS_PATH")
-            creds_json = os.environ.get("FIREBASE_CREDENTIALS_JSON")
-            if creds_path:
-                cred = credentials.Certificate(creds_path)
-                firebase_admin.initialize_app(cred, options=init_options)
-            elif creds_json:
-                cred = credentials.Certificate(json.loads(creds_json))
-                firebase_admin.initialize_app(cred, options=init_options)
-            else:
-                firebase_admin.initialize_app(credentials.ApplicationDefault(), options=init_options)
+        messaging = _init_firebase()
+        if messaging is None:
+            return False
 
         message = messaging.Message(
             data={
@@ -581,7 +592,7 @@ def update_device_heartbeat(
     device = get_device(db, parent_id, device_id)
 
     if battery_percent is not None:
-        battery = max(0, min(100, battery_percent))
+        battery = int(max(0, min(100, battery_percent)))
         device.battery_percent = battery
     if is_online is not None:
         device.is_online = is_online
@@ -601,13 +612,14 @@ def update_device_battery(
     parent_id: str,
     device_id: str,
     battery_percent: Optional[int],
+    device: Optional[Device] = None,
 ) -> Device:
     """Persist battery telemetry when provided from chunk/location/ack flows."""
-    device = get_device(db, parent_id, device_id)
+    device = device if device is not None else get_device(db, parent_id, device_id)
     if battery_percent is None:
         return device
 
-    battery = max(0, min(100, battery_percent))
+    battery = int(max(0, min(100, battery_percent)))
     if device.battery_percent == battery:
         return device
 
@@ -650,26 +662,26 @@ def get_device(db: Session, parent_id: str, device_id: str) -> Device:
     return device
 
 
-def update_device_activity(db: Session, parent_id: str, device_id: str) -> Device:
-    """Mark device as active by updating last_activity_at.
-    
-    Called when:
-    - Audio chunk uploaded (detect_chunk)
-    - Location update received (detect_location)
-    - Explicit heartbeat sent
-    
-    This keeps get_effective_online() returning True during active streaming.
+ACTIVITY_WRITE_INTERVAL_SEC = float(os.environ.get("SAFEEAR_ACTIVITY_WRITE_INTERVAL_SEC", "15"))
+
+
+def update_device_activity(db: Session, parent_id: str, device_id: str, device: Optional[Device] = None) -> Device:
+    """Mark the device as active (last_activity_at), used for "online" status and
+    the silence watchdog.  Called for audio chunks, location updates and heartbeats.
+
+    Streaming devices send a chunk about every second; one write per
+    ACTIVITY_WRITE_INTERVAL_SEC is enough for the 120 s online window and the
+    5-minute silence watchdog.
     """
-    device = get_device(db, parent_id, device_id)
+    device = device if device is not None else get_device(db, parent_id, device_id)
     now = datetime.now(timezone.utc).replace(tzinfo=None)
-    
-    # Only update if activity timestamp is outdated (avoid excessive DB updates)
-    if device.last_activity_at is None or \
-       (now - device.last_activity_at).total_seconds() > 1:
+    last = device.last_activity_at
+    if last is not None and last.tzinfo is not None:
+        last = last.astimezone(timezone.utc).replace(tzinfo=None)
+    if last is None or (now - last).total_seconds() > ACTIVITY_WRITE_INTERVAL_SEC:
         device.last_activity_at = now
         db.commit()
         db.refresh(device)
-    
     return device
 
 
@@ -893,21 +905,28 @@ def delete_speaker(db: Session, parent_id: str, speaker_id: str) -> None:
     sdir = _speaker_dir(parent_id, speaker_id)
     if os.path.exists(sdir):
         shutil.rmtree(sdir)
+    invalidate_gallery(parent_id)
 
 
 def save_speaker_embedding(db: Session, parent_id: str, speaker_id: str, emb: np.ndarray) -> str:
-    sdir = _speaker_dir(parent_id, speaker_id)
-    os.makedirs(sdir, exist_ok=True)
-    files = [f for f in os.listdir(sdir) if f.endswith(".npy")]
-    idx = len(files) + 1
-    fpath = os.path.join(sdir, f"emb_{idx}.npy")
     arr = np.asarray(emb, dtype=np.float32).reshape(-1)
     if arr.shape[0] != config.EMBEDDING_DIM:
         raise HTTPException(status_code=400, detail=f"invalid_embedding_dim_{arr.shape[0]}")
+    sdir = _speaker_dir(parent_id, speaker_id)
+    os.makedirs(sdir, exist_ok=True)
+    existing = [f for f in os.listdir(sdir) if f.endswith(".npy")]
+    # Next number after the highest existing one, so a gap can never overwrite a file.
+    numbers = [int(f[4:-4]) for f in existing if f.startswith("emb_") and f[4:-4].isdigit()]
+    idx = max(numbers, default=0) + 1
+    fpath = os.path.join(sdir, f"emb_{idx}.npy")
+    while os.path.exists(fpath):
+        idx += 1
+        fpath = os.path.join(sdir, f"emb_{idx}.npy")
     np.save(fpath, arr)
+    invalidate_gallery(parent_id)
 
     speaker = get_speaker(db, parent_id, speaker_id)
-    speaker.sample_count = idx
+    speaker.sample_count = len(existing) + 1
     speaker.updated_at = datetime.now(timezone.utc)
     db.commit()
     return fpath
@@ -919,7 +938,49 @@ def save_speaker_embedding(db: Session, parent_id: str, speaker_id: str, emb: np
 _SpeakerGalleryEntry = Dict[str, Any]  # keys: embs, role, t_high_override, cohort_mean, cohort_std
 
 
-def load_parent_embeddings(
+GALLERY_CACHE_TTL_SEC = float(os.environ.get("SAFEEAR_GALLERY_CACHE_TTL_SEC", "600"))
+_GALLERY_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_GALLERY_LOCK = threading.Lock()
+
+
+def _unit_rows(vectors: List[np.ndarray]) -> np.ndarray:
+    """Stack vectors as rows scaled to unit length (zero vectors stay zero)."""
+    mat = np.stack([np.asarray(v, dtype=np.float32).reshape(-1) for v in vectors], axis=0)
+    norms = np.linalg.norm(mat, axis=1, keepdims=True)
+    return np.where(norms > 0.0, mat / np.where(norms > 0.0, norms, 1.0), 0.0).astype(np.float32)
+
+
+def invalidate_gallery(parent_id: str) -> None:
+    """Drop the cached voiceprints of a family (call after any enrollment change)."""
+    with _GALLERY_LOCK:
+        _GALLERY_CACHE.pop(str(parent_id), None)
+
+
+def load_parent_embeddings(db: Session, parent_id: str) -> Dict[str, "_SpeakerGalleryEntry"]:
+    """Enrolled voiceprints of a family, cached in memory.
+
+    The detect path calls this for every scored window; reading the database and
+    every .npy file each time was the slowest non-model step.  The cache is
+    invalidated on enroll/delete and expires after GALLERY_CACHE_TTL_SEC as a
+    safety net for files changed outside the API.  Each entry also carries
+    "matrix": the voiceprints stacked as unit-length rows for fast scoring.
+    Returns a fresh dict, so callers may remove keys without touching the cache.
+    """
+    key = str(parent_id)
+    now = time.monotonic()
+    with _GALLERY_LOCK:
+        hit = _GALLERY_CACHE.get(key)
+        if hit is not None and now - hit[0] < GALLERY_CACHE_TTL_SEC:
+            return dict(hit[1])
+    gallery = _load_parent_embeddings_uncached(db, key)
+    for entry in gallery.values():
+        entry["matrix"] = _unit_rows(entry["embs"])
+    with _GALLERY_LOCK:
+        _GALLERY_CACHE[key] = (now, gallery)
+    return dict(gallery)
+
+
+def _load_parent_embeddings_uncached(
     db: Session, parent_id: str
 ) -> Dict[str, "_SpeakerGalleryEntry"]:
     """Load all enrolled speaker embeddings for a parent.
@@ -941,21 +1002,19 @@ def load_parent_embeddings(
             if not fname.endswith(".npy"):
                 continue
             fpath = os.path.join(sdir, fname)
+            # One unreadable or wrong-size file must not disable detection for the
+            # whole family: skip it and keep the speaker's other references.
             try:
-                arr = np.asarray(np.load(fpath), dtype=np.float32).reshape(-1)
+                arr = np.asarray(np.load(fpath, allow_pickle=False), dtype=np.float32).reshape(-1)
             except Exception as exc:
-                logger.error("EMBEDDING_LOAD_FAILED | file=%s | reason=%s", fpath, str(exc))
-                raise ValueError(f"dim mismatch or unreadable embedding: {fpath}") from exc
-            if arr.ndim != 1 or arr.shape[0] != config.EXPECTED_EMBEDDING_DIM:
+                logger.error("EMBEDDING_LOAD_FAILED | file=%s | reason=%s | skipped", fpath, str(exc))
+                continue
+            if arr.shape[0] != config.EXPECTED_EMBEDDING_DIM or not np.all(np.isfinite(arr)):
                 logger.error(
-                    "EMBEDDING_DIM_MISMATCH | file=%s | expected=%s | got=%s",
-                    fpath,
-                    config.EXPECTED_EMBEDDING_DIM,
-                    arr.shape[0] if arr.ndim == 1 else -1,
+                    "EMBEDDING_INVALID | file=%s | expected_dim=%s | got=%s | skipped",
+                    fpath, config.EXPECTED_EMBEDDING_DIM, arr.shape[0],
                 )
-                raise ValueError(
-                    f"dim mismatch for embedding {fpath}: expected {config.EXPECTED_EMBEDDING_DIM}, got {arr.shape[0] if arr.ndim == 1 else 'non-1d'}"
-                )
+                continue
             embs.append(arr)
         if embs:
             out[str(sp.id)] = {
@@ -988,6 +1047,7 @@ def _score_against_candidates(
     query_embs: List[np.ndarray],
     parent_id: Optional[str] = None,
     t_high_global: float = T_HIGH,
+    scores_out: Optional[Dict[str, float]] = None,
 ) -> Tuple[float, Optional[str], Optional[str]]:
     """Score query embeddings against all enrolled speakers.
 
@@ -998,6 +1058,7 @@ def _score_against_candidates(
         query_embs  : list of L2-normalised query embeddings for this chunk.
         parent_id   : used for logging only.
         t_high_global : household / global T_HIGH used for ZT-norm context.
+        scores_out  : if given, filled with {speaker_id: score} for every speaker.
 
     Returns:
         (best_score, best_speaker_id, best_speaker_role)
@@ -1008,24 +1069,42 @@ def _score_against_candidates(
     best_role: Optional[str] = None
     speaker_scores: Dict[str, float] = {}
 
+    if not query_embs:
+        return 0.0, None, None
+    queries = _unit_rows(query_embs)
+
+    # Adaptive symmetric normalisation (opt-in, SAFEEAR_SCORE_NORM=asnorm).  Its output
+    # is calibrated to the cosine scale, so the usual thresholds apply.
+    from app.utils.score_normaliser import get_asnorm
+    asnorm = get_asnorm()
+    query_stats = asnorm.query_stats(queries) if asnorm is not None else None
+
     for sid, entry in candidates.items():
         # Support both legacy List[np.ndarray] (no metadata) and new dict format.
         if isinstance(entry, dict):
             embs = entry["embs"]
+            refs = entry.get("matrix")
             role = entry.get("role", "familiar_adult")
             cohort_mean = entry.get("cohort_mean")
             cohort_std = entry.get("cohort_std")
         else:
             embs = entry  # backward compat
+            refs = None
             role = "familiar_adult"
             cohort_mean = None
             cohort_std = None
+        if not len(embs):
+            continue
+        if refs is None:
+            refs = _unit_rows(embs)
 
-        per_chunk_best: List[float] = []
-        for q in query_embs:
-            chunk_best = max((_cos(q, ref) for ref in embs), default=-1.0)
-            if chunk_best >= 0.0:
-                per_chunk_best.append(float(chunk_best))
+        # Cosine of every query chunk against every reference in one product;
+        # each chunk keeps its best-matching reference.
+        best_per_chunk = (queries @ refs.T).max(axis=1)
+        if asnorm is not None:
+            per_chunk_best = [float(v) for v in best_per_chunk]  # normalisation needs the full range
+        else:
+            per_chunk_best = [float(v) for v in best_per_chunk if v >= 0.0]
         if not per_chunk_best:
             continue
 
@@ -1033,11 +1112,20 @@ def _score_against_candidates(
         top_chunks = sorted(per_chunk_best, reverse=True)[: min(2, len(per_chunk_best))]
         raw_score = float((0.7 * np.median(per_chunk_best)) + (0.3 * np.mean(top_chunks)))
 
-        # ZT-norm: z-score using pre-computed cohort statistics.
-        # If cohort stats are missing (enrollment predates Change 6), use raw score.
-        if cohort_mean is not None and cohort_std is not None and cohort_std > 1e-6:
+        if asnorm is not None:
+            cached = entry.get("_asnorm_stats") if isinstance(entry, dict) else None
+            if cached is not None and cached[0] is asnorm:
+                enroll_stats = cached[1]
+            else:
+                enroll_stats = asnorm.enroll_stats(refs)
+                if isinstance(entry, dict):
+                    entry["_asnorm_stats"] = (asnorm, enroll_stats)
+            speaker_score = float(asnorm.normalize(raw_score, enroll_stats, query_stats))
+        # Cohort z-norm (opt-in).  The result is a z-score, not a cosine, so it
+        # must not be clipped or compared against cosine thresholds.
+        elif ENABLE_SCORE_NORM and cohort_mean is not None and cohort_std is not None and cohort_std > 1e-6:
             from app.utils.score_normaliser import zt_norm
-            speaker_score = float(np.clip(zt_norm(raw_score, cohort_mean, cohort_std), 0.0, 1.0))
+            speaker_score = float(zt_norm(raw_score, cohort_mean, cohort_std))
             logger.debug(
                 "ZT_NORM | speaker_id=%s | raw=%.4f | mean=%.4f | std=%.4f | normed=%.4f",
                 sid, raw_score, cohort_mean, cohort_std, speaker_score,
@@ -1046,6 +1134,8 @@ def _score_against_candidates(
             speaker_score = raw_score
 
         speaker_scores[sid] = speaker_score
+        if scores_out is not None:
+            scores_out[str(sid)] = round(float(speaker_score), 4)
         if speaker_score > best:
             best = speaker_score
             best_speaker = sid
@@ -1101,8 +1191,8 @@ def create_alert(
     db.commit()
     db.refresh(alert)
     logger.info(
-        "ALERT_CREATED | alert_id=%s | parent_id=%s | device_id=%s | alert_type=%s | confidence_score=%.4f | location=(%s, %s)",
-        alert.id, parent_id, device_id, alert_type, confidence_score, latitude, longitude,
+        "ALERT_CREATED | alert_id=%s | parent_id=%s | device_id=%s | alert_type=%s | confidence_score=%.4f | has_location=%s",
+        alert.id, parent_id, device_id, alert_type, confidence_score, latitude is not None,
     )
     return alert
 
@@ -1166,17 +1256,28 @@ def other_embeddings_exist(gallery: Dict[str, Any]) -> bool:
 # Change 5: Per-household calibrated thresholds
 # ---------------------------------------------------------------------------
 
-_GLOBAL_T_HIGH = float(os.environ.get("SAFEEAR_T_HIGH", "0.47"))
-_GLOBAL_T_LOW = float(os.environ.get("SAFEEAR_T_LOW", "0.31"))
+_GLOBAL_T_HIGH = T_HIGH
+_GLOBAL_T_LOW = T_LOW
+
+# Per-household thresholds are opt-in.  Calibrating from enrollment clips alone
+# (clean phone audio, family-only impostors) does not transfer to the worn
+# device, so the field-tuned global thresholds are used unless this is enabled.
+USE_HOUSEHOLD_THRESHOLDS = os.environ.get("SAFEEAR_USE_HOUSEHOLD_THRESHOLDS", "false").strip().lower() in {"1", "true", "yes", "on"}
+# When false, auto_calibrate_thresholds() only logs what it would have set.
+AUTO_CALIBRATE_APPLY = os.environ.get("SAFEEAR_AUTO_CALIBRATE_APPLY", "false").strip().lower() in {"1", "true", "yes", "on"}
+# Cohort score normalisation is opt-in; thresholds must be re-derived in the
+# z-score domain before enabling it.
+ENABLE_SCORE_NORM = os.environ.get("SAFEEAR_ENABLE_SCORE_NORM", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def get_household_thresholds(db: Session, parent_id: str) -> Tuple[float, float]:
     """Return (T_HIGH, T_LOW) for this household.
 
-    Reads from HouseholdConfig if a calibrated record exists; falls back to
-    global env-var defaults.  The calibrated values are set by
-    auto_calibrate_thresholds() when enough enrollment data is available.
+    Returns the global env-var thresholds unless SAFEEAR_USE_HOUSEHOLD_THRESHOLDS
+    is enabled, in which case a calibrated HouseholdConfig record takes precedence.
     """
+    if not USE_HOUSEHOLD_THRESHOLDS:
+        return _GLOBAL_T_HIGH, _GLOBAL_T_LOW
     try:
         parent_uuid = _as_uuid(parent_id, "parent_id")
         cfg = db.query(HouseholdConfig).filter(
@@ -1255,6 +1356,15 @@ def auto_calibrate_thresholds(db: Session, parent_id: str) -> Optional[Tuple[flo
     min_t_high = 0.45 if _IS_REDIMNET2 else 0.30
     t_high = float(np.clip(eer_t, min_t_high, 0.90))
     t_low = float(np.clip(eer_t - margin, min_t_high - 0.15, t_high - 0.05))
+
+    if not AUTO_CALIBRATE_APPLY:
+        logger.info(
+            "AUTO_CALIBRATE_SHADOW | parent_id=%s | would_set_t_high=%.4f | would_set_t_low=%.4f | eer=%.4f "
+            "| target_n=%d | impostor_n=%d | active_t_high=%.4f | active_t_low=%.4f",
+            parent_id, t_high, t_low, eer, len(target_scores), len(impostor_scores),
+            _GLOBAL_T_HIGH, _GLOBAL_T_LOW,
+        )
+        return None
 
     try:
         parent_uuid = _as_uuid(parent_id, "parent_id")
@@ -1414,17 +1524,66 @@ def get_alert(db: Session, parent_id: str, alert_id: str) -> AlertModel:
 
 
 def _delete_clip_path(path: Optional[str]) -> None:
+    """Remove an alert clip together with its alert folder (metadata.json included)."""
     if not path:
         return
     try:
-        if os.path.exists(path):
-            os.remove(path)
         clip_dir = os.path.dirname(path)
-        if clip_dir and os.path.isdir(clip_dir) and not os.listdir(clip_dir):
-            os.rmdir(clip_dir)
+        alerts_root = os.path.dirname(clip_dir)
+        if clip_dir and os.path.basename(alerts_root) == "alerts" and os.path.isdir(clip_dir):
+            shutil.rmtree(clip_dir, ignore_errors=True)
+        elif os.path.exists(path):
+            os.remove(path)
     except OSError:
         # Clip cleanup should never block DB deletion.
         pass
+
+
+CLIP_RETENTION_DAYS = int(os.environ.get("SAFEEAR_CLIP_RETENTION_DAYS", "30"))
+
+
+def purge_old_alert_clips(db: Session, retention_days: int = CLIP_RETENTION_DAYS) -> int:
+    """Delete alert audio older than the retention period.
+
+    The alert record (time, device, score, location) stays in the history; only
+    the recording of the people involved is removed.  0 disables purging.
+    """
+    if retention_days <= 0:
+        return 0
+    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=retention_days)
+    rows = (
+        db.query(AlertModel)
+        .filter(AlertModel.audio_clip_path.isnot(None), AlertModel.timestamp < cutoff)
+        .all()
+    )
+    for row in rows:
+        _delete_clip_path(str(row.audio_clip_path))
+        row.audio_clip_path = None
+    if rows:
+        db.commit()
+    return len(rows)
+
+
+def delete_parent_account(db: Session, parent_id: str) -> None:
+    """Permanently delete a family: recordings, voiceprints, devices, alerts, sessions."""
+    from app.database.models import RefreshToken
+
+    parent = get_parent(db, parent_id)
+    parent_uuid = parent.id
+    for device in list(parent.devices):
+        try:
+            stop_session(str(parent_uuid), str(device.id))
+        except Exception:
+            pass
+    db.query(RefreshToken).filter(RefreshToken.parent_id == parent_uuid).delete(synchronize_session=False)
+    db.query(HouseholdConfig).filter(HouseholdConfig.parent_id == parent_uuid).delete(synchronize_session=False)
+    from app.database.models import PairingRequest
+
+    db.query(PairingRequest).filter(PairingRequest.claimed_parent_id == parent_uuid).delete(synchronize_session=False)
+    db.delete(parent)  # cascades to devices, speakers, alerts and credentials
+    db.commit()
+    shutil.rmtree(os.path.join(TENANTS_ROOT, str(parent_uuid)), ignore_errors=True)
+    invalidate_gallery(str(parent_uuid))
 
 
 def delete_alert(db: Session, parent_id: str, alert_id: str) -> None:
@@ -1482,6 +1641,12 @@ class SessionState:
     recent_confirmed_stranger_embeddings: List[np.ndarray] = field(default_factory=list)
     # Change 7: consecutive windows with distress_score >= DISTRESS_ALERT_THRESHOLD
     distress_streak: int = 0
+    # Chunk stream bookkeeping (client-supplied seq / t_start_ms), used to detect
+    # gaps and reordering so the stranger streak only spans contiguous audio.
+    stream_id: Optional[str] = None
+    last_seq: Optional[int] = None
+    last_chunk_end_ms: Optional[int] = None
+    last_distress_alert_ms: int = 0
     # Change 10: drift tracking
     child_drift_scores: List[float] = field(default_factory=list)
     # Change 11: weighted streak
@@ -1492,33 +1657,77 @@ class SessionState:
     # Phase 5: Device obstruction detection
     obstruction_counter: int = 0
     device_obstructed_alert_sent_at: int = 0
+    # Parent-nearby rule (app.services.child_safety): cached result per stream.
+    proximity_checked_ms: int = 0
+    proximity_near: bool = False
+    # Alert clip post-roll: the saved clip is rewritten once this much more audio arrived.
+    post_roll_clip_path: Optional[str] = None
+    post_roll_buffer: Optional[np.ndarray] = None
+    post_roll_remaining: int = 0
+    last_used_monotonic: float = 0.0
 
 def _session_key(parent_id: str, device_id: str) -> str:
     return f"{parent_id}:{device_id}"
 
 
-def get_or_create_session(parent_id: str, device_id: str) -> SessionState:
+_DEVICE_LOCKS: Dict[str, threading.Lock] = {}
+
+
+def device_lock(parent_id: str, device_id: str) -> threading.Lock:
+    """Per-device lock: chunks from one device are processed strictly one at a time."""
     key = _session_key(parent_id, device_id)
+    with _LOCK:
+        lock = _DEVICE_LOCKS.get(key)
+        if lock is None:
+            lock = _DEVICE_LOCKS[key] = threading.Lock()
+        return lock
+
+
+SESSION_IDLE_EVICT_SEC = int(os.environ.get("SAFEEAR_SESSION_IDLE_EVICT_SEC", "600"))
+_PERSISTED_FIELDS = (
+    "stranger_streak", "stranger_weight_sum", "familiar_recovery_streak", "last_alert_ms",
+    "last_familiar_ms", "last_familiar_speaker_id", "stream_id", "last_seq", "last_chunk_end_ms",
+    "last_distress_alert_ms",
+)
+
+
+def get_or_create_session(parent_id: str, device_id: str) -> SessionState:
+    """In-memory session for a device.  A new session restores its small decision
+    state (streak, debounce clock, stream position) from Redis when available, so
+    a server restart neither repeats an alert nor forgets a streak in progress."""
+    key = _session_key(parent_id, device_id)
+    with _LOCK:
+        row = _SESSIONS.get(key)
+        if row is not None:
+            row.last_used_monotonic = time.monotonic()
+            return row
+    restored = load_session(parent_id, device_id)
     with _LOCK:
         row = _SESSIONS.get(key)
         if row is None:
             row = SessionState(parent_id=parent_id, device_id=device_id)
+            for field_name in _PERSISTED_FIELDS:
+                if restored and field_name in restored and restored[field_name] is not None:
+                    setattr(row, field_name, restored[field_name])
             _SESSIONS[key] = row
-        # persist light-weight metadata to redis for cross-process visibility
-        try:
-            persist_session(parent_id, device_id, {
-                "parent_id": row.parent_id,
-                "device_id": row.device_id,
-                "sr": row.sr,
-                "stranger_streak": row.stranger_streak,
-                "last_alert_ms": row.last_alert_ms,
-                "lat": float(row.lat) if row.lat is not None else None,
-                "lon": float(row.lon) if row.lon is not None else None,
-                "last_familiar_ms": row.last_familiar_ms,
-            })
-        except Exception:
-            pass
+        row.last_used_monotonic = time.monotonic()
         return row
+
+
+def persist_session_state(session: SessionState) -> None:
+    """Save the small decision state (a few hundred bytes) after each processed chunk."""
+    persist_session(session.parent_id, session.device_id, {f: getattr(session, f) for f in _PERSISTED_FIELDS})
+
+
+def evict_idle_sessions(max_idle_sec: int = SESSION_IDLE_EVICT_SEC) -> int:
+    """Free audio buffers of devices that stopped streaming (state stays in Redis)."""
+    cutoff = time.monotonic() - max_idle_sec
+    with _LOCK:
+        stale = [k for k, v in _SESSIONS.items() if v.last_used_monotonic < cutoff]
+        for k in stale:
+            del _SESSIONS[k]
+            _DEVICE_LOCKS.pop(k, None)
+    return len(stale)
 
 
 def stop_session(parent_id: str, device_id: str) -> None:
@@ -1537,47 +1746,32 @@ def start_stranger_segment(
     started_ms: int,
     pre_roll_waveform: Optional[np.ndarray] = None,
 ) -> None:
-    segment = np.asarray(waveform, dtype=np.float32).reshape(-1)
-    if pre_roll_waveform is not None:
-        pre_roll = np.asarray(pre_roll_waveform, dtype=np.float32).reshape(-1)
-        if pre_roll.size > 0:
-            segment = np.concatenate([pre_roll, segment])
-    session.stranger_segment = segment.copy()
+    """Mark the start of a stranger episode.  Only timestamps are kept: the alert
+    clip comes from the rolling clip_buffer, so the audio is not copied here."""
     session.stranger_segment_started_ms = started_ms
     session.stranger_segment_ended_ms = 0
-    try:
-        # persist stranger_segment buffer to redis for cross-process retrieval
-        from app.services.session_manager import save_buffer
-
-        save_buffer(session.parent_id, session.device_id, "stranger_segment", session.stranger_segment)
-    except Exception:
-        pass
 
 
 def append_stranger_segment(session: SessionState, waveform: np.ndarray) -> None:
-    segment = np.asarray(waveform, dtype=np.float32).reshape(-1)
-    if session.stranger_segment is None or session.stranger_segment.size == 0:
-        session.stranger_segment = segment.copy()
-        return
-    session.stranger_segment = np.concatenate([session.stranger_segment, segment])
-    try:
-        from app.services.session_manager import save_buffer
-
-        save_buffer(session.parent_id, session.device_id, "stranger_segment", session.stranger_segment)
-    except Exception:
-        pass
+    """Kept for call-site compatibility; the episode audio is not accumulated."""
+    return None
 
 
 def clear_stranger_segment(session: SessionState) -> None:
     session.stranger_segment = None
     session.stranger_segment_started_ms = 0
     session.stranger_segment_ended_ms = 0
-    try:
-        from app.services.session_manager import save_buffer
 
-        save_buffer(session.parent_id, session.device_id, "stranger_segment", None)
-    except Exception:
-        pass
+
+def reset_stream(session: SessionState) -> None:
+    """Forget audio context after a gap in the stream.  Windows on either side of a
+    gap must not be stitched together or count toward the same stranger streak.
+    The alert debounce and familiar-grace clocks are kept."""
+    session.inference_buffer = None
+    session.stranger_streak = 0
+    session.stranger_weight_sum = 0.0
+    session.familiar_recovery_streak = 0
+    clear_stranger_segment(session)
 
 
 def clear_stranger_identity(session: SessionState) -> None:
@@ -1603,13 +1797,9 @@ def set_active_stranger_embedding(session: SessionState) -> Optional[np.ndarray]
     return normed
 
 
-def get_stranger_segment_waveform(session: SessionState, fallback: np.ndarray) -> np.ndarray:
-    if session.stranger_segment is not None and session.stranger_segment.size > 0:
-        return session.stranger_segment
-    return np.asarray(fallback, dtype=np.float32).reshape(-1)
-
-
 def update_session_location(parent_id: str, device_id: str, lat: Optional[float], lon: Optional[float]) -> None:
+    if lat is None or lon is None:
+        return  # a location post without coordinates must not erase the last fix
     s = get_or_create_session(parent_id, device_id)
     s.lat = lat
     s.lon = lon
@@ -1617,12 +1807,6 @@ def update_session_location(parent_id: str, device_id: str, lat: Optional[float]
 
 def clear_clip_buffer(session: SessionState) -> None:
     session.clip_buffer = None
-    try:
-        from app.services.session_manager import save_buffer
-
-        save_buffer(session.parent_id, session.device_id, "clip_buffer", None)
-    except Exception:
-        pass
 
 
 def evaluate_window(db: Session, parent_id: str, waveform: np.ndarray, sr: int = 16000) -> Dict[str, Any]:
@@ -1685,47 +1869,28 @@ def evaluate_window(db: Session, parent_id: str, waveform: np.ndarray, sr: int =
 
     logger.info("TIER1_VAD_PASSED | parent_id=%s | voiced_ms=%.1f | rms=%.6f", parent_id, voiced_ms, rms)
 
-    longest = max(segments, key=lambda ab: ab[1] - ab[0])
-    gate_audio = waveform[longest[0] : longest[1]]
-    parent_candidates = load_parent_embeddings(db, parent_id)
-
-    # Change 7: submit distress detection in parallel with YAMNet + ReDimNet.
-    # classify_distress_event is non-blocking and cheap relative to ReDimNet inference.
-    future_yamnet = _INFER_POOL.submit(classify_audio_event_windowed, gate_audio, sr)
-    future_distress = _INFER_POOL.submit(classify_distress_event, gate_audio, sr)
-    future_embs = _INFER_POOL.submit(embed_waveform_chunks, waveform, sr, segments)
-
-    speech_ok, speech_metrics = assess_speech_likeness(gate_audio, sr)
-
-    yamnet_result = future_yamnet.result()
+    # Tier 2 and Tier 3 both look only at the voiced audio (silence removed),
+    # exactly as enrollment does.
+    voiced = np.concatenate([waveform[s:e] for s, e in segments]).astype(np.float32, copy=False)
+    speech_ok, speech_metrics = assess_speech_likeness(voiced, sr)
+    yamnet_result = classify_audio_event_windowed(voiced, sr)
     category = yamnet_result.get("category", "uncertain")
     confidence = float(yamnet_result.get("confidence", 0.0))
-
-    # Collect distress result (best-effort; never block alert path on failure).
-    try:
-        distress_result = future_distress.result()
-    except Exception:
-        distress_result = {"distress": False, "distress_score": 0.0, "distress_class": None}
+    distress_result = distress_from_result(yamnet_result)
 
     logger.info(
         "TIER2_EVALUATION | parent_id=%s | speech_ok=%s | yamnet_category=%s | yamnet_confidence=%.4f"
-        " | distress=%s | distress_score=%.4f | rms=%.6f | flatness=%.4f | centroid_hz=%.1f",
-        parent_id, speech_ok, category, confidence,
-        distress_result.get("distress", False), distress_result.get("distress_score", 0.0),
-        speech_metrics.get("rms", 0.0), speech_metrics.get("spectral_flatness", 0.0),
+        " | top_class=%s | distress_score=%.4f | flatness=%.4f | centroid_hz=%.1f",
+        parent_id, speech_ok, category, confidence, yamnet_result.get("top_class"),
+        distress_result["distress_score"], speech_metrics.get("spectral_flatness", 0.0),
         speech_metrics.get("spectral_centroid_hz", 0.0),
     )
 
-    # Only hard-reject clear non-human audio. If YAMNet is uncertain,
-    # continue to tier-3 so speaker scoring can still run.
+    # Hard-reject clear non-speech (music/TV/singing, laughing/crying/coughing).
+    # Crowd babble and uncertain audio still go to Tier 3: a confident familiar
+    # match there is useful, but they never count as stranger evidence.
     hard_reject = (
         not speech_ok
-        or speech_metrics.get("rms", 0.0) < 0.003
-        or speech_metrics.get("spectral_flatness", 1.0) > 0.85
-        or (
-            speech_metrics.get("spectral_centroid_hz", 0.0) < 120.0
-            or speech_metrics.get("spectral_centroid_hz", 0.0) > 7800.0
-        )
         or category == "reject"
         or (category == "vocal_non_speech" and confidence >= 0.70)
     )
@@ -1755,15 +1920,31 @@ def evaluate_window(db: Session, parent_id: str, waveform: np.ndarray, sr: int =
 
     logger.info("TIER2_PASSED | parent_id=%s | proceeding_to_tier3_speaker_match", parent_id)
 
+    # Tier 3 runs only for windows that passed Tier 2.
     try:
-        query_embs = future_embs.result()
+        parent_candidates = load_parent_embeddings(db, parent_id)
+        if not parent_candidates:
+            # Nobody is enrolled yet: every voice would score 0 and look like a
+            # stranger.  Hold until at least one family voice is enrolled.
+            perf = _perf_metrics(len(waveform), sr, started_at)
+            logger.info("TIER3_SETUP_REQUIRED | parent_id=%s | reason=no_enrolled_speakers", parent_id)
+            return {
+                "tier1_vad": {"passed": True, "voiced_ms": voiced_ms},
+                "tier2": {"passed": True, "confidence": confidence, **yamnet_result, **speech_metrics},
+                "tier3": {"passed": False, "score": 0.0, "closest_speaker_id": None,
+                          "closest_speaker_role": None, "error": "no_enrolled_speakers"},
+                "distress": distress_result,
+                "decision": "setup_required",
+                "perf": perf,
+            }
+        if INFERENCE_EMBED_MODE == "segments":
+            # Legacy (pre-fix) behaviour: one embedding per VAD segment.
+            query_embs = embed_waveform_chunks(waveform, sr, segments)
+        else:
+            query_embs = embed_waveform_chunks(voiced, sr, None, drop_short_tails=True)
     except Exception as exc:
         perf = _perf_metrics(len(waveform), sr, started_at)
-        logger.warning(
-            "TIER3_UNAVAILABLE | parent_id=%s | reason=%s",
-            parent_id,
-            str(exc),
-        )
+        logger.error("TIER3_UNAVAILABLE | parent_id=%s | reason=%s", parent_id, str(exc))
         return {
             "tier1_vad": {"passed": True, "voiced_ms": voiced_ms},
             "tier2": {"passed": True, "confidence": confidence, **yamnet_result, **speech_metrics},
@@ -1780,8 +1961,9 @@ def evaluate_window(db: Session, parent_id: str, waveform: np.ndarray, sr: int =
         }
 
     # Change 1: _score_against_candidates now returns (score, speaker_id, speaker_role).
+    speaker_scores: Dict[str, float] = {}
     score, closest_speaker_id, closest_speaker_role = _score_against_candidates(
-        parent_candidates, query_embs, parent_id, t_high_global=t_high
+        parent_candidates, query_embs, parent_id, t_high_global=t_high, scores_out=speaker_scores
     )
     query_centroid = _compute_query_centroid(query_embs)
 
@@ -1807,6 +1989,7 @@ def evaluate_window(db: Session, parent_id: str, waveform: np.ndarray, sr: int =
             "score": float(score),
             "closest_speaker_id": closest_speaker_id,
             "closest_speaker_role": closest_speaker_role,
+            "speaker_scores": speaker_scores,
             "t_high": t_high,
             "t_low": t_low,
         },
@@ -1837,27 +2020,56 @@ def append_frame(session: SessionState, frame: np.ndarray) -> np.ndarray:
     if session.clip_buffer.shape[0] > clip_keep:
         session.clip_buffer = session.clip_buffer[-clip_keep:]
 
-    # Persist buffers to Redis (best-effort) for cross-process visibility
-    try:
-        save_buffer(session.parent_id, session.device_id, "inference_buffer", session.inference_buffer)
-        save_buffer(session.parent_id, session.device_id, "clip_buffer", session.clip_buffer)
-    except Exception:
-        pass
-
+    _feed_post_roll(session, frame)
     return session.inference_buffer
+
+
+def pad_clip_silence(session: SessionState, n_samples: int) -> None:
+    """Insert the silence the device did not upload (silent chunks it skipped), so the
+    alert clip keeps real timing instead of jumping between speech chunks.
+    Only the clip buffers are padded; the analysis buffer is unchanged."""
+    n = min(int(n_samples), int(ALERT_RING_SEC * session.sr))
+    if n <= 0:
+        return
+    zeros = np.zeros(n, dtype=np.float32)
+    if session.clip_buffer is not None:
+        session.clip_buffer = np.concatenate([session.clip_buffer, zeros])[-int(ALERT_RING_SEC * session.sr):]
+    _feed_post_roll(session, zeros)
+
+
+def start_post_roll(session: SessionState, clip_path: str, pre_alert: np.ndarray) -> None:
+    if ALERT_POST_ROLL_SEC <= 0 or not clip_path:
+        return
+    session.post_roll_clip_path = clip_path
+    session.post_roll_buffer = np.asarray(pre_alert, dtype=np.float32).reshape(-1).copy()
+    session.post_roll_remaining = int(ALERT_POST_ROLL_SEC * session.sr)
+
+
+def _feed_post_roll(session: SessionState, frame: np.ndarray) -> None:
+    if not session.post_roll_clip_path or session.post_roll_buffer is None:
+        return
+    take = np.asarray(frame, dtype=np.float32).reshape(-1)[: session.post_roll_remaining]
+    session.post_roll_buffer = np.concatenate([session.post_roll_buffer, take])
+    session.post_roll_remaining -= take.shape[0]
+    if session.post_roll_remaining > 0:
+        return
+    path = session.post_roll_clip_path
+    waveform = session.post_roll_buffer
+    session.post_roll_clip_path = None
+    session.post_roll_buffer = None
+    session.post_roll_remaining = 0
+    try:
+        tmp = f"{path}.post.tmp"
+        sf.write(tmp, normalize_waveform(waveform), session.sr, format="WAV")
+        os.replace(tmp, path)  # atomic: a parent playing the clip gets old or new, never half
+        logger.info("ALERT_CLIP_POST_ROLL_SAVED | path=%s | seconds=%.1f", path, waveform.shape[0] / session.sr)
+    except Exception as exc:
+        logger.warning("ALERT_CLIP_POST_ROLL_FAILED | path=%s | reason=%s", path, exc)
 
 
 def get_clip_buffer_waveform(session: SessionState, fallback: np.ndarray) -> np.ndarray:
     if session.clip_buffer is not None and session.clip_buffer.size > 0:
         return np.asarray(session.clip_buffer, dtype=np.float32).reshape(-1)
-    try:
-        from app.services.session_manager import load_buffer
-
-        buf = load_buffer(session.parent_id, session.device_id, "clip_buffer")
-        if buf is not None and buf.size > 0:
-            return np.asarray(buf, dtype=np.float32).reshape(-1)
-    except Exception:
-        pass
     return np.asarray(fallback, dtype=np.float32).reshape(-1)
 
 
@@ -1877,12 +2089,14 @@ def compute_and_store_enrollment_quality(db: Session, parent_id: str, speaker_id
                 embs.append(arr)
 
     if len(embs) < 2:
+        # Consistency needs at least two embeddings; ask for another sample
+        # rather than reporting a quality we cannot measure.
         speaker.quality_score = None
-        speaker.quality_label = None
+        speaker.quality_label = "pending"
         speaker.updated_at = datetime.now(timezone.utc)
         db.commit()
         db.refresh(speaker)
-        return None, None
+        return None, "pending"
 
     pair_scores = [_cos(a, b) for a, b in combinations(embs, 2)]
     if not pair_scores:
@@ -1936,12 +2150,14 @@ def save_alert_clip(parent_id: str, session: SessionState, waveform: np.ndarray)
     tmp_clip_path = f"{clip_path}.tmp"
     metadata_path = os.path.join(adir, "metadata.json")
     metadata = {
-        "segment_started_ms": session.stranger_segment_started_ms if session.stranger_segment_started_ms else None,
-        "segment_ended_ms": session.stranger_segment_ended_ms if session.stranger_segment_ended_ms else None,
-        "sample_rate": session.sr,
-        "samples": np.asarray(waveform.reshape(-1).shape[0]),
+        "segment_started_ms": int(session.stranger_segment_started_ms) if session.stranger_segment_started_ms else None,
+        "segment_ended_ms": int(session.stranger_segment_ended_ms) if session.stranger_segment_ended_ms else None,
+        "sample_rate": int(session.sr),
+        "samples": int(np.asarray(waveform).reshape(-1).shape[0]),
     }
     try:
+        # Raw chunks are no longer gain-normalized on arrival; level the clip for playback.
+        waveform = normalize_waveform(np.asarray(waveform, dtype=np.float32).reshape(-1))
         sf.write(tmp_clip_path, waveform, session.sr, format="WAV")
         try:
             os.replace(tmp_clip_path, clip_path)

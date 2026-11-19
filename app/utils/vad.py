@@ -1,72 +1,122 @@
 # app/utils/vad.py
 """
-Silero-based VAD with energy fallback.
-Returns a trimmed numpy float32 waveform (speech only) or original audio if VAD fails.
+Voice activity detection: Silero VAD (installed `silero-vad` package), with an
+energy-based fallback that is used only if Silero cannot be loaded.
+
+Earlier versions loaded Silero through torch.hub and read
+`utils.get_speech_timestamps` from a tuple, which always raised; the error was
+swallowed and every window silently used the energy fallback (which marks
+noise, hum and music as speech).  `status()` now reports which backend is live
+so a degraded VAD is visible in logs and /health.
 """
 
-from typing import List, Tuple
+import logging
+import os
+import threading
+from typing import List, Optional, Tuple
 
 import numpy as np
+
 try:
     import torch
 except Exception:
     torch = None
 
+logger = logging.getLogger(__name__)
 
 _SILERO_MODEL = None
-_SILERO_UTILS = None
+_SILERO_GET_TS = None
 _SILERO_LOAD_ATTEMPTED = False
+_SILERO_ERROR: Optional[str] = None
+_LOAD_LOCK = threading.Lock()
+# The Silero model keeps internal state between frames, so calls are serialized.
+_INFER_LOCK = threading.Lock()
+
+
+def _silero_kwargs() -> dict:
+    """Optional Silero overrides from env.  Unset keeps Silero's own defaults."""
+    kwargs: dict = {}
+    if os.environ.get("SAFEEAR_VAD_THRESHOLD"):
+        kwargs["threshold"] = float(os.environ["SAFEEAR_VAD_THRESHOLD"])
+    if os.environ.get("SAFEEAR_VAD_MIN_SILENCE_MS"):
+        kwargs["min_silence_duration_ms"] = int(os.environ["SAFEEAR_VAD_MIN_SILENCE_MS"])
+    if os.environ.get("SAFEEAR_VAD_MIN_SPEECH_MS"):
+        kwargs["min_speech_duration_ms"] = int(os.environ["SAFEEAR_VAD_MIN_SPEECH_MS"])
+    return kwargs
+
+
+# torch's own default (physical cores), captured before silero_vad can lower it.
+_DEFAULT_TORCH_THREADS = torch.get_num_threads() if torch is not None else 1
+
+
+def configured_torch_threads() -> int:
+    """SAFEEAR_TORCH_THREADS if set.  On a container host set it to the number of
+    CPUs the plan actually provides; the default can see more cores than the quota."""
+    return max(1, int(os.environ.get("SAFEEAR_TORCH_THREADS", str(_DEFAULT_TORCH_THREADS))))
+
+
+def restore_torch_threads() -> None:
+    """Importing silero_vad calls torch.set_num_threads(1) globally, which made the
+    speaker-embedding model ~3x slower.  Re-apply the intended thread count."""
+    if torch is not None:
+        torch.set_num_threads(configured_torch_threads())
 
 
 def _get_silero():
-    """Load Silero once; return (model, utils) or (None, None) on failure."""
-    global _SILERO_MODEL, _SILERO_UTILS, _SILERO_LOAD_ATTEMPTED
-    if _SILERO_MODEL is not None and _SILERO_UTILS is not None:
-        return _SILERO_MODEL, _SILERO_UTILS
-    if _SILERO_LOAD_ATTEMPTED:
-        return None, None
+    """Load Silero once; return (model, get_speech_timestamps) or (None, None)."""
+    global _SILERO_MODEL, _SILERO_GET_TS, _SILERO_LOAD_ATTEMPTED, _SILERO_ERROR
+    if _SILERO_MODEL is not None:
+        return _SILERO_MODEL, _SILERO_GET_TS
+    with _LOAD_LOCK:
+        if _SILERO_MODEL is not None or _SILERO_LOAD_ATTEMPTED:
+            return _SILERO_MODEL, _SILERO_GET_TS
+        _SILERO_LOAD_ATTEMPTED = True
+        try:
+            from silero_vad import get_speech_timestamps, load_silero_vad
 
-    _SILERO_LOAD_ATTEMPTED = True
-    try:
-        if torch is None:
-            raise ImportError("torch is not available")
-        model, utils = torch.hub.load(  # type: ignore
-            repo_or_dir="snakers4/silero-vad",
-            model="silero_vad",
-            force_reload=False,
-        )
-        _SILERO_MODEL = model
-        _SILERO_UTILS = utils
-        return _SILERO_MODEL, _SILERO_UTILS
-    except Exception:
-        return None, None
+            model = load_silero_vad()
+            restore_torch_threads()
+            _SILERO_MODEL, _SILERO_GET_TS = model, get_speech_timestamps
+            logger.info("VAD_READY | backend=silero | torch_threads=%d", configured_torch_threads())
+        except Exception as exc:
+            _SILERO_ERROR = str(exc)
+            restore_torch_threads()
+            logger.error("VAD_DEGRADED | backend=energy_fallback | reason=%s", exc)
+    return _SILERO_MODEL, _SILERO_GET_TS
 
 
-def _energy_segments(audio: np.ndarray, sr: int, frame_ms: int = 30, threshold_ratio: float = 0.5) -> List[dict]:
-    """Return pseudo speech segments [{start, end}, ...] in samples (energy fallback)."""
+def status() -> dict:
+    model, _ = _get_silero()
+    return {"backend": "silero" if model is not None else "energy_fallback", "error": _SILERO_ERROR}
+
+
+def _silero_segments(audio: np.ndarray, sr: int) -> Optional[List[Tuple[int, int]]]:
+    """Silero segments, or None if Silero is unavailable.  [] means no speech."""
+    model, get_ts = _get_silero()
+    if model is None or torch is None:
+        return None
+    audio_t = torch.from_numpy(np.ascontiguousarray(audio, dtype=np.float32))
+    with _INFER_LOCK, torch.inference_mode():
+        stamps = get_ts(audio_t, model, sampling_rate=sr, **_silero_kwargs())
+    return [(int(t["start"]), int(t["end"])) for t in stamps]
+
+
+def _energy_segments(audio: np.ndarray, sr: int, frame_ms: int = 30, threshold_ratio: float = 0.5) -> List[Tuple[int, int]]:
+    """Pseudo speech segments in samples (fallback only; cannot tell speech from noise)."""
     frame_len = int(sr * frame_ms / 1000)
-    if frame_len <= 0:
-        return [{"start": 0, "end": len(audio)}]
+    if frame_len <= 0 or len(audio) == 0:
+        return [(0, len(audio))] if len(audio) else []
 
     n_frames = int(np.ceil(len(audio) / frame_len))
     pad_len = n_frames * frame_len - len(audio)
-    if pad_len > 0:
-        audio_p = np.concatenate([audio, np.zeros(pad_len, dtype=audio.dtype)])
-    else:
-        audio_p = audio
+    audio_p = np.concatenate([audio, np.zeros(pad_len, dtype=audio.dtype)]) if pad_len > 0 else audio
 
-    frames = audio_p.reshape(n_frames, frame_len)
-    # Use absolute-energy per frame; signed mean is unstable around zero.
-    energy = np.mean(np.abs(frames), axis=1)
+    energy = np.mean(np.abs(audio_p.reshape(n_frames, frame_len)), axis=1)
     if np.all(energy == 0):
-        return [{"start": 0, "end": len(audio)}]
+        return []
 
-    thresh = max(1e-6, energy.mean() * threshold_ratio)
-    mask = energy > thresh
-    if not mask.any():
-        return [{"start": 0, "end": len(audio)}]
-
-    segments = []
+    mask = energy > max(1e-6, energy.mean() * threshold_ratio)
+    segments: List[Tuple[int, int]] = []
     i = 0
     while i < len(mask):
         if not mask[i]:
@@ -75,132 +125,32 @@ def _energy_segments(audio: np.ndarray, sr: int, frame_ms: int = 30, threshold_r
         j = i
         while j < len(mask) and mask[j]:
             j += 1
-        start = i * frame_len
-        end = min(len(audio), j * frame_len)
+        start, end = i * frame_len, min(len(audio), j * frame_len)
         if end > start:
-            segments.append({"start": start, "end": end})
+            segments.append((start, end))
         i = j
-    return segments if segments else [{"start": 0, "end": len(audio)}]
-
-
-def _energy_vad_trim(audio: np.ndarray, sr: int, frame_ms: int = 30, threshold_ratio: float = 0.5):
-    """Simple energy-based VAD fallback"""
-    frame_len = int(sr * frame_ms / 1000)
-    if frame_len <= 0:
-        return audio
-
-    # pad to full frames
-    n_frames = int(np.ceil(len(audio) / frame_len))
-    pad_len = n_frames * frame_len - len(audio)
-    if pad_len > 0:
-        audio_p = np.concatenate([audio, np.zeros(pad_len, dtype=audio.dtype)])
-    else:
-        audio_p = audio
-
-    frames = audio_p.reshape(n_frames, frame_len)
-    # Use absolute-energy per frame; signed mean is unstable around zero.
-    energy = np.mean(np.abs(frames), axis=1)
-    if np.all(energy == 0):
-        return audio
-
-    thresh = max(1e-6, energy.mean() * threshold_ratio)
-    mask = energy > thresh
-    if not mask.any():
-        return audio
-
-    first = np.argmax(mask)
-    last = int(len(mask) - 1 - np.argmax(mask[::-1]))
-    start_sample = first * frame_len
-    end_sample = min(len(audio), (last + 1) * frame_len)
-    return audio[start_sample:end_sample]
+    return segments
 
 
 def get_speech_segments(audio: np.ndarray, sr: int = 16000, use_silero: bool = True) -> List[Tuple[int, int]]:
-    """
-    Return disjoint voiced segments as (start_sample, end_sample) in half-open style [start, end).
-    """
-    audio = np.asarray(audio, dtype=np.float32)
-
-    if use_silero:
+    """Disjoint voiced segments as half-open (start_sample, end_sample).  [] = no speech."""
+    audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+    # SAFEEAR_VAD_BACKEND=energy reproduces the pre-fix behaviour, for A/B comparison only.
+    if use_silero and os.environ.get("SAFEEAR_VAD_BACKEND", "silero").strip().lower() != "energy":
         try:
-            if torch is None:
-                raise ImportError("torch is not available")
-            model, utils = _get_silero()
-            if model is not None and utils is not None:
-                get_speech_ts = utils.get_speech_timestamps
-                audio_t = torch.tensor(audio, dtype=torch.float32)
-                speech_timestamps = get_speech_ts(
-                    audio_t,
-                    model,
-                    sampling_rate=sr,
-                    min_silence_duration_ms=750,  # Bridge pauses between words up to 750ms
-                    min_speech_duration_ms=250,
-                    threshold=0.3
-                )
-                if speech_timestamps:
-                    return [(int(t["start"]), int(t["end"])) for t in speech_timestamps]
-        except Exception:
-            pass
-
-    segs = _energy_segments(audio, sr)
-    return [(int(s["start"]), int(s["end"])) for s in segs]
+            segments = _silero_segments(audio, sr)
+            if segments is not None:
+                return segments
+        except Exception as exc:
+            logger.warning("VAD_SILERO_CALL_FAILED | reason=%s", exc)
+    return _energy_segments(audio, sr)
 
 
-def apply_vad(audio: np.ndarray, sr: int = 16000, use_silero: bool = True):
-    """
-    Trim silence from audio using Silero VAD when available, otherwise energy-based fallback.
-
-    Args:
-        audio: 1-D float32 numpy waveform (range roughly [-1,1])
-        sr: sample rate (expected 16000)
-        use_silero: attempt silero torch.hub model if True
-
-    Returns:
-        trimmed audio (numpy float32)
-    """
-
-    # ensure numpy array float32
-    audio = np.asarray(audio, dtype=np.float32)
-
-    if sr != 16000:
-        # Silero models are trained for 16k, but we don't resample here.
-        # Caller should resample before calling apply_vad.
-        pass
-
-    if use_silero:
-        try:
-            model, utils = _get_silero()
-            if model is None or utils is None:
-                return _energy_vad_trim(audio, sr)
-
-            get_speech_ts = utils.get_speech_timestamps
-            # model expects torch tensor on cpu
-            if torch is None:
-                raise ImportError("torch is not available")
-            audio_t = torch.tensor(audio, dtype=torch.float32)
-            speech_timestamps = get_speech_ts(
-                audio_t,
-                model,
-                sampling_rate=sr,
-                min_silence_duration_ms=750,  # Bridge pauses between words up to 750ms
-                min_speech_duration_ms=250,
-                threshold=0.3
-            )
-
-            if not speech_timestamps:
-                return _energy_vad_trim(audio, sr)
-
-            # merge contiguous segments — keep from first start to last end
-            start = speech_timestamps[0]["start"]
-            end = speech_timestamps[-1]["end"]
-            # ensure ints and within bounds
-            start = max(0, int(start))
-            end = min(len(audio), int(end))
-            if start >= end:
-                return _energy_vad_trim(audio, sr)
-            return audio[start:end]
-        except Exception:
-            # any failure -> fallback
-            return _energy_vad_trim(audio, sr)
-    else:
-        return _energy_vad_trim(audio, sr)
+def apply_vad(audio: np.ndarray, sr: int = 16000, use_silero: bool = True) -> np.ndarray:
+    """Trim leading/trailing non-speech; returns the input unchanged when no speech is found."""
+    audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+    segments = get_speech_segments(audio, sr, use_silero=use_silero)
+    if not segments:
+        return audio
+    start, end = max(0, segments[0][0]), min(len(audio), segments[-1][1])
+    return audio[start:end] if end > start else audio

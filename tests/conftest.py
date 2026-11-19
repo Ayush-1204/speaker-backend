@@ -12,3 +12,12 @@ import pytest
 
 # Ensure tests use an in-memory SQLite database to avoid polluting dev data.
 os.environ.setdefault("DATABASE_URL", "sqlite:///./test_safeear.db")
+
+
+@pytest.fixture(autouse=True)
+def _reset_rate_limits():
+    """Each test starts with empty rate-limit windows (all tests share one client IP)."""
+    from app.core.security import rate_limiter
+
+    rate_limiter.reset()
+    yield

@@ -1,15 +1,94 @@
+"""Per-window stranger decision logic.
+
+`decide()` is the single source of truth for turning a scored window into a
+decision.  It mutates only the session's decision counters and never touches
+the database, audio buffers or notifications, so the live /detect path and the
+offline replay tool (scripts/eval/replay.py) run exactly the same logic.
+
+Defaults reproduce the rules field-tuned on the worn device (backend ff78b72,
+April 2026).  Experimental rules are opt-in via environment flags.
+"""
+
+import datetime
 import logging
-import time
-from typing import Any, Dict, Optional, Tuple
+import math
+import os
+from dataclasses import dataclass
+from typing import Any, Optional, Tuple
 
 import numpy as np
 
 from app.utils import prd_services_db as svc
-from app.services.alert_service import create_and_escalate_alert
-import math
-import datetime
 
 logger = logging.getLogger(__name__)
+
+
+def _env_float(name: str, default: float) -> float:
+    return float(os.environ.get(name, str(default)))
+
+
+def _env_int(name: str, default: int) -> int:
+    return int(os.environ.get(name, str(default)))
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    return os.environ.get(name, "true" if default else "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
+@dataclass
+class DecisionParams:
+    t_high: float = svc.T_HIGH
+    t_low: float = svc.T_LOW
+    stranger_min_tier2_conf: float = 0.70
+    stranger_uncertain_conf_floor: float = 0.88
+    familiar_grace_sec: int = 20
+    familiar_hold_floor: float = 0.30
+    familiar_grace_margin: float = 0.05
+    familiar_grace_min_conf: float = 0.65
+    familiar_reset_min_streak: int = 2
+    soft_stranger_margin: float = 0.03
+    soft_stranger_min_conf: float = 0.30
+    force_alert_score: float = 0.15
+    force_alert_min_streak: int = 2
+    alert_trigger_streak: int = svc.STRANGER_CONFIRM_COUNT
+    debounce_sec: int = 60
+    speaker_change_threshold: float = 0.30
+    # Opt-in: alert on accumulated confidence weight instead of window count.
+    weighted_streak: bool = False
+    alert_weight_threshold: float = 2.5
+
+    @classmethod
+    def from_env(cls) -> "DecisionParams":
+        d = cls()
+        return cls(
+            t_high=_env_float("SAFEEAR_T_HIGH", d.t_high),
+            t_low=_env_float("SAFEEAR_T_LOW", d.t_low),
+            stranger_min_tier2_conf=_env_float("SAFEEAR_STRANGER_MIN_TIER2_CONF", d.stranger_min_tier2_conf),
+            stranger_uncertain_conf_floor=_env_float("SAFEEAR_STRANGER_UNCERTAIN_CONF_FLOOR", d.stranger_uncertain_conf_floor),
+            familiar_grace_sec=_env_int("SAFEEAR_FAMILIAR_GRACE_SEC", d.familiar_grace_sec),
+            familiar_hold_floor=_env_float("SAFEEAR_FAMILIAR_HOLD_FLOOR", d.familiar_hold_floor),
+            familiar_grace_margin=_env_float("SAFEEAR_FAMILIAR_GRACE_MARGIN", d.familiar_grace_margin),
+            familiar_grace_min_conf=_env_float("SAFEEAR_FAMILIAR_GRACE_MIN_CONF", d.familiar_grace_min_conf),
+            familiar_reset_min_streak=_env_int("SAFEEAR_FAMILIAR_RESET_MIN_STREAK", d.familiar_reset_min_streak),
+            soft_stranger_margin=_env_float("SAFEEAR_SOFT_STRANGER_MARGIN", d.soft_stranger_margin),
+            soft_stranger_min_conf=_env_float("SAFEEAR_SOFT_STRANGER_MIN_CONF", d.soft_stranger_min_conf),
+            force_alert_score=_env_float("SAFEEAR_FORCE_ALERT_SCORE", d.force_alert_score),
+            force_alert_min_streak=_env_int("SAFEEAR_FORCE_ALERT_MIN_STREAK", d.force_alert_min_streak),
+            alert_trigger_streak=_env_int("SAFEEAR_ALERT_TRIGGER_STREAK", d.alert_trigger_streak),
+            debounce_sec=_env_int("SAFEEAR_DEBOUNCE_SEC", d.debounce_sec),
+            speaker_change_threshold=_env_float("SAFEEAR_SPEAKER_CHANGE_THRESHOLD", d.speaker_change_threshold),
+            weighted_streak=_env_bool("SAFEEAR_WEIGHTED_STREAK", d.weighted_streak),
+            alert_weight_threshold=_env_float("SAFEEAR_ALERT_WEIGHT_THRESHOLD", d.alert_weight_threshold),
+        )
+
+
+@dataclass
+class DecisionResult:
+    decision: str
+    should_alert: bool = False
+    block_reason: Optional[str] = None
+    child_self_match: bool = False
+    debounce_reset_similarity: Optional[float] = None
 
 
 def _normalized_embedding(vec: Optional[Any]) -> Optional[np.ndarray]:
@@ -37,26 +116,13 @@ def _has_speaker_changed(
     current_embedding: Optional[Any],
     speaker_change_threshold: float,
 ) -> Tuple[bool, Optional[float]]:
-    """Detect whether the current stranger is a different person from the last.
+    """Whether the current stranger differs from the one that last alerted.
 
-    Fix (Change 8): before the first alert fires, active_stranger_embedding is
-    None because set_active_stranger_embedding() is only called inside
-    create_and_escalate_alert.  Previously this returned (False, None) for the
-    entire first episode, making the debounce-reset-on-speaker-change inert.
-
-    Now we fall back to a running centroid computed from
-    recent_confirmed_stranger_embeddings if active_stranger_embedding is None.
+    Only compares against the stranger that actually triggered the last alert.
+    Falling back to the running centroid of the current episode lets noisy
+    1.5 s embeddings of the same person reset the debounce and re-alert.
     """
     reference = session.active_stranger_embedding
-
-    # Fallback: use running centroid from the accumulating embedding list
-    # (populated by record_confirmed_stranger_window on every stranger_candidate
-    # window) when no alert has fired yet.
-    if reference is None and session.recent_confirmed_stranger_embeddings:
-        stacked = np.stack(session.recent_confirmed_stranger_embeddings, axis=0)
-        centroid = np.mean(stacked, axis=0)
-        reference = _normalized_embedding(centroid)
-
     if reference is None or current_embedding is None:
         return False, None
 
@@ -65,164 +131,125 @@ def _has_speaker_changed(
 
 
 def _streak_weight(score: float, t_low: float, t_high: float, tier2_confidence: Optional[float]) -> float:
-    """Change 11: Compute the continuous weight for a stranger candidate window."""
+    """Continuous weight for a stranger-candidate window (opt-in weighted streak)."""
+    if t_low <= 0:
+        return 1.0
     score_weight = max(0.0, min(1.0, (t_low - score) / t_low)) if score <= t_low else 0.0
     conf_weight = min(1.0, tier2_confidence / 0.90) if tier2_confidence else 1.0
     return score_weight * conf_weight
 
 
 def _should_alert(session: svc.SessionState, now_ms: int) -> Tuple[bool, Optional[str]]:
-    """Change 12: Evaluate context gates (time-of-day, geofence, party mode)."""
+    """Context gates (party mode, quiet hours, home geofence).
+
+    Only active when the parent has configured them in HouseholdConfig.
+    """
     cfg = session.household_config
     if not cfg:
         return True, None
-        
-    # Party mode
+
     party = cfg.get("party_mode_until")
     if party:
-        party_dt = datetime.datetime.fromisoformat(party.replace('Z', '+00:00'))
-        # Using UTC for party_mode comparison assuming it's stored in UTC
+        party_dt = datetime.datetime.fromisoformat(party.replace("Z", "+00:00"))
+        if party_dt.tzinfo is None:
+            party_dt = party_dt.replace(tzinfo=datetime.timezone.utc)
         if datetime.datetime.now(datetime.timezone.utc) < party_dt:
             return False, "party_mode"
-            
-    # Time of day (assuming local time via simple datetime)
+
     start = cfg.get("quiet_hours_start")
     end = cfg.get("quiet_hours_end")
     if start is not None and end is not None:
-        dt = datetime.datetime.fromtimestamp(now_ms / 1000.0)
-        h = dt.hour
+        h = datetime.datetime.fromtimestamp(now_ms / 1000.0).hour
         if start <= end:
             if start <= h < end:
                 return False, "quiet_hours"
-        else:
-            if h >= start or h < end:
-                return False, "quiet_hours"
-                
-    # Geofence
+        elif h >= start or h < end:
+            return False, "quiet_hours"
+
     home_lat = cfg.get("home_lat")
     home_lon = cfg.get("home_lon")
     radius = cfg.get("home_radius_m") or 100.0
-    
     if home_lat is not None and home_lon is not None and session.lat is not None and session.lon is not None:
-        R = 6371000  # Earth radius in meters
+        r_earth = 6371000
         phi1, phi2 = math.radians(home_lat), math.radians(session.lat)
         dphi = math.radians(session.lat - home_lat)
         dlambda = math.radians(session.lon - home_lon)
-        a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
-        dist = 2 * R * math.atan2(math.sqrt(a), math.sqrt(1-a))
+        a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+        dist = 2 * r_earth * math.atan2(math.sqrt(a), math.sqrt(1 - a))
         if dist <= radius:
             return False, "geofence_home"
-            
+
     return True, None
 
-def decide_and_act(db, parent_id: str, device_id: str, detection_result: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
-    now = int(time.time() * 1000)
-    session = detection_result["session"]
-    stage = detection_result["stage"]
-    arr_len = detection_result.get("window_samples", 0)
-    score = float(detection_result.get("score", 0.0))
-    current_stranger_centroid = detection_result.get("current_stranger_centroid")
 
-    # Useful stage info
-    tier1_pass = stage.get("tier1_vad", {}).get("passed", False)
-    tier2_pass = stage.get("tier2", {}).get("passed", False)
-    tier3_pass = stage.get("tier3", {}).get("passed", False)
-    tier2_category = str(stage.get("tier2", {}).get("category", "uncertain"))
-    tier2_confidence = float(stage.get("tier2", {}).get("confidence", 0.0))
+def _add_stranger_window(
+    session: svc.SessionState,
+    score: float,
+    limit: float,
+    params: DecisionParams,
+    tier2_confidence: float,
+    centroid: Optional[np.ndarray],
+) -> None:
+    session.stranger_streak += 1
+    session.stranger_weight_sum += _streak_weight(score, limit, params.t_high, tier2_confidence)
+    svc.record_confirmed_stranger_window(session, centroid)
 
-    decision = "hold"
-    alert_fired = False
-    alert_id = None
-    alert_block_reason = None
 
-    # Score decisions
-    T_HIGH = float(config.get("t_high") or 0.65)
-    T_LOW = float(config.get("t_low") or 0.35)
-    STRANGER_MIN_TIER2_CONF = float(config.get("stranger_min_tier2_conf") or 0.9)
-    STRANGER_UNCERTAIN_CONF_FLOOR = float(config.get("stranger_uncertain_conf_floor") or 0.7)
-    FAMILIAR_GRACE_SEC = int(config.get("familiar_grace_sec") or 300)
-    FAMILIAR_HOLD_FLOOR = float(config.get("familiar_hold_floor") or 0.1)
-    FAMILIAR_GRACE_MARGIN = float(config.get("familiar_grace_margin") or 0.1)
-    FAMILIAR_GRACE_MIN_CONF = float(config.get("familiar_grace_min_conf") or 0.8)
-    FAMILIAR_RESET_MIN_STREAK = int(config.get("familiar_reset_min_streak") or 3)
-    SOFT_STRANGER_MARGIN = float(config.get("soft_stranger_margin") or 0.1)
-    SOFT_STRANGER_MIN_CONF = float(config.get("soft_stranger_min_conf") or 0.95)
-    FORCE_ALERT_SCORE = float(config.get("force_alert_score") or -0.5)
-    FORCE_ALERT_MIN_STREAK = int(config.get("force_alert_min_streak") or 5)
-    ALERT_TRIGGER_STREAK = float(config.get("alert_trigger_streak") or 4.0)
-    DEBOUNCE_SEC = int(config.get("debounce_sec") or 120)
-    SPEAKER_CHANGE_THRESHOLD = float(config.get("speaker_change_threshold") or 0.4)
-    STRANGER_PREROLL_SEC = int(config.get("stranger_preroll_sec") or 10)
+def decide(
+    session: svc.SessionState,
+    *,
+    score: float,
+    closest_speaker_id: Optional[str],
+    closest_speaker_role: Optional[str],
+    tier2_category: str,
+    tier2_confidence: float,
+    current_stranger_centroid: Optional[np.ndarray],
+    now_ms: int,
+    params: DecisionParams,
+) -> DecisionResult:
+    """Classify one tier-3-scored window and decide whether to raise an alert.
 
+    The caller is responsible for creating the alert when `should_alert` is
+    true and must then call `mark_identity_alert_fired()`.
+    """
+    role = closest_speaker_role or "familiar_adult"
     allow_stranger_increment = (
-        (tier2_category == "human_speech" and tier2_confidence >= STRANGER_MIN_TIER2_CONF)
-        or (tier2_category == "uncertain" and tier2_confidence >= STRANGER_UNCERTAIN_CONF_FLOOR)
+        (tier2_category == "human_speech" and tier2_confidence >= params.stranger_min_tier2_conf)
+        or (tier2_category == "uncertain" and tier2_confidence >= params.stranger_uncertain_conf_floor)
     )
+    child_self_match = False
 
-    if not tier3_pass:
-        decision = "hold_tier3_unavailable"
-        return {
-            "status": "ok",
-            "decision": decision,
-            "stranger_streak": session.stranger_streak,
-            "score": score,
-            "thresholds": {"t_high": T_HIGH, "t_low": T_LOW},
-            "stage": stage,
-            "alert_fired": False,
-            "alert_id": None,
-        }
-
-    # --- Change 1: per-speaker threshold override for child_self role ---
-    # Resolve the effective T_HIGH for the matched speaker.  For child_self
-    # speakers we use a looser threshold (t_high_override, default T_HIGH - 0.08)
-    # because adult-trained speaker verification degrades on children's voices.
-    closest_speaker_role = str(stage.get("tier3", {}).get("closest_speaker_role") or "familiar_adult")
-    # t_high_override is embedded in the tier3 response via _score_against_candidates
-    # when the matched speaker has one set; fall back to household T_HIGH.
-    effective_t_high = T_HIGH
-    if closest_speaker_role == "child_self":
-        # Apply a fixed 0.08 loosening unless the speaker row has an explicit override
-        effective_t_high = max(0.20, T_HIGH - 0.08)
-        logger.debug(
-            "CHILD_SELF_THRESHOLD | speaker_role=child_self | t_high_base=%.4f | effective_t_high=%.4f",
-            T_HIGH, effective_t_high,
-        )
-
-    if score >= effective_t_high:
+    if score >= params.t_high:
         session.familiar_recovery_streak += 1
-        if session.stranger_streak > 0 and session.familiar_recovery_streak < FAMILIAR_RESET_MIN_STREAK:
+        if session.stranger_streak > 0 and session.familiar_recovery_streak < params.familiar_reset_min_streak:
             decision = "uncertain_recovery"
         else:
             session.stranger_streak = 0
             session.stranger_weight_sum = 0.0
             session.familiar_recovery_streak = 0
-
-            if closest_speaker_role == "child_self":
-                # Child match: suppress the stranger streak but do NOT update the
-                # familiar grace window. The child's presence is irrelevant to the
-                # threat model — what matters is who else is speaking to the child.
+            if role == "child_self":
+                # The child's own voice resets the streak but does not open the
+                # familiar grace window: it says nothing about who else is near.
                 decision = "child_self_match"
-                # Track drift
-                session.child_drift_scores.append(score)
-                logger.debug("CHILD_SELF_MATCH | score=%.4f | streak_reset", score)
+                child_self_match = True
             else:
-                # familiar_adult match: full familiar suppression + grace window update.
-                session.last_familiar_ms = now
-                session.last_familiar_speaker_id = None
+                session.last_familiar_ms = now_ms
+                session.last_familiar_speaker_id = str(closest_speaker_id) if closest_speaker_id else None
                 svc.clear_stranger_identity(session)
                 decision = "familiar"
-    elif score <= T_LOW:
+    elif score <= params.t_low:
         session.familiar_recovery_streak = 0
         within_familiar_grace = (
-            session.last_familiar_ms > 0 and (now - session.last_familiar_ms) <= FAMILIAR_GRACE_SEC * 1000
+            session.last_familiar_ms > 0
+            and (now_ms - session.last_familiar_ms) <= params.familiar_grace_sec * 1000
         )
         same_recent_speaker = (
-            bool(stage.get("tier3", {}).get("closest_speaker_id"))
+            bool(closest_speaker_id)
             and bool(session.last_familiar_speaker_id)
-            and str(stage.get("tier3", {}).get("closest_speaker_id")) == str(session.last_familiar_speaker_id)
+            and str(closest_speaker_id) == str(session.last_familiar_speaker_id)
         )
-        mild_post_familiar_dip = score >= max(FAMILIAR_HOLD_FLOOR, T_LOW - FAMILIAR_GRACE_MARGIN)
-        strong_human_signal = tier2_category == "human_speech" and tier2_confidence >= FAMILIAR_GRACE_MIN_CONF
+        mild_post_familiar_dip = score >= max(params.familiar_hold_floor, params.t_low - params.familiar_grace_margin)
+        strong_human_signal = tier2_category == "human_speech" and tier2_confidence >= params.familiar_grace_min_conf
 
         if within_familiar_grace and same_recent_speaker and session.stranger_streak == 0 and mild_post_familiar_dip and strong_human_signal:
             session.stranger_streak = 0
@@ -231,94 +258,69 @@ def decide_and_act(db, parent_id: str, device_id: str, detection_result: Dict[st
         elif not allow_stranger_increment:
             decision = "uncertain_noise"
         else:
-            session.stranger_streak += 1
-            session.stranger_weight_sum += _streak_weight(score, T_LOW, T_HIGH, tier2_confidence)
+            _add_stranger_window(session, score, params.t_low, params, tier2_confidence, current_stranger_centroid)
             decision = "stranger_candidate"
-            svc.record_confirmed_stranger_window(session, current_stranger_centroid)
     else:
         session.familiar_recovery_streak = 0
-        soft_limit = T_LOW + SOFT_STRANGER_MARGIN
-        likely_human_speech = tier2_category == "human_speech" and tier2_confidence >= SOFT_STRANGER_MIN_CONF
+        soft_limit = params.t_low + params.soft_stranger_margin
+        likely_human_speech = tier2_category == "human_speech" and tier2_confidence >= params.soft_stranger_min_conf
         if score <= soft_limit and likely_human_speech:
-            session.stranger_streak += 1
-            session.stranger_weight_sum += _streak_weight(score, soft_limit, T_HIGH, tier2_confidence)
+            _add_stranger_window(session, score, soft_limit, params, tier2_confidence, current_stranger_centroid)
             decision = "stranger_candidate_soft"
-            svc.record_confirmed_stranger_window(session, current_stranger_centroid)
         else:
             decision = "uncertain"
 
-    # Fast-track low scores
-    if FORCE_ALERT_SCORE is not None and score <= FORCE_ALERT_SCORE and session.stranger_streak >= FORCE_ALERT_MIN_STREAK:
-        session.stranger_weight_sum = max(session.stranger_weight_sum, config.get("alert_weight_threshold", 2.5))
+    # Clearly low scores fast-track only after a minimum number of stranger windows.
+    if score <= params.force_alert_score and session.stranger_streak >= params.force_alert_min_streak:
+        session.stranger_streak = max(session.stranger_streak, params.alert_trigger_streak)
+        session.stranger_weight_sum = max(session.stranger_weight_sum, params.alert_weight_threshold)
 
-    # Manage stranger segment
-    if session.stranger_streak > 0:
-        if session.stranger_segment is None:
-            pre_roll_samples = int(STRANGER_PREROLL_SEC * session.sr)
-            pre_roll_waveform = None
-            if session.clip_buffer is not None and session.clip_buffer.shape[0] > arr_len:
-                pre_roll_source = session.clip_buffer[:-arr_len]
-                if pre_roll_source.shape[0] > 0:
-                    pre_roll_waveform = pre_roll_source[-pre_roll_samples:]
-            svc.start_stranger_segment(session, np.zeros(0, dtype=np.float32) if arr_len==0 else np.zeros(arr_len, dtype=np.float32), now, pre_roll_waveform=pre_roll_waveform)
-        else:
-            svc.append_stranger_segment(session, np.zeros(0, dtype=np.float32) if arr_len==0 else np.zeros(arr_len, dtype=np.float32))
-    else:
-        svc.clear_stranger_segment(session)
+    result = DecisionResult(decision=decision, child_self_match=child_self_match)
 
-    # Alert triggering
-    alert_weight_threshold = config.get("alert_weight_threshold", 2.5)
-    
-    can_alert, block_reason = _should_alert(session, now)
-    
+    triggered = (
+        session.stranger_weight_sum >= params.alert_weight_threshold
+        if params.weighted_streak
+        else session.stranger_streak >= params.alert_trigger_streak
+    )
+    if not triggered:
+        result.block_reason = "insufficient_stranger_streak"
+        return result
+
+    can_alert, gate_reason = _should_alert(session, now_ms)
     if not can_alert:
-        alert_block_reason = block_reason
         session.stranger_streak = 0
         session.stranger_weight_sum = 0.0
         svc.clear_stranger_segment(session)
         svc.clear_stranger_identity(session)
-    elif session.stranger_weight_sum >= alert_weight_threshold:
-        debounce_elapsed = (now - session.last_alert_ms) >= DEBOUNCE_SEC * 1000
-        if not debounce_elapsed:
-            speaker_changed, similarity = _has_speaker_changed(session, current_stranger_centroid, SPEAKER_CHANGE_THRESHOLD)
-            if speaker_changed:
-                session.last_alert_ms = 0
-                debounce_elapsed = True
-        if debounce_elapsed:
-            session.stranger_segment_ended_ms = now
-            aid = create_and_escalate_alert(db, parent_id, device_id, session, score)
-            if aid:
-                alert_fired = True
-                alert_id = aid
-        else:
-            alert_block_reason = "debounced"
-    else:
-        alert_block_reason = "insufficient_stranger_streak"
+        result.block_reason = gate_reason
+        return result
 
-    return {
-        "status": "ok",
-        "decision": decision,
-        "stranger_streak": session.stranger_streak,
-        "score": score,
-        "thresholds": {"t_high": config.get("t_high"), "t_low": config.get("t_low")},
-        "trigger": {
-            "required_streak": ALERT_TRIGGER_STREAK,
-            "force_alert_score": FORCE_ALERT_SCORE,
-            "force_alert_min_streak": FORCE_ALERT_MIN_STREAK,
-            "familiar_grace_sec": FAMILIAR_GRACE_SEC,
-            "familiar_hold_floor": FAMILIAR_HOLD_FLOOR,
-            "familiar_grace_margin": FAMILIAR_GRACE_MARGIN,
-            "familiar_grace_min_conf": FAMILIAR_GRACE_MIN_CONF,
-            "familiar_reset_min_streak": FAMILIAR_RESET_MIN_STREAK,
-            "soft_stranger_margin": SOFT_STRANGER_MARGIN,
-            "soft_stranger_min_conf": SOFT_STRANGER_MIN_CONF,
-            "stranger_min_tier2_conf": STRANGER_MIN_TIER2_CONF,
-            "stranger_uncertain_conf_floor": STRANGER_UNCERTAIN_CONF_FLOOR,
-            "debounce_sec": DEBOUNCE_SEC,
-            "speaker_change_threshold": SPEAKER_CHANGE_THRESHOLD,
-            "block_reason": alert_block_reason,
-        },
-        "stage": stage,
-        "alert_fired": alert_fired,
-        "alert_id": alert_id,
-    }
+    debounce_elapsed = (now_ms - session.last_alert_ms) >= params.debounce_sec * 1000
+    if not debounce_elapsed:
+        speaker_changed, similarity = _has_speaker_changed(
+            session, current_stranger_centroid, params.speaker_change_threshold
+        )
+        if speaker_changed:
+            session.last_alert_ms = 0
+            debounce_elapsed = True
+            result.debounce_reset_similarity = similarity
+
+    if debounce_elapsed:
+        result.should_alert = True
+    else:
+        result.block_reason = "debounced"
+    return result
+
+
+def mark_identity_alert_fired(
+    session: svc.SessionState,
+    now_ms: int,
+    current_stranger_centroid: Optional[np.ndarray] = None,
+) -> None:
+    """Session bookkeeping after an unenrolled-contact alert has been created."""
+    session.last_alert_ms = now_ms
+    session.stranger_streak = 0
+    session.stranger_weight_sum = 0.0
+    if not session.recent_confirmed_stranger_embeddings:
+        svc.record_confirmed_stranger_window(session, current_stranger_centroid)
+    svc.set_active_stranger_embedding(session)
