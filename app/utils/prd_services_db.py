@@ -61,9 +61,11 @@ _REDIMNET_HUB_ENTRY = os.environ.get("REDIMNET_HUB_ENTRY", "redimnet2")
 _IS_REDIMNET2 = ("redimnet2" in _REDIMNET_HUB_REPO.lower()) or ("redimnet2" in _REDIMNET_HUB_ENTRY.lower())
 
 _DEFAULT_T_HIGH = "0.47" if _IS_REDIMNET2 else "0.72"
-# 0.33 (was 0.31): slightly stricter after on-device watch testing, 2026-11-18.
-_DEFAULT_T_LOW = "0.33" if _IS_REDIMNET2 else "0.60"
-_DEFAULT_CONFIRM_WINDOWS = "3"
+# 0.40 (was 0.33) and a streak of 2 (was 3): stricter stranger detection, 2026-11-24.
+# Replay of the eval sessions (T_H 0.475, T_L 0.40, K 2): 98.8 % of strangers detected,
+# 3.39 false alerts per family hour (results/P3_threshold_sweep.csv).
+_DEFAULT_T_LOW = "0.40" if _IS_REDIMNET2 else "0.60"
+_DEFAULT_CONFIRM_WINDOWS = "2"
 
 T_HIGH = float(os.environ.get("SAFEEAR_T_HIGH", _DEFAULT_T_HIGH))
 T_LOW = float(os.environ.get("SAFEEAR_T_LOW", _DEFAULT_T_LOW))
